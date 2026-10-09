@@ -1,0 +1,16 @@
+* libnostril
+
+=nostril.til= is the canonical =mode lib= entry point for reusable Nostril
+behavior. It currently exports only version metadata so that library generation,
+binding consumption, and both application builds can be verified before the
+protocol API is designed.
+
+From the repository root:
+
+#+begin_src sh
+./make.til library
+./make.til test
+#+end_src
+
+Til places generated libraries under =gen/lib/= and bindings under =gen/til/=.
+See [[file:../../doc/architecture.org][the initial architecture]] for intended component boundaries.

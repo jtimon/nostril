@@ -1,0 +1,52 @@
+* Building and running Nostril
+
+[[file:../README.org][Nostril]] | [[file:architecture.org][Initial architecture]]
+
+** Requirements
+
+Nostril currently targets installed Til =0.0.1-f24e6004c= (check with
+=til -v=). The =til= executable, Git, and a C compiler must be on =PATH=, and
+the source must be built from a Git checkout. Like Tiled, the build driver uses
+a compile-time macro to derive the =0.0.1-<short-commit>= version; it generates
+the library's shared version constant before building. The graphical client
+also requires the GUI dependencies supplied by the Til installation.
+
+The build driver is executable Til code, =make.til=, rather than a GNU
+Makefile. It uses =--cpu=baseline --usize=64 --opt=0= by default.
+
+** Build targets
+
+From the repository root:
+
+#+begin_src sh
+./make.til
+./make.til library
+./make.til test
+./make.til clean
+#+end_src
+
+Optimization can be selected with =--opt=0=, =--opt=2=, or =--opt=3=:
+
+#+begin_src sh
+./make.til --opt=2
+./make.til test --opt=2
+#+end_src
+
+The default target builds =libnostril= and statically links =bin/nostril-cli=
+and =bin/nostril-gui= against it. =library= builds only the archive, shared
+object, and generated language bindings. =test= rebuilds the library and runs
+the Til smoke test through the generated binding.
+
+=clean= removes =bin/=, =gen/=, and =tmp/=. The Git-ignored =.inspirations/=
+directory is reserved for reference repositories and is preserved.
+
+** Generated files
+
+- =gen/lib/libnostril.a= and =gen/lib/libnostril.so=: generated libraries.
+- =gen/til/nostril.*=: generated Til, C, and Python bindings.
+- =gen/nostril_api.til=: build-selected static Til interface for local clients.
+- =gen/nostril_version.til=: Git-derived version shared by the library and clients.
+- =gen/*.c=: generated C translations.
+- =bin/nostril-cli= and =bin/nostril-gui=: application executables.
+
+Generated files are ignored by Git and should not be edited by hand.

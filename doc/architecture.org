@@ -1,0 +1,29 @@
+* Initial architecture
+
+[[file:../README.org][Nostril]] | [[file:build.org][Building and running]]
+
+Nostril begins with one reusable library and two thin hosts. The split keeps
+Nostr protocol and relay behavior independent of command-line or graphical
+presentation.
+
+- =lib/nostril/nostril.til= is the canonical =mode lib= entry point.
+- =src/nostril_cli.til= is the =mode cli= host.
+- =src/nostril_gui.til= is the =mode gui= host.
+- =test/= contains Til tests of the public library interface.
+
+The build creates Til's generated binding and rewrites its library reference
+to the absolute static archive for repository-local consumers. Both hosts use
+that same interface; they should not develop separate protocol implementations.
+
+** Intended boundaries
+
+The library should eventually own event representation and validation, relay
+messages, filters, subscription state, and transport-independent client
+behavior. Hosts should own argument handling, display state, input, and user
+interaction.
+
+WebSocket integration is intentionally undecided. Whether it is implemented in
+Til or through a C library, transport-specific resources should have explicit
+ownership and teardown, while protocol code remains testable without a live
+network. Persistence, key storage, signing, and supported NIPs likewise need
+documented interfaces and threat models before implementation.

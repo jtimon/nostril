@@ -1,3 +1,33 @@
-* Nostril
+* Nostril: Nostr Interface layer
 
-A [[https://github.com/nostr-protocol/nostr][nostr]] client written in [[https://github.com/jtimon/til][til]] language.
+A [[https://github.com/nostr-protocol/nostr][nostr]] client written in [[https://github.com/jtimon/til][Til]] language.
+
+- =nostril-cli= is the command-line client in =mode cli=.
+- =nostril-gui= is the graphical client in =mode gui=.
+- =nostril= is the reusable client library in =mode lib=.
+
+** Getting started
+
+Nostril targets installed Til =0.0.1-f24e6004c=. From the repository root:
+
+#+begin_src sh
+./make.til
+./bin/nostril-cli
+./bin/nostril-gui
+#+end_src
+
+The initial executables are placeholders while the event model and relay
+transport are developed. Build only the library with =./make.til library=,
+run the smoke test with =./make.til test=, or remove generated output with
+=./make.til clean=.
+
+See [[file:doc/build.org][building Nostril]] and [[file:doc/architecture.org][the initial architecture]].
+
+** TODO Notes
+
+Would be nice to have some sort of mode websockets, maybe.
+Alternatively just find some nice C library to link to and just do the til bindings.
+
+** Dependencies
+
+- [[https://github.com/jtimon/til][Til]]

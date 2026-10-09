@@ -1,0 +1,11 @@
+mode cli
+
+import("../gen/nostril_api")
+
+main := proc(args: ..Str) {
+    if args.len() == 1 && (args[0] == "-v" || args[0] == "--version") {
+        println(nostril_version())
+        return
+    }
+    println("nostril-cli ", nostril_version(), ": relay transport is not implemented yet")
+}

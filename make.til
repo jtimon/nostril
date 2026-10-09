@@ -1,0 +1,80 @@
+#!/usr/bin/env -S til run
+mode cli
+
+// Run from the repository root: ./make.til (or til run make.til).
+import("std/sys")
+import("std/file")
+
+get_cwd_str := ext_proc() returns Str {}
+
+BASE_VERSION := "0.0.1-"
+
+get_version := macro() returns shallow Str {
+    mut hash : Str = ""
+    status := run_cmd(hash, "git", "rev-parse", "--short", "HEAD")
+    if status != 0 { panic("cannot derive the Nostril version from git") }
+    return format(BASE_VERSION, hash.replace("\n", ""))
+}
+
+VERSION := get_version()
+
+generate_version := proc() {
+    File.writefile("gen/nostril_version.til",
+        format("mode lib\nNOSTRIL_VERSION := \"", VERSION, "\"\n"))
+}
+
+library := proc(opt: Str) {
+    Cmd.new("til", "build", "--cpu=baseline", "--usize=64", opt,
+        "-c", "gen/nostril.c", "lib/nostril/nostril.til").run_checked()
+}
+
+select_api := proc() {
+    path := format(get_cwd_str(), "/gen/lib/libnostril.a")
+    if !File.is_file(path) { panic("missing library: ", path) }
+    escaped := path.replace("\\", "\\\\").replace("\"", "\\\"")
+    binding := File.readfile("gen/til/nostril.til")
+    File.writefile("gen/nostril_api.til", format("mode lib\n",
+        binding.replace("link(\"nostril\")", format("link(\"", escaped, "\")"))))
+}
+
+build := proc(name: Str, source: Str, opt: Str) {
+    Cmd.new("til", "build", "--cpu=baseline", "--usize=64", opt,
+        "-o", format("bin/", name), "-c", format("gen/", name, ".c"), source).run_checked()
+}
+
+run_tests := proc(opt: Str) {
+    Cmd.new("til", "run", "--cpu=baseline", "--usize=64", opt,
+        "-o", "bin/nostril-test", "-c", "gen/nostril-test.c", "test/nostril.til").run_checked()
+}
+
+main := proc(args: ..Str) {
+    if args.len() == 1 && args[0] == "clean" {
+        if !File.is_file("make.til") || !File.is_file("src/nostril_cli.til") {
+            panic("run clean from the Nostril repository root")
+        }
+        for path : Str in array(Str, "bin", "gen", "tmp") { File.remove_tree(path) }
+        return
+    }
+
+    mut target := "build"
+    mut opt := "--opt=0"
+    for arg : Str in args {
+        if arg.starts_with("--opt=") { opt = arg.clone() }
+        else if target == "build" { target = arg.clone() }
+        else { panic("unknown build argument: ", arg) }
+    }
+    if (target != "build" && target != "library" && target != "test") ||
+        (opt != "--opt=0" && opt != "--opt=2" && opt != "--opt=3") {
+        panic("usage: ./make.til [build|library|test] [--opt=0|--opt=2|--opt=3], or clean")
+    }
+    if mkdir_p("bin") != 0 { panic("could not create bin/") }
+    if mkdir_p("gen") != 0 { panic("could not create gen/") }
+
+    generate_version()
+    library(opt)
+    if target == "library" { return }
+    select_api()
+    if target == "test" { run_tests(opt); return }
+    build("nostril-cli", "src/nostril_cli.til", opt)
+    build("nostril-gui", "src/nostril_gui.til", opt)
+}

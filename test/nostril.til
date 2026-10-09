@@ -1,0 +1,10 @@
+mode cli
+
+import("../gen/nostril_api")
+
+main := proc() {
+    version := nostril_version()
+    assert(version.starts_with("0.0.1-"))
+    assert(version.len() > "0.0.1-".len())
+    println("PASS: generated libnostril binding")
+}
