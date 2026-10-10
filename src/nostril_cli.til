@@ -1,11 +1,29 @@
-mode cli
-
-import("../gen/nostril_api")
+mode nostril_client
 
 main := proc(args: ..Str) {
     if args.len() == 1 && (args[0] == "-v" || args[0] == "--version") {
         println(nostril_version())
         return
     }
-    println("nostril-cli ", nostril_version(), ": relay transport is not implemented yet")
+    if args.len() > 1 { panic("usage: nostril-cli [ipc-endpoint]") }
+    mut endpoint := NOSTRIL_LOCAL_ENDPOINT
+    if args.len() == 1 { endpoint = args[0].clone() }
+
+    mut socket := nng_socket(id = 0)
+    nostril_nng_check(nng_pair0_open(socket), "open client socket")
+    nostril_nng_configure(socket)
+    mut dialer := nng_dialer(id = 0)
+    nostril_nng_check(nng_dial(socket, endpoint.c_str, dialer, 0), "dial")
+
+    nostril_nng_send(socket, NOSTRIL_LOCAL_REQUEST)
+    println("sent: ", NOSTRIL_LOCAL_REQUEST)
+    response := nostril_nng_receive(socket)
+    if response != NOSTRIL_LOCAL_EOSE {
+        nostril_nng_close(socket)
+        panic("expected local NIP-01 EOSE, received: ", response)
+    }
+    println("received: ", response)
+    nostril_nng_send(socket, NOSTRIL_LOCAL_CLOSE)
+    println("sent: ", NOSTRIL_LOCAL_CLOSE)
+    nostril_nng_close(socket)
 }

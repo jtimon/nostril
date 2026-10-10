@@ -37,14 +37,48 @@ select_api := proc() {
         binding.replace("link(\"nostril\")", format("link(\"", escaped, "\")"))))
 }
 
+build_nng := proc() {
+    if !File.is_file("vendor/nng/CMakeLists.txt") {
+        panic("missing vendored NNG source under vendor/nng/")
+    }
+    if mkdir_p("gen/nng") != 0 { panic("could not create gen/nng/") }
+    Cmd.new("cmake", "-S", "vendor/nng", "-B", "gen/nng/build",
+        "-DCMAKE_BUILD_TYPE=Release", "-DBUILD_SHARED_LIBS=OFF",
+        "-DNNG_TESTS=OFF", "-DNNG_TOOLS=OFF", "-DNNG_ENABLE_TLS=OFF",
+        "-DCMAKE_POSITION_INDEPENDENT_CODE=ON").run_checked()
+    Cmd.new("cmake", "--build", "gen/nng/build", "--parallel").run_checked()
+
+    archive := "gen/nng/build/libnng.a"
+    if !File.is_file(archive) { panic("NNG build did not produce ", archive) }
+    Cmd.new("cp", archive, "gen/nng/libnng.a").run_checked()
+    // The interpreter dlopens a shared twin beside each linked archive.
+    Cmd.new("cc", "-shared", "-fPIC", "-o", "gen/nng/libnng.so",
+        "-Wl,--whole-archive", "gen/nng/libnng.a", "-Wl,--no-whole-archive",
+        "-lpthread", "-latomic").run_checked()
+
+    path := format(get_cwd_str(), "/gen/nng/libnng.a")
+    escaped := path.replace("\\", "\\\\").replace("\"", "\\\"")
+    File.writefile("gen/nng_link.til", format("mode lib\nlink(\"", escaped,
+        "\")\nlink(\"pthread\")\nlink(\"atomic\")\n"))
+}
+
 build := proc(name: Str, source: Str, opt: Str) {
     Cmd.new("til", "build", "--cpu=baseline", "--usize=64", opt,
         "-o", format("bin/", name), "-c", format("gen/", name, ".c"), source).run_checked()
 }
 
+build_mode := proc(name: Str, source: Str, opt: Str) {
+    Cmd.new("til", "build", "--cpu=baseline", "--usize=64", opt,
+        "--extra-modes=modes.til", "-o", format("bin/", name),
+        "-c", format("gen/", name, ".c"), source).run_checked()
+}
+
 run_tests := proc(opt: Str) {
-    Cmd.new("til", "run", "--cpu=baseline", "--usize=64", opt,
-        "-o", "bin/nostril-test", "-c", "gen/nostril-test.c", "test/nostril.til").run_checked()
+    build_mode("nostril-cli", "src/nostril_cli.til", opt)
+    build_mode("nostril-relay", "src/nostril_relay.til", opt)
+    Cmd.new("til", "test", "--cpu=baseline", "--usize=64", opt,
+        "-o", "bin/nostril-tests", "-c", "gen/nostril-tests.c",
+        "tests.til").run_checked()
 }
 
 main := proc(args: ..Str) {
@@ -74,7 +108,9 @@ main := proc(args: ..Str) {
     library(opt)
     if target == "library" { return }
     select_api()
+    build_nng()
     if target == "test" { run_tests(opt); return }
-    build("nostril-cli", "src/nostril_cli.til", opt)
+    build_mode("nostril-cli", "src/nostril_cli.til", opt)
+    build_mode("nostril-relay", "src/nostril_relay.til", opt)
     build("nostril-gui", "src/nostril_gui.til", opt)
 }

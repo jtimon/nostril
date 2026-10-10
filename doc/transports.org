@@ -1,0 +1,154 @@
+* Transport design
+
+[[file:../README.org][Nostril]] | [[file:architecture.org][Architecture]] | [[file:build.org][Building and running]]
+
+Nostril separates Nostr protocol behavior from the mechanism carrying a
+message. NNG is the first transport and local integration harness. It is not a
+temporary replacement that must disappear when WebSocket support arrives:
+local clients and services may continue to use NNG, while remote endpoints use
+WebSocket, WebRTC, or another transport required by their environment or NIP.
+
+** Shared protocol model
+
+Event representation and validation, JSON message envelopes, filters,
+subscriptions, relay state, and NIP behavior belong above the transport layer.
+They must not depend on an NNG socket type, a WebSocket connection, or GUI
+state.
+
+Transport backends carry complete Nostr messages and provide lifecycle,
+ordering, send, receive, error, and close behavior. The exact Til interface is
+not defined yet. Its ownership and error contracts must be documented before
+it becomes a public library API.
+
+Use the normal Nostr JSON arrays across the local boundary rather than a
+special NNG-only protocol. In particular, clients send messages such as
+=EVENT=, =REQ=, and =CLOSE=, while relays produce messages such as =EVENT=,
+=OK=, =EOSE=, =CLOSED=, and =NOTICE=. This allows common parser, state-machine,
+and conformance tests to run against every backend.
+
+NNG pub/sub topics are a delivery mechanism, not an implementation of Nostr
+filters. Nostr filter evaluation and subscription semantics remain in the
+shared relay model so they behave identically over another transport.
+
+** NIP-01 baseline
+
+NIP-01 is mandatory for interoperable Nostr clients and relays. Its public
+client-to-relay transport is a WebSocket endpoint. Clients should use one
+WebSocket connection per relay for all subscriptions, and relays scope
+subscription identifiers to that connection. A subscription identifier is a
+non-empty string of at most 64 characters.
+
+NNG does not make a local endpoint a NIP-01-compatible public relay. It is a
+Nostril transport and conformance harness for the same messages and behavior.
+The local backend must preserve a logical connection identity so subscription
+replacement, =CLOSE=, relay-initiated =CLOSED=, and disconnect cleanup have the
+same scope they have on a WebSocket connection.
+
+The common model must also preserve NIP-01 filter behavior: conditions within
+one filter are combined with AND, multiple filters in a =REQ= are combined
+with OR, =limit= applies only to stored-event results, =limit: 0= suppresses
+stored events, and =EOSE= ends the stored phase without ending the live
+subscription.
+
+** Local NNG backend
+
+NNG supplies ZeroMQ-style messaging patterns that can exercise the model
+before Nostril has a WebSocket dependency:
+
+- =inproc://= supports deterministic communication inside one test process.
+- =ipc://= supports separate local client and relay processes without an
+  external network service.
+- Pair or client/server-style communication can exercise bidirectional client
+  commands and relay responses.
+- Publisher/subscriber communication can exercise relay fan-out to multiple
+  consumers.
+
+The first tests should cover the model without transport, then NNG in-process
+round trips, followed by separate-process IPC. All receive operations need
+bounded waits so a failing test reports an error instead of hanging.
+
+NNG may remain useful in deployed local compositions after remote transports
+exist. Code above the backend must therefore not describe it as a mock or
+assume that every connection ultimately becomes a WebSocket.
+
+*** Current prototype
+
+The first harness uses NNG Pair0 for one client and one relay. It exchanges one
+fixed NIP-01 sequence: =REQ= with =limit:0=, =EOSE=, then =CLOSE=. The
+=inproc://= test exercises both peers in one process; a second test launches
+=bin/nostril-relay= and =bin/nostril-cli= over a unique =ipc://= endpoint.
+
+Two additional in-process tests keep transport and protocol claims separate.
+The =test_nng_pubsub_fanout= case in =tests.til= is only an NNG fan-out smoke
+test: one publisher sends a fixed =EVENT= envelope to two subscribers. The
+=test_fake_relay_lifecycle= case layers two independent Pair0 control channels
+for =REQ=, =EOSE=, and =CLOSE= over a shared publisher/subscriber event channel.
+That split-channel arrangement belongs to the test harness; it is not the
+selected architecture for a production local backend. The event has a complete
+NIP-01 JSON shape but deliberately fake cryptographic fields, so these tests
+make no event-validation claim.
+
+This proves custom-mode loading, NNG linkage, process communication, bounded
+receives, basic subscription lifecycles, and NNG fan-out to two local consumers.
+It does not yet parse arbitrary JSON, validate events, evaluate filters, store
+events, implement post-=CLOSE= delivery suppression, support multiple clients
+in the standalone relay, or implement a public WebSocket relay. Pair0 and the
+fixed 64 KiB receive buffer are prototype constraints, not transport-interface
+decisions.
+
+** Custom Til modes
+
+Til's =examples/custom_modes.til= demonstrates NNG-backed sender, receiver,
+publisher, and subscriber modes. A Nostril-owned =mode mode= definition can
+similarly auto-import a support prelude that supplies NNG bindings and link
+requirements. This is analogous to =mode gui=: application files select a
+concise execution environment while ordinary library modules retain explicit
+ownership boundaries.
+
+Current custom modes support =needs_main=, =decls_only=, =auto_import=,
+=is_library=, =is_pure=, =run_tests=, and =debug_prints=. They are loaded with
+=--extra-modes=<file>=. They do not provide mode inheritance, arbitrary entry
+signatures, or custom output generators. Those limitations are sufficient for
+an NNG prelude, but the mode must not become the only way to use the protocol
+library.
+
+Nostril owns the minimal Til binding and custom-mode prelude used by the local
+harness. It also owns the pinned NNG 1.11 source under =vendor/nng/= and builds
+the archive and shared interpreter twin into =gen/nng/=. NNG is not treated as
+part of an installed Til distribution or loaded from a separate Til checkout.
+The current native build path is Linux-specific; packaging and other target
+toolchains remain future decisions.
+
+** Future backends and NIPs
+
+NIP-01 relay communication uses WebSocket. A future WebSocket backend should
+adapt the shared messages and state machines rather than duplicate them. The
+same rule applies to WebRTC or another transport introduced for a particular
+NIP.
+
+Transport selection may depend on the endpoint, deployment, or capabilities
+required by a NIP. Unsupported combinations should fail explicitly. A NIP may
+add messages and state transitions or require backend capabilities, but it
+should not cause unrelated protocol logic to import a transport implementation.
+
+Backend conformance tests should replay common message and state-machine
+vectors. Backend-specific tests then cover framing, connection setup,
+reconnection, security, and teardown that the common model cannot exercise.
+
+** Specification and issue workflow
+
+The protocol overview is available under =.inspirations/nostr/=. The canonical
+NIP specifications, including [[file:../.inspirations/nips/01.md][NIP-01]], are under
+=.inspirations/nips/=. Both directories are Git-ignored and disposable;
+upstream remains the source of truth. Planned work derived from the NIPs should
+be recorded as Nostril issues with the relevant NIP, section, and reference
+commit. This keeps protocol requirements traceable without copying the NIPs
+into Nostril or making either reference clone part of the build.
+
+The NIPs repository is not an implementation checklist. Nostril should select
+the NIPs appropriate to its clients and relay model, treating NIP-01 as the
+baseline rather than creating work merely because another NIP exists.
+
+Issues should distinguish shared protocol behavior, a transport-independent
+capability requirement, and backend-specific work. WebSocket support therefore
+does not block event, filter, subscription, relay-model, or local NNG work.

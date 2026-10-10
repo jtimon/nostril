@@ -5,11 +5,21 @@
 ** Requirements
 
 Nostril currently targets installed Til =0.0.1-f24e6004c= (check with
-=til -v=). The =til= executable, Git, and a C compiler must be on =PATH=, and
-the source must be built from a Git checkout. Like Tiled, the build driver uses
-a compile-time macro to derive the =0.0.1-<short-commit>= version; it generates
-the library's shared version constant before building. The graphical client
-also requires the GUI dependencies supplied by the Til installation.
+=til -v=). The =til= executable, Git, CMake 3.15 or newer, and a C compiler must
+be on =PATH=, and the source must be built from a Git checkout. Like Tiled, the
+build driver uses a compile-time macro to derive the =0.0.1-<short-commit>=
+version; it generates the library's shared version constant before building.
+The graphical client also requires the GUI dependencies supplied by the Til
+installation.
+
+The local client and relay use the project-owned NNG =v1.11= snapshot under
+=vendor/nng/=, pinned to upstream commit
+=84aa701f42968bf536141a24e826da66963b571a=. The driver configures a release,
+position-independent static build with NNG's tests, tools, and TLS disabled.
+It then creates =gen/nng/libnng.a= and force-loads that same archive into the
+=libnng.so= twin required by Til's interpreter. No Til source checkout or
+system NNG package is used. This native twin command currently targets the
+Linux/GNU linker and links =pthread= and =atomic= explicitly.
 
 The build driver is executable Til code, =make.til=, rather than a GNU
 Makefile. It uses =--cpu=baseline --usize=64 --opt=0= by default.
@@ -32,10 +42,15 @@ Optimization can be selected with =--opt=0=, =--opt=2=, or =--opt=3=:
 ./make.til test --opt=2
 #+end_src
 
-The default target builds =libnostril= and statically links =bin/nostril-cli=
-and =bin/nostril-gui= against it. =library= builds only the archive, shared
-object, and generated language bindings. =test= rebuilds the library and runs
-the Til smoke test through the generated binding.
+The default target builds =libnostril= and statically links =bin/nostril-cli=,
+=bin/nostril-relay=, and =bin/nostril-gui= against it. The local client and
+relay are built with the project-owned modes in =modes.til=. =library= builds
+only the archive, shared object, and generated language bindings. =test=
+rebuilds the library and clients, then runs =tests.til= through Til's =test=
+command. Til interprets the complete suite and then compiles and runs it. The
+suite covers the generated binding, an NNG =inproc://= round trip,
+publisher/subscriber fan-out, a layered two-client fake-relay lifecycle, and
+the separate client and relay over =ipc://=.
 
 =clean= removes =bin/=, =gen/=, and =tmp/=. The Git-ignored =.inspirations/=
 directory is reserved for reference repositories and is preserved.
@@ -46,7 +61,10 @@ directory is reserved for reference repositories and is preserved.
 - =gen/til/nostril.*=: generated Til, C, and Python bindings.
 - =gen/nostril_api.til=: build-selected static Til interface for local clients.
 - =gen/nostril_version.til=: Git-derived version shared by the library and clients.
+- =gen/nng/=: NNG CMake tree, static archive, and interpreter twin.
+- =gen/nng_link.til=: generated absolute link selection for the custom modes.
 - =gen/*.c=: generated C translations.
-- =bin/nostril-cli= and =bin/nostril-gui=: application executables.
+- =bin/nostril-tests=: compiled =tests.til= runner.
+- =bin/nostril-cli=, =bin/nostril-relay=, and =bin/nostril-gui=: application executables.
 
 Generated files are ignored by Git and should not be edited by hand.

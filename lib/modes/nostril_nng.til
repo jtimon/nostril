@@ -1,0 +1,53 @@
+import("../nng")
+_nng_link := import("../../gen/nng_link")
+_nostril_api := import("../../gen/nostril_api")
+
+NOSTRIL_LOCAL_ENDPOINT := "ipc://tmp/nostril.ipc"
+NOSTRIL_LOCAL_REQUEST := "[\"REQ\",\"local\",{\"limit\":0}]"
+NOSTRIL_LOCAL_EOSE := "[\"EOSE\",\"local\"]"
+NOSTRIL_LOCAL_CLOSE := "[\"CLOSE\",\"local\"]"
+NOSTRIL_FAKE_EVENT := "[\"EVENT\",\"local\",{\"id\":\"0000000000000000000000000000000000000000000000000000000000000000\",\"pubkey\":\"1111111111111111111111111111111111111111111111111111111111111111\",\"created_at\":0,\"kind\":1,\"tags\":[],\"content\":\"test event\",\"sig\":\"22222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222\"}]"
+NOSTRIL_NNG_MAX_MESSAGE : USize = 65536
+
+nostril_nng_read_cstr := func(data: Dynamic) returns Str {
+    mut size : USize = 0
+    while true {
+        ref byte : I8 = ptr_add(data, size.to_uptr())
+        if byte.eq(0) { break }
+        size++
+    }
+    ref start : I8 = ptr_add(data, 0)
+    return Str(c_str = start, count = size, cap = CAP_VIEW).clone()
+}
+
+nostril_nng_check := proc(status: I32, operation: Str) {
+    if status == 0 { return }
+    message := nostril_nng_read_cstr(nng_strerror(status))
+    panic(operation, ": ", message)
+}
+
+nostril_nng_configure := proc(socket: nng_socket) {
+    nostril_nng_check(nng_socket_set_ms(socket, "recv-timeout".c_str, 3000), "set receive timeout")
+    nostril_nng_check(nng_socket_set_ms(socket, "send-timeout".c_str, 3000), "set send timeout")
+}
+
+nostril_nng_subscribe_all := proc(socket: nng_socket) {
+    mut topic := ""
+    nostril_nng_check(nng_socket_set(socket, "sub:subscribe".c_str,
+        topic.c_str, 0), "subscribe to all messages")
+}
+
+nostril_nng_send := proc(socket: nng_socket, mut message: Str) {
+    nostril_nng_check(nng_send(socket, message.c_str, message.len().add(1), 0), "send")
+}
+
+nostril_nng_receive := proc(socket: nng_socket) returns Str {
+    mut buffer := Str.with_capacity(NOSTRIL_NNG_MAX_MESSAGE)
+    mut size := NOSTRIL_NNG_MAX_MESSAGE
+    nostril_nng_check(nng_recv(socket, buffer.c_str, size, 0), "receive")
+    return nostril_nng_read_cstr(buffer.c_str)
+}
+
+nostril_nng_close := proc(socket: nng_socket) {
+    nostril_nng_check(nng_close(socket), "close")
+}

@@ -2,10 +2,209 @@ mode gui
 
 import("../gen/nostril_api")
 
+gui_utf8 := func(code: I64) returns Str {
+    if code < 0 || code > 0x10ffff || (code >= 0xd800 && code <= 0xdfff) {
+        panic("invalid Unicode scalar")
+    }
+    if code < 128 { return Str.from_byte(code.to_u8()) }
+    if code < 2048 {
+        return format(Str.from_byte((192 + code / 64).to_u8()),
+            Str.from_byte((128 + code.mod(64)).to_u8()))
+    }
+    if code < 65536 {
+        return format(Str.from_byte((224 + code / 4096).to_u8()),
+            Str.from_byte((128 + (code / 64).mod(64)).to_u8()),
+            Str.from_byte((128 + code.mod(64)).to_u8()))
+    }
+    return format(Str.from_byte((240 + code / 262144).to_u8()),
+        Str.from_byte((128 + (code / 4096).mod(64)).to_u8()),
+        Str.from_byte((128 + (code / 64).mod(64)).to_u8()),
+        Str.from_byte((128 + code.mod(64)).to_u8()))
+}
+
+gui_without_last_scalar := func(text: Str) returns Str {
+    if text.len() == 0 { return "" }
+    mut start := text.len() - 1
+    while start > 0 && text[start].cast(U8).to_i64().band(0xc0) == 0x80 { start-- }
+    return text.substr(0, start).clone()
+}
+
+gui_fitting_tail := proc(text: Str, width: I32, font_size: I32) returns Str {
+    mut visible := text.clone()
+    while visible.len() > 0 && MeasureText(visible.c_str, font_size) > width {
+        mut start : USize = 1
+        while start < visible.len() &&
+              visible[start].cast(U8).to_i64().band(0xc0) == 0x80 { start++ }
+        visible = visible.substr(start, visible.len() - start).clone()
+    }
+    return visible
+}
+
+gui_wrapped_lines := proc(text: Str, width: I32, font_size: I32) returns I32 {
+    mut count : I32 = 1
+    mut line := ""
+    for word : Str in text.split(" ") {
+        mut candidate := word.clone()
+        if line.len() > 0 { candidate = format(line, " ", word) }
+        if line.len() > 0 && MeasureText(candidate.c_str, font_size) > width {
+            count++
+            line = word.clone()
+        } else {
+            line = candidate
+        }
+    }
+    return count
+}
+
+gui_draw_wrapped := proc(text: Str, x: I32, y: I32, width: I32, font_size: I32,
+        line_height: I32, color: Color) {
+    mut line := ""
+    mut row : I32 = 0
+    for word : Str in text.split(" ") {
+        mut candidate := word.clone()
+        if line.len() > 0 { candidate = format(line, " ", word) }
+        if line.len() > 0 && MeasureText(candidate.c_str, font_size) > width {
+            DrawText(line.c_str, x, y + row * line_height, font_size, color)
+            row++
+            line = word.clone()
+        } else {
+            line = candidate
+        }
+    }
+    DrawText(line.c_str, x, y + row * line_height, font_size, color)
+}
+
 main := proc(args: ..Str) {
     if args.len() == 1 && (args[0] == "-v" || args[0] == "--version") {
         println(nostril_version())
         return
     }
-    println("nostril-gui ", nostril_version(), ": graphical client is not implemented yet")
+    if args.len() > 0 { panic("usage: nostril-gui [--version]") }
+
+    background := Color(r = 24, g = 24, b = 24, a = 255)
+    field := Color(r = 32, g = 32, b = 32, a = 255)
+    border := Color(r = 64, g = 64, b = 64, a = 255)
+    text := Color(r = 232, g = 232, b = 232, a = 255)
+    muted := Color(r = 152, g = 152, b = 152, a = 255)
+    action := Color(r = 74, g = 112, b = 170, a = 255)
+
+    mut messages := Vec(Str).new()
+    mut composer := ""
+    mut composer_scalars : I32 = 0
+
+    SetConfigFlags(FLAG_WINDOW_RESIZABLE.cast(U32))
+    InitWindow(900, 640, "Nostril".c_str)
+    SetWindowMinSize(480, 320)
+    SetTargetFPS(60)
+
+    while !WindowShouldClose() {
+        if IsKeyPressed(259) || IsKeyPressedRepeat(259) {
+            if composer_scalars > 0 {
+                composer = gui_without_last_scalar(composer)
+                composer_scalars--
+            }
+        }
+        mut code := GetCharPressed()
+        while code > 0 {
+            if code >= 32 && code != 127 && composer_scalars < 280 {
+                composer = format(composer, gui_utf8(code.cast(I64)))
+                composer_scalars++
+            }
+            code = GetCharPressed()
+        }
+
+        width := GetScreenWidth()
+        height := GetScreenHeight()
+        margin : I32 = 12
+        content_x := margin
+        content_w := width - margin * 2
+        header_h : I32 = 44
+        composer_h : I32 = 56
+        composer_y := height - composer_h
+        field_x := margin
+        field_y := composer_y + 8
+        field_h : I32 = 40
+        button_w : I32 = 64
+        field_w := width - margin * 3 - button_w
+        button_x := field_x + field_w + margin
+
+        mouse := GetMousePosition()
+        button_hover := mouse.x >= button_x.to_f32() &&
+            mouse.x < (button_x + button_w).to_f32() &&
+            mouse.y >= field_y.to_f32() && mouse.y < (field_y + field_h).to_f32()
+        submit := IsKeyPressed(257) || (button_hover && IsMouseButtonPressed(0))
+        if submit && composer.trim().len() > 0 {
+            messages.push(own composer.clone())
+            composer = ""
+            composer_scalars = 0
+        }
+
+        BeginDrawing()
+        ClearBackground(background)
+
+        DrawRectangle(0, header_h - 1, width, 1, border)
+        DrawText("Nostril".c_str, margin, 12, 20, text)
+        status := "Local only - 0 relays"
+        DrawText(status.c_str, width - margin - MeasureText(status.c_str, 13), 16, 13, muted)
+
+        timeline_top := header_h + 8
+        timeline_bottom := composer_y - 8
+        if messages.len() == 0 {
+            DrawText("No messages.".c_str, content_x, timeline_top + 4, 14, muted)
+        } else {
+            BeginScissorMode(content_x, timeline_top, content_w, timeline_bottom - timeline_top)
+            mut bottom := timeline_bottom
+            mut index := messages.len()
+            while index > 0 && bottom > timeline_top {
+                index--
+                ref message : Str = messages[index]
+                message_x := content_x + 48
+                message_w := content_w - 48
+                line_count := gui_wrapped_lines(message, message_w, 16)
+                row_h : I32 = 18 + line_count * 21
+                row_y : I32 = bottom - row_h
+                DrawText("You".c_str, content_x, row_y + 9, 13, muted)
+                gui_draw_wrapped(message, message_x, row_y + 7, message_w, 16, 21, text)
+                DrawRectangle(content_x, bottom - 1, content_w, 1, border)
+                bottom = row_y
+            }
+            EndScissorMode()
+        }
+
+        DrawRectangle(0, composer_y, width, composer_h, background)
+        DrawRectangle(0, composer_y, width, 1, border)
+        DrawRectangle(field_x, field_y, field_w, field_h, field)
+        DrawRectangleLines(field_x, field_y, field_w, field_h, border)
+
+        count := format(composer_scalars.to_str(), "/280")
+        count_w := MeasureText(count.c_str, 11)
+        input_w := field_w - count_w - 28
+        BeginScissorMode(field_x + 10, field_y + 1, input_w, field_h - 2)
+        if composer.len() == 0 {
+            DrawText("Message".c_str, field_x + 10, field_y + 12, 16, muted)
+        } else {
+            visible := gui_fitting_tail(composer, input_w, 16)
+            DrawText(visible.c_str, field_x + 10, field_y + 12, 16, text)
+            if (GetTime() * 2).to_i64().mod(2) == 0 {
+                caret_x := field_x + 12 + MeasureText(visible.c_str, 16)
+                DrawRectangle(caret_x, field_y + 10, 1, 21, text)
+            }
+        }
+        EndScissorMode()
+        DrawText(count.c_str, field_x + field_w - count_w - 8, field_y + 14, 11, muted)
+
+        mut button_color := border
+        if composer.trim().len() > 0 { button_color = action }
+        if button_hover && composer.trim().len() > 0 {
+            button_color = Color(r = 88, g = 128, b = 188, a = 255)
+        }
+        DrawRectangle(button_x, field_y, button_w, field_h, button_color)
+        send_label := "Send"
+        send_x := button_x + (button_w - MeasureText(send_label.c_str, 14)) / 2
+        DrawText(send_label.c_str, send_x, field_y + 13, 14, text)
+
+        EndDrawing()
+    }
+
+    CloseWindow()
 }

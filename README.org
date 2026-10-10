@@ -2,7 +2,8 @@
 
 A [[https://github.com/nostr-protocol/nostr][nostr]] client written in [[https://github.com/jtimon/til][Til]] language.
 
-- =nostril-cli= is the command-line client in =mode cli=.
+- =nostril-cli= is the local command-line client in =mode nostril_client=.
+- =nostril-relay= is the local relay harness in =mode nostril_relay=.
 - =nostril-gui= is the graphical client in =mode gui=.
 - =nostril= is the reusable client library in =mode lib=.
 
@@ -12,22 +13,52 @@ Nostril targets installed Til =0.0.1-f24e6004c=. From the repository root:
 
 #+begin_src sh
 ./make.til
-./bin/nostril-cli
 ./bin/nostril-gui
 #+end_src
 
-The initial executables are placeholders while the event model and relay
-transport are developed. Build only the library with =./make.til library=,
-run the smoke test with =./make.til test=, or remove generated output with
-=./make.til clean=.
+The GUI starts with an empty local timeline. Type into the composer and press
+Enter or =Send= to see your own messages. They remain only in memory for
+that window session: no event is signed, persisted, or sent to a relay.
 
-See [[file:doc/build.org][building Nostril]] and [[file:doc/architecture.org][the initial architecture]].
+To run the scripted local NIP-01 exchange, start the relay and then run the CLI
+from another terminal:
 
-** TODO Notes
+#+begin_src sh
+./bin/nostril-relay
+./bin/nostril-cli
+#+end_src
 
-Would be nice to have some sort of mode websockets, maybe.
-Alternatively just find some nice C library to link to and just do the til bindings.
+The CLI sends =REQ= with =limit:0=, receives =EOSE=, and sends =CLOSE= over
+NNG IPC. This is a development harness, not yet a general relay. Build only
+the library with =./make.til library=, run the smoke and local transport tests
+with =./make.til test=, or remove generated output with =./make.til clean=.
+
+See [[file:doc/build.org][building Nostril]], [[file:doc/architecture.org][the initial architecture]], and
+[[file:doc/transports.org][the transport design]].
+
+** Transport direction
+
+Nostril will first exercise its transport-independent protocol model through
+local NNG communication and project-owned custom Til modes. NNG can remain an
+IPC backend while WebSocket, WebRTC, or other backends are added for remote
+relays and transport-specific NIPs. Backend selection must not fork the event,
+filter, subscription, or relay model.
+
+** Configuration direction
+
+Nostril does not currently load user configuration. A later version may read a
+file such as =~/.nostril.conf= or a Til initialization file such as
+=nostril.d/init.til=, but those names are examples rather than a promised
+interface. Configuration loading, executable configuration, and ownership of
+user startup code will wait for Tiled to establish the corresponding patterns.
+There is no need to invent a Nostril-specific mechanism first.
+
+Nostril is an experimental Til project, not an urgent replacement for mature
+Nostr software. Users who need a complete Nostr client today should use one of
+the existing clients available in other languages.
 
 ** Dependencies
 
 - [[https://github.com/jtimon/til][Til]]
+- CMake 3.15 or newer and a C compiler
+- [[https://github.com/nanomsg/nng][NNG]] 1.11, vendored under =vendor/nng/= and built into =gen/nng/=

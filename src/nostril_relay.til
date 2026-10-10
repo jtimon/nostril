@@ -1,0 +1,35 @@
+mode nostril_relay
+
+main := proc(args: ..Str) {
+    if args.len() == 1 && (args[0] == "-v" || args[0] == "--version") {
+        println(nostril_version())
+        return
+    }
+    if args.len() > 1 { panic("usage: nostril-relay [ipc-endpoint]") }
+    mut endpoint := NOSTRIL_LOCAL_ENDPOINT
+    if args.len() == 1 { endpoint = args[0].clone() }
+
+    mut socket := nng_socket(id = 0)
+    nostril_nng_check(nng_pair0_open(socket), "open relay socket")
+    nostril_nng_configure(socket)
+    mut listener := nng_listener(id = 0)
+    nostril_nng_check(nng_listen(socket, endpoint.c_str, listener, 0), "listen")
+    println("nostril-relay listening on ", endpoint)
+
+    request := nostril_nng_receive(socket)
+    if request != NOSTRIL_LOCAL_REQUEST {
+        nostril_nng_close(socket)
+        panic("expected local NIP-01 request, received: ", request)
+    }
+    println("received: ", request)
+
+    // limit:0 returns no stored events, but NIP-01 still starts the live phase.
+    nostril_nng_send(socket, NOSTRIL_LOCAL_EOSE)
+    close := nostril_nng_receive(socket)
+    if close != NOSTRIL_LOCAL_CLOSE {
+        nostril_nng_close(socket)
+        panic("expected local NIP-01 close, received: ", close)
+    }
+    println("received: ", close)
+    nostril_nng_close(socket)
+}

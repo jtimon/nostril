@@ -1,0 +1,4 @@
+mode mode
+
+nostril_client := Mode(needs_main = true, auto_import = "lib/modes/nostril_client", decls_only = false)
+nostril_relay := Mode(needs_main = true, auto_import = "lib/modes/nostril_relay", decls_only = false)

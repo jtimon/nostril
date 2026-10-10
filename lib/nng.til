@@ -1,0 +1,27 @@
+mode lib
+
+// Minimal subset copied from Til's generated NNG 1.11 binding.
+// NNG is MIT licensed; see vendor/nng/LICENSE.txt.
+nng_dialer := ext_struct("nng_dialer_s") {
+    id : U32 = 0
+}
+
+nng_listener := ext_struct("nng_listener_s") {
+    id : U32 = 0
+}
+
+nng_socket := ext_struct("nng_socket_s") {
+    id : U32 = 0
+}
+
+nng_close := ext_proc(shallow socket: nng_socket) returns shallow I32 {}
+nng_socket_set_ms := ext_proc(shallow socket: nng_socket, option: I8, shallow duration: I32) returns shallow I32 {}
+nng_socket_set := ext_proc(shallow socket: nng_socket, option: I8, data: Dynamic, shallow size: USize) returns shallow I32 {}
+nng_listen := ext_proc(shallow socket: nng_socket, url: I8, mut listener: nng_listener, shallow flags: I32) returns shallow I32 {}
+nng_dial := ext_proc(shallow socket: nng_socket, url: I8, mut dialer: nng_dialer, shallow flags: I32) returns shallow I32 {}
+nng_strerror := ext_proc(shallow error: I32) returns ref I8 {}
+nng_send := ext_proc(shallow socket: nng_socket, mut data: Dynamic, shallow size: USize, shallow flags: I32) returns shallow I32 {}
+nng_recv := ext_proc(shallow socket: nng_socket, mut data: Dynamic, mut size: USize, shallow flags: I32) returns shallow I32 {}
+nng_pair0_open := ext_proc(mut socket: nng_socket) returns shallow I32 {}
+nng_pub0_open := ext_proc(mut socket: nng_socket) returns shallow I32 {}
+nng_sub0_open := ext_proc(mut socket: nng_socket) returns shallow I32 {}

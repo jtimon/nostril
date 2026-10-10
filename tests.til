@@ -1,0 +1,183 @@
+mode test
+
+import("std/sys")
+import("std/file")
+_nostril_test_nng := import("lib/modes/nostril_nng")
+
+fake_relay_open_pair := proc(mut relay: nng_socket, mut client: nng_socket,
+        endpoint: Str) {
+    nostril_nng_check(nng_pair0_open(relay), "open fake relay control socket")
+    nostril_nng_check(nng_pair0_open(client), "open client control socket")
+    nostril_nng_configure(relay)
+    nostril_nng_configure(client)
+    mut listener := nng_listener(id = 0)
+    nostril_nng_check(nng_listen(relay, endpoint.c_str, listener, 0),
+        "listen on fake relay control channel")
+    mut dialer := nng_dialer(id = 0)
+    nostril_nng_check(nng_dial(client, endpoint.c_str, dialer, 0),
+        "dial fake relay control channel")
+}
+
+fake_relay_subscribe := proc(client: nng_socket, relay: nng_socket) {
+    nostril_nng_send(client, NOSTRIL_LOCAL_REQUEST)
+    assert(nostril_nng_receive(relay) == NOSTRIL_LOCAL_REQUEST)
+    nostril_nng_send(relay, NOSTRIL_LOCAL_EOSE)
+    assert(nostril_nng_receive(client) == NOSTRIL_LOCAL_EOSE)
+}
+
+fake_relay_close := proc(client: nng_socket, relay: nng_socket) {
+    nostril_nng_send(client, NOSTRIL_LOCAL_CLOSE)
+    assert(nostril_nng_receive(relay) == NOSTRIL_LOCAL_CLOSE)
+}
+
+test_generated_binding := test() {
+    version := nostril_version()
+    assert(version.starts_with("0.0.1-"))
+    assert(version.len() > "0.0.1-".len())
+}
+
+test_cli_version := test() {
+    command := Cmd.new("bin/nostril-cli", "--version")
+    command.capture()
+    assert(command.run() == 0)
+    output := command.out()
+    assert(output.trim() == nostril_version())
+}
+
+test_nng_pair_roundtrip := test() {
+    endpoint := "inproc://nostril-roundtrip"
+    mut relay := nng_socket(id = 0)
+    mut client := nng_socket(id = 0)
+    nostril_nng_check(nng_pair0_open(relay), "open test relay socket")
+    nostril_nng_check(nng_pair0_open(client), "open test client socket")
+    nostril_nng_configure(relay)
+    nostril_nng_configure(client)
+
+    mut listener := nng_listener(id = 0)
+    nostril_nng_check(nng_listen(relay, endpoint.c_str, listener, 0),
+        "listen in process")
+    mut dialer := nng_dialer(id = 0)
+    nostril_nng_check(nng_dial(client, endpoint.c_str, dialer, 0),
+        "dial in process")
+
+    nostril_nng_send(client, NOSTRIL_LOCAL_REQUEST)
+    assert(nostril_nng_receive(relay) == NOSTRIL_LOCAL_REQUEST)
+    nostril_nng_send(relay, NOSTRIL_LOCAL_EOSE)
+    assert(nostril_nng_receive(client) == NOSTRIL_LOCAL_EOSE)
+    nostril_nng_send(client, NOSTRIL_LOCAL_CLOSE)
+    assert(nostril_nng_receive(relay) == NOSTRIL_LOCAL_CLOSE)
+
+    nostril_nng_close(client)
+    nostril_nng_close(relay)
+}
+
+test_nng_pubsub_fanout := test() {
+    endpoint := "inproc://nostril-pubsub"
+    mut publisher := nng_socket(id = 0)
+    mut first := nng_socket(id = 0)
+    mut second := nng_socket(id = 0)
+    nostril_nng_check(nng_pub0_open(publisher), "open publisher socket")
+    nostril_nng_check(nng_sub0_open(first), "open first subscriber socket")
+    nostril_nng_check(nng_sub0_open(second), "open second subscriber socket")
+    nostril_nng_configure(publisher)
+    nostril_nng_configure(first)
+    nostril_nng_configure(second)
+    nostril_nng_subscribe_all(first)
+    nostril_nng_subscribe_all(second)
+
+    mut listener := nng_listener(id = 0)
+    nostril_nng_check(nng_listen(publisher, endpoint.c_str, listener, 0),
+        "listen as publisher")
+    mut first_dialer := nng_dialer(id = 0)
+    mut second_dialer := nng_dialer(id = 0)
+    nostril_nng_check(nng_dial(first, endpoint.c_str, first_dialer, 0),
+        "dial first subscriber")
+    nostril_nng_check(nng_dial(second, endpoint.c_str, second_dialer, 0),
+        "dial second subscriber")
+
+    // PUB/SUB has no delivery acknowledgement; allow subscriptions to attach.
+    sleep_ms(100)
+    nostril_nng_send(publisher, NOSTRIL_FAKE_EVENT)
+    assert(nostril_nng_receive(first) == NOSTRIL_FAKE_EVENT)
+    assert(nostril_nng_receive(second) == NOSTRIL_FAKE_EVENT)
+
+    nostril_nng_close(second)
+    nostril_nng_close(first)
+    nostril_nng_close(publisher)
+}
+
+test_fake_relay_lifecycle := test() {
+    mut first_relay := nng_socket(id = 0)
+    mut first_client := nng_socket(id = 0)
+    mut second_relay := nng_socket(id = 0)
+    mut second_client := nng_socket(id = 0)
+    fake_relay_open_pair(first_relay, first_client,
+        "inproc://nostril-fake-relay-first")
+    fake_relay_open_pair(second_relay, second_client,
+        "inproc://nostril-fake-relay-second")
+
+    mut publisher := nng_socket(id = 0)
+    mut first_subscriber := nng_socket(id = 0)
+    mut second_subscriber := nng_socket(id = 0)
+    nostril_nng_check(nng_pub0_open(publisher), "open fake relay publisher")
+    nostril_nng_check(nng_sub0_open(first_subscriber), "open first event subscriber")
+    nostril_nng_check(nng_sub0_open(second_subscriber), "open second event subscriber")
+    nostril_nng_configure(publisher)
+    nostril_nng_configure(first_subscriber)
+    nostril_nng_configure(second_subscriber)
+    nostril_nng_subscribe_all(first_subscriber)
+    nostril_nng_subscribe_all(second_subscriber)
+
+    stream_endpoint := "inproc://nostril-fake-relay-events"
+    mut listener := nng_listener(id = 0)
+    nostril_nng_check(nng_listen(publisher, stream_endpoint.c_str, listener, 0),
+        "listen on fake relay event stream")
+    mut first_dialer := nng_dialer(id = 0)
+    mut second_dialer := nng_dialer(id = 0)
+    nostril_nng_check(nng_dial(first_subscriber, stream_endpoint.c_str,
+        first_dialer, 0), "dial first event subscriber")
+    nostril_nng_check(nng_dial(second_subscriber, stream_endpoint.c_str,
+        second_dialer, 0), "dial second event subscriber")
+
+    fake_relay_subscribe(first_client, first_relay)
+    fake_relay_subscribe(second_client, second_relay)
+    sleep_ms(100)
+    nostril_nng_send(publisher, NOSTRIL_FAKE_EVENT)
+    assert(nostril_nng_receive(first_subscriber) == NOSTRIL_FAKE_EVENT)
+    assert(nostril_nng_receive(second_subscriber) == NOSTRIL_FAKE_EVENT)
+    fake_relay_close(first_client, first_relay)
+    fake_relay_close(second_client, second_relay)
+
+    nostril_nng_close(first_subscriber)
+    nostril_nng_close(second_subscriber)
+    nostril_nng_close(publisher)
+    nostril_nng_close(second_client)
+    nostril_nng_close(second_relay)
+    nostril_nng_close(first_client)
+    nostril_nng_close(first_relay)
+}
+
+test_cli_and_relay_processes := test() {
+    mkdir_p("tmp")
+    socket_path := format("tmp/nostril-process-", process_id().to_str(), ".ipc")
+    endpoint := format("ipc://", socket_path)
+    if File.exists(socket_path) { File.remove(socket_path) }
+
+    relay := Cmd.new("bin/nostril-relay", endpoint)
+    relay.capture()
+    relay.start()
+    sleep_ms(100)
+    client := Cmd.new("bin/nostril-cli", endpoint)
+    client.capture()
+    client_status := client.run()
+    relay_status := relay.wait()
+    if File.exists(socket_path) { File.remove(socket_path) }
+
+    assert(client_status == 0)
+    assert(relay_status == 0)
+    client_output := client.out()
+    relay_output := relay.out()
+    assert(client_output.contains(NOSTRIL_LOCAL_EOSE))
+    assert(relay_output.contains(NOSTRIL_LOCAL_REQUEST))
+    assert(relay_output.contains(NOSTRIL_LOCAL_CLOSE))
+}

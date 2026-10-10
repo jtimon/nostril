@@ -1,18 +1,22 @@
 * Initial architecture
 
-[[file:../README.org][Nostril]] | [[file:build.org][Building and running]]
+[[file:../README.org][Nostril]] | [[file:build.org][Building and running]] | [[file:transports.org][Transport design]]
 
-Nostril begins with one reusable library and two thin hosts. The split keeps
+Nostril begins with one reusable library and three thin hosts. The split keeps
 Nostr protocol and relay behavior independent of command-line or graphical
 presentation.
 
 - =lib/nostril/nostril.til= is the canonical =mode lib= entry point.
-- =src/nostril_cli.til= is the =mode cli= host.
-- =src/nostril_gui.til= is the =mode gui= host.
-- =test/= contains Til tests of the public library interface.
+- =modes.til= defines the project-owned =nostril_client= and =nostril_relay=
+  modes and their automatically imported NNG support.
+- =src/nostril_cli.til= is the local client host.
+- =src/nostril_relay.til= is the local relay harness.
+- =src/nostril_gui.til= is the =mode gui= host with an in-memory local timeline.
+- =tests.til= is the canonical =mode test= suite for the public library,
+  local NNG transports, and client/relay process boundary.
 
 The build creates Til's generated binding and rewrites its library reference
-to the absolute static archive for repository-local consumers. Both hosts use
+to the absolute static archive for repository-local consumers. All hosts use
 that same interface; they should not develop separate protocol implementations.
 
 ** Intended boundaries
@@ -22,8 +26,25 @@ messages, filters, subscription state, and transport-independent client
 behavior. Hosts should own argument handling, display state, input, and user
 interaction.
 
-WebSocket integration is intentionally undecided. Whether it is implemented in
-Til or through a C library, transport-specific resources should have explicit
-ownership and teardown, while protocol code remains testable without a live
-network. Persistence, key storage, signing, and supported NIPs likewise need
-documented interfaces and threat models before implementation.
+The first GUI deliberately keeps its posts in a host-owned =Vec(Str)=. It opens
+empty and shows only text entered during the current window session. These
+entries are not Nostr events: they have no keys, signatures, IDs, storage, or
+relay delivery. Moving them into the shared event model should happen only
+after that model defines the required NIP-01 serialization and ownership.
+
+User configuration is likewise deferred. Possible forms include a conventional
+=~/.nostril.conf= file or executable Til startup code such as
+=nostril.d/init.til=, but neither path nor format is an interface yet. Nostril
+will follow the configuration and initialization model established by Tiled
+rather than define a parallel loader prematurely.
+
+NNG is the initial local transport and integration harness. It may remain a
+production IPC backend after remote transports are added. WebSocket, WebRTC,
+and other backends should carry the same protocol messages and use the same
+state machines rather than duplicate NIP behavior. See
+[[file:transports.org][the transport design]] for local testing, custom Til modes,
+backend capabilities, and specification-derived issue planning.
+
+Transport-specific resources should have explicit ownership and teardown.
+Persistence, key storage, signing, and supported NIPs likewise need documented
+interfaces and threat models before implementation.

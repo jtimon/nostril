@@ -1,0 +1,2 @@
+// Re-export the shared local transport prelude into mode nostril_relay.
+_nostril_nng := import("nostril_nng")

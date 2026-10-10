@@ -1,0 +1,13 @@
+* Vendored dependencies
+
+** NNG
+
+=nng/= is an unmodified snapshot of NNG =v1.11= at upstream commit
+=84aa701f42968bf536141a24e826da66963b571a=:
+
+https://github.com/nanomsg/nng/tree/84aa701f42968bf536141a24e826da66963b571a
+
+NNG is distributed under the MIT license in =nng/LICENSE.txt=. To update it,
+replace the complete source snapshot from a reviewed upstream tag, update the
+commit recorded here and in the build documentation, then run the upstream NNG
+tests before running Nostril's clean build and transport tests.
