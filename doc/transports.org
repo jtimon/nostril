@@ -84,17 +84,19 @@ test: one publisher sends a fixed =EVENT= envelope to two subscribers. The
 =test_fake_relay_lifecycle= case layers two independent Pair0 control channels
 for =REQ=, =EOSE=, and =CLOSE= over a shared publisher/subscriber event channel.
 That split-channel arrangement belongs to the test harness; it is not the
-selected architecture for a production local backend. The event has a complete
-NIP-01 JSON shape but deliberately fake cryptographic fields, so these tests
-make no event-validation claim.
+selected architecture for a production local backend. The fixed fixture is a
+signed NIP-01 event. The lifecycle test delivers valid and invalid events and
+checks that each subscriber accepts only the valid event.
 
 This proves custom-mode loading, NNG linkage, process communication, bounded
-receives, basic subscription lifecycles, and NNG fan-out to two local consumers.
-It does not yet parse arbitrary JSON, validate events, evaluate filters, store
-events, implement post-=CLOSE= delivery suppression, support multiple clients
-in the standalone relay, or implement a public WebSocket relay. Pair0 and the
-fixed 64 KiB receive buffer are prototype constraints, not transport-interface
-decisions.
+receives, basic subscription lifecycles, NNG fan-out to two local consumers,
+and rejection of unsigned, wrong-ID, and bad-signature relay events. The shared
+library parses NIP-01 event objects and relay =EVENT= envelopes, including
+canonical tag arrays; it does not yet parse every relay message, evaluate
+filters, store events, implement post-=CLOSE= delivery suppression, support
+multiple clients in the standalone relay, or implement a public WebSocket
+relay. Pair0 and the fixed 64 KiB receive buffer are prototype constraints, not
+transport-interface decisions.
 
 ** Custom Til modes
 

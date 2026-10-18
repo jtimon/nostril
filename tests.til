@@ -4,6 +4,38 @@ import("std/sys")
 import("std/file")
 _nostril_test_nng := import("lib/modes/nostril_nng")
 
+TEST_SECRET_KEY := "0000000000000000000000000000000000000000000000000000000000000003"
+
+replace_hex_digit := func(text: Str, marker: Str) returns Str {
+    at := text.find(marker)
+    if at < 0 { panic("missing test marker: ", marker) }
+    digit := at.to_usize() + marker.len()
+    mut replacement := "0"
+    if text.substr(digit, 1) == "0" { replacement = "1" }
+    return format(text.substr(0, digit), replacement,
+        text.substr(digit + 1, text.len() - digit - 1))
+}
+
+unsigned_event := func(event: Str) returns Str {
+    at := event.find(",\"sig\":")
+    if at < 0 { panic("signed test event has no signature field") }
+    return format(event.substr(0, at.to_usize()), "}")
+}
+
+relay_event_for := func(event: Str, subscription: Str) returns Str {
+    return format("[\"EVENT\",\"", subscription, "\",", event, "]")
+}
+
+relay_event := func(event: Str) returns Str {
+    return relay_event_for(event, "local")
+}
+
+repeat_text := func(value: Str, count: USize) returns Str {
+    mut out := Str.with_capacity(value.len() * count)
+    for _i in 0..count { out.push_str(value) }
+    return out
+}
+
 fake_relay_open_pair := proc(mut relay: nng_socket, mut client: nng_socket,
         endpoint: Str) {
     nostril_nng_check(nng_pair0_open(relay), "open fake relay control socket")
@@ -42,6 +74,67 @@ test_cli_version := test() {
     assert(command.run() == 0)
     output := command.out()
     assert(output.trim() == nostril_version())
+}
+
+test_nip01_signing := test() {
+    assert(nostril_pubkey(TEST_SECRET_KEY) ==
+        "f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f9")
+    content := "quote \" slash \\ line\ncarriage\rtab\t"
+    event := nostril_sign_text_note(TEST_SECRET_KEY, content, 1700000000)
+    assert(nostril_event_is_valid(event))
+    assert(nostril_event_content(event) == content)
+    assert(event.contains("\"id\":\"0af9921ea5a776471017538e8b394a41a315aab5f9a72f913e51a1fcb6430367\""))
+    assert(event.contains("\"created_at\":1700000000"))
+    assert(event.contains("\"kind\":1,\"tags\":[]"))
+
+    generated := nostril_generate_secret_key()
+    assert(generated.len() == 64)
+    assert(nostril_pubkey(generated).len() == 64)
+    assert(nostril_now() > 1700000000)
+}
+
+test_nip01_rejects_invalid_events := test() {
+    // The fixed valid event also covers canonical tag serialization.
+    assert(nostril_relay_event_is_valid(NOSTRIL_FAKE_EVENT))
+    assert(nostril_relay_event_content(NOSTRIL_FAKE_EVENT) == "tagged")
+
+    event := nostril_sign_text_note(TEST_SECRET_KEY, "accepted", 1700000001)
+    no_signature := unsigned_event(event)
+    wrong_id := replace_hex_digit(event, "\"id\":\"")
+    bad_signature := replace_hex_digit(event, "\"sig\":\"")
+    assert(!nostril_event_is_valid(no_signature))
+    assert(!nostril_event_is_valid(wrong_id))
+    assert(!nostril_event_is_valid(bad_signature))
+    assert(!nostril_relay_event_is_valid(relay_event(no_signature)))
+    assert(!nostril_relay_event_is_valid(relay_event(wrong_id)))
+    assert(!nostril_relay_event_is_valid(relay_event(bad_signature)))
+    assert(nostril_relay_event_is_valid(relay_event(event)))
+    assert(!nostril_relay_event_is_valid(format("[\"EVENT\",\"local\",", event, ",null]")))
+    assert(!nostril_relay_event_is_valid(format("[\"NOTICE\",\"local\",", event, "]")))
+    assert(!nostril_relay_event_is_valid(format("[\"EVENT\",\"\",", event, "]")))
+
+    duplicate_kind := format(event.substr(0, event.len() - 1), ",\"kind\":1}")
+    assert(!nostril_event_is_valid(duplicate_kind))
+    assert(!nostril_relay_event_is_valid(format("[\"EVENT\",\"\\x\",", event, "]")))
+    assert(!nostril_relay_event_is_valid(format("[\"EVENT\",\"\\uD800\",", event, "]")))
+    assert(!nostril_relay_event_is_valid(relay_event_for(event, Str.from_byte(0xff))))
+
+    two_byte_scalar := format(Str.from_byte(0xc3), Str.from_byte(0xa9))
+    assert(nostril_relay_event_is_valid(relay_event_for(event,
+        repeat_text(two_byte_scalar, 64))))
+    assert(!nostril_relay_event_is_valid(relay_event_for(event,
+        repeat_text(two_byte_scalar, 65))))
+
+    mut tags := Str.with_capacity(32002)
+    tags.push_str("[")
+    count : USize = 2000
+    for i in 0..count {
+        if i > 0 { tags.push_str(",") }
+        tags.push_str("[\"p\",\"value\"]")
+    }
+    tags.push_str("]")
+    tag_heavy := event.replace("\"tags\":[]", format("\"tags\":", tags))
+    assert(!nostril_event_is_valid(tag_heavy))
 }
 
 test_nng_pair_roundtrip := test() {
@@ -142,9 +235,24 @@ test_fake_relay_lifecycle := test() {
     fake_relay_subscribe(first_client, first_relay)
     fake_relay_subscribe(second_client, second_relay)
     sleep_ms(100)
-    nostril_nng_send(publisher, NOSTRIL_FAKE_EVENT)
-    assert(nostril_nng_receive(first_subscriber) == NOSTRIL_FAKE_EVENT)
-    assert(nostril_nng_receive(second_subscriber) == NOSTRIL_FAKE_EVENT)
+    event := nostril_sign_text_note(TEST_SECRET_KEY, "accepted relay note", 1700000002)
+    messages := array(Str,
+        relay_event(unsigned_event(event)),
+        relay_event(replace_hex_digit(event, "\"id\":\"")),
+        relay_event(replace_hex_digit(event, "\"sig\":\"")),
+        relay_event(event))
+    mut first_accepted : I64 = 0
+    mut second_accepted : I64 = 0
+    for raw_message : Str in messages {
+        mut message := raw_message.clone()
+        nostril_nng_send(publisher, message)
+        first_received := nostril_nng_receive(first_subscriber)
+        second_received := nostril_nng_receive(second_subscriber)
+        if nostril_relay_event_is_valid(first_received) { first_accepted++ }
+        if nostril_relay_event_is_valid(second_received) { second_accepted++ }
+    }
+    assert(first_accepted == 1)
+    assert(second_accepted == 1)
     fake_relay_close(first_client, first_relay)
     fake_relay_close(second_client, second_relay)
 

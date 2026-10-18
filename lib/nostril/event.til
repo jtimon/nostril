@@ -1,0 +1,537 @@
+mode lib
+
+crypto := import("std/crypto")
+import("std/crypto", CryptoError)
+
+getrandom := ext_proc(mut buf: Dynamic, shallow count: USize,
+    shallow flags: U32) returns shallow I64 {}
+time := ext_proc(mut out: Dynamic) returns shallow I64 {}
+
+priv JsonCursor := struct {
+    text : Str = ""
+    at : USize = 0
+}
+
+priv NostrEventFields := struct {
+    id : Str = ""
+    pubkey : Str = ""
+    created_at : I64 = 0
+    kind : I64 = 0
+    tags : Str = ""
+    content : Str = ""
+    sig : Str = ""
+    has_id := false
+    has_pubkey := false
+    has_created_at := false
+    has_kind := false
+    has_tags := false
+    has_content := false
+    has_sig := false
+}
+
+priv nostril_utf8 := func(code: I64) returns Str {
+    if code < 0 || code > 0x10ffff || (code >= 0xd800 && code <= 0xdfff) {
+        return ""
+    }
+    if code < 128 { return Str.from_byte(code.to_u8()) }
+    if code < 2048 {
+        return format(Str.from_byte((192 + code / 64).to_u8()),
+            Str.from_byte((128 + code.mod(64)).to_u8()))
+    }
+    if code < 65536 {
+        return format(Str.from_byte((224 + code / 4096).to_u8()),
+            Str.from_byte((128 + (code / 64).mod(64)).to_u8()),
+            Str.from_byte((128 + code.mod(64)).to_u8()))
+    }
+    return format(Str.from_byte((240 + code / 262144).to_u8()),
+        Str.from_byte((128 + (code / 4096).mod(64)).to_u8()),
+        Str.from_byte((128 + (code / 64).mod(64)).to_u8()),
+        Str.from_byte((128 + code.mod(64)).to_u8()))
+}
+
+priv json_skip_ws := func(mut cursor: JsonCursor) {
+    while cursor.at < cursor.text.len() {
+        ref byte : I8 = cursor.text[cursor.at]
+        if byte != ' ' && byte != '\n' && byte != '\r' && byte != '\t' { return }
+        cursor.at++
+    }
+}
+
+priv json_take := func(mut cursor: JsonCursor, wanted: I8) returns Bool {
+    json_skip_ws(cursor)
+    if cursor.at >= cursor.text.len() || cursor.text[cursor.at] != wanted { return false }
+    cursor.at++
+    return true
+}
+
+priv json_hex_value := func(byte: I8) returns I64 {
+    if byte >= '0' && byte <= '9' { return (byte - '0').cast(I64) }
+    if byte >= 'a' && byte <= 'f' { return (byte - 'a').cast(I64) + 10 }
+    if byte >= 'A' && byte <= 'F' { return (byte - 'A').cast(I64) + 10 }
+    return -1
+}
+
+priv json_hex_quad := func(mut cursor: JsonCursor, mut value: I64) returns Bool {
+    if cursor.at + 4 > cursor.text.len() { return false }
+    value = 0
+    four : USize = 4
+    for _i in 0..four {
+        digit := json_hex_value(cursor.text[cursor.at])
+        if digit < 0 { return false }
+        value = value * 16 + digit
+        cursor.at++
+    }
+    return true
+}
+
+priv nostril_utf8_width := func(text: Str, at: USize, mut width: USize) returns Bool {
+    if at >= text.len() { return false }
+    first := text[at].cast(U8).to_i64()
+    if first < 0x80 { width = 1; return true }
+    mut wanted : USize = 0
+    if first >= 0xc2 && first <= 0xdf { wanted = 2 }
+    else if first >= 0xe0 && first <= 0xef { wanted = 3 }
+    else if first >= 0xf0 && first <= 0xf4 { wanted = 4 }
+    else { return false }
+    if at + wanted > text.len() { return false }
+    second := text[at + 1].cast(U8).to_i64()
+    if second < 0x80 || second > 0xbf { return false }
+    if first == 0xe0 && second < 0xa0 { return false }
+    if first == 0xed && second > 0x9f { return false }
+    if first == 0xf0 && second < 0x90 { return false }
+    if first == 0xf4 && second > 0x8f { return false }
+    mut i : USize = 2
+    while i < wanted {
+        continuation := text[at + i].cast(U8).to_i64()
+        if continuation < 0x80 || continuation > 0xbf { return false }
+        i++
+    }
+    width = wanted
+    return true
+}
+
+priv nostril_valid_utf8 := func(text: Str) returns Bool {
+    mut at : USize = 0
+    while at < text.len() {
+        mut width : USize = 0
+        if !nostril_utf8_width(text, at, width) { return false }
+        at = at + width
+    }
+    return true
+}
+
+priv nostril_utf8_scalars := func(text: Str) returns USize {
+    mut at : USize = 0
+    mut count : USize = 0
+    while at < text.len() {
+        mut width : USize = 0
+        if !nostril_utf8_width(text, at, width) { return 0 }
+        at = at + width
+        count++
+    }
+    return count
+}
+
+priv json_parse_string := func(mut cursor: JsonCursor, mut out: Str) returns Bool {
+    json_skip_ws(cursor)
+    if cursor.at >= cursor.text.len() || cursor.text[cursor.at] != '"' { return false }
+    cursor.at++
+    mut end := cursor.at
+    while end < cursor.text.len() && cursor.text[end] != '"' {
+        if cursor.text[end] == '\\' {
+            end++
+            if end >= cursor.text.len() { return false }
+        }
+        end++
+    }
+    if end >= cursor.text.len() { return false }
+    mut decoded := Str.with_capacity(end - cursor.at)
+    while cursor.at < cursor.text.len() {
+        ref byte : I8 = cursor.text[cursor.at]
+        cursor.at++
+        if byte == '"' {
+            out = decoded
+            return true
+        }
+        if byte.cast(U8).to_i64() < 0x20 { return false }
+        if byte != '\\' {
+            start := cursor.at - 1
+            mut width : USize = 0
+            if !nostril_utf8_width(cursor.text, start, width) { return false }
+            decoded.push_str(cursor.text.substr(start, width))
+            cursor.at = start + width
+            continue
+        }
+        if cursor.at >= cursor.text.len() { return false }
+        ref escaped : I8 = cursor.text[cursor.at]
+        cursor.at++
+        if escaped == '"' || escaped == '\\' || escaped == '/' {
+            decoded.push_str(Str.from_byte(escaped.cast(U8)))
+        } else if escaped == 'b' { decoded.push_str(Str.from_byte(8)) }
+        else if escaped == 'f' { decoded.push_str(Str.from_byte(12)) }
+        else if escaped == 'n' { decoded.push_str(Str.from_byte(10)) }
+        else if escaped == 'r' { decoded.push_str(Str.from_byte(13)) }
+        else if escaped == 't' { decoded.push_str(Str.from_byte(9)) }
+        else if escaped == 'u' {
+            mut code : I64 = 0
+            if !json_hex_quad(cursor, code) { return false }
+            if code >= 0xd800 && code <= 0xdbff {
+                if cursor.at + 6 > cursor.text.len() ||
+                    cursor.text[cursor.at] != '\\' || cursor.text[cursor.at + 1] != 'u' {
+                    return false
+                }
+                cursor.at = cursor.at + 2
+                mut low : I64 = 0
+                if !json_hex_quad(cursor, low) || low < 0xdc00 || low > 0xdfff { return false }
+                code = 0x10000 + (code - 0xd800) * 1024 + low - 0xdc00
+            } else if code >= 0xdc00 && code <= 0xdfff { return false }
+            decoded.push_str(nostril_utf8(code))
+        } else { return false }
+    }
+    return false
+}
+
+priv json_quote := func(value: Str) returns Str {
+    mut out := Str.with_capacity(value.len() * 6 + 2)
+    out.push_str("\"")
+    for i in 0..value.len() {
+        ref byte : I8 = value[i]
+        if byte == '"' { out.push_str("\\\"") }
+        else if byte == '\\' { out.push_str("\\\\") }
+        else if byte == '\n' { out.push_str("\\n") }
+        else if byte == '\r' { out.push_str("\\r") }
+        else if byte == '\t' { out.push_str("\\t") }
+        else if byte.cast(U8).to_i64() == 8 { out.push_str("\\b") }
+        else if byte.cast(U8).to_i64() == 12 { out.push_str("\\f") }
+        else if byte.cast(U8).to_i64() < 0x20 {
+            digits := "0123456789abcdef"
+            n := byte.cast(U8).to_i64()
+            out.push_str(format("\\u00", digits.substr((n / 16).to_usize(), 1),
+                digits.substr(n.mod(16).to_usize(), 1)))
+        } else { out.push_str(Str.from_byte(byte.cast(U8))) }
+    }
+    out.push_str("\"")
+    return out
+}
+
+priv json_parse_nonnegative_i64 := func(mut cursor: JsonCursor, mut out: I64) returns Bool {
+    json_skip_ws(cursor)
+    if cursor.at >= cursor.text.len() { return false }
+    ref first : I8 = cursor.text[cursor.at]
+    if first < '0' || first > '9' { return false }
+    if first == '0' && cursor.at + 1 < cursor.text.len() {
+        ref next : I8 = cursor.text[cursor.at + 1]
+        if next >= '0' && next <= '9' { return false }
+    }
+    mut value : I64 = 0
+    while cursor.at < cursor.text.len() {
+        ref byte : I8 = cursor.text[cursor.at]
+        if byte < '0' || byte > '9' { break }
+        digit := (byte - '0').cast(I64)
+        if value > (I64.MAX - digit) / 10 { return false }
+        value = value * 10 + digit
+        cursor.at++
+    }
+    out = value
+    return true
+}
+
+priv json_skip_number := func(mut cursor: JsonCursor) returns Bool {
+    json_skip_ws(cursor)
+    start := cursor.at
+    if cursor.at < cursor.text.len() && cursor.text[cursor.at] == '-' { cursor.at++ }
+    if cursor.at >= cursor.text.len() { return false }
+    if cursor.text[cursor.at] == '0' { cursor.at++ }
+    else {
+        if cursor.text[cursor.at] < '1' || cursor.text[cursor.at] > '9' { return false }
+        while cursor.at < cursor.text.len() && cursor.text[cursor.at] >= '0' &&
+            cursor.text[cursor.at] <= '9' { cursor.at++ }
+    }
+    if cursor.at < cursor.text.len() && cursor.text[cursor.at] == '.' {
+        cursor.at++
+        digit_start := cursor.at
+        while cursor.at < cursor.text.len() && cursor.text[cursor.at] >= '0' &&
+            cursor.text[cursor.at] <= '9' { cursor.at++ }
+        if cursor.at == digit_start { return false }
+    }
+    if cursor.at < cursor.text.len() &&
+        (cursor.text[cursor.at] == 'e' || cursor.text[cursor.at] == 'E') {
+        cursor.at++
+        if cursor.at < cursor.text.len() &&
+            (cursor.text[cursor.at] == '+' || cursor.text[cursor.at] == '-') { cursor.at++ }
+        digit_start := cursor.at
+        while cursor.at < cursor.text.len() && cursor.text[cursor.at] >= '0' &&
+            cursor.text[cursor.at] <= '9' { cursor.at++ }
+        if cursor.at == digit_start { return false }
+    }
+    return cursor.at > start
+}
+
+priv json_skip_value := func(mut cursor: JsonCursor, depth: I64) returns Bool {
+    if depth > 64 { return false }
+    json_skip_ws(cursor)
+    if cursor.at >= cursor.text.len() { return false }
+    ref byte : I8 = cursor.text[cursor.at]
+    if byte == '"' {
+        mut ignored := ""
+        return json_parse_string(cursor, ignored)
+    }
+    if byte == '[' {
+        cursor.at++
+        json_skip_ws(cursor)
+        if cursor.at < cursor.text.len() && cursor.text[cursor.at] == ']' {
+            cursor.at++
+            return true
+        }
+        while true {
+            if !json_skip_value(cursor, depth + 1) { return false }
+            json_skip_ws(cursor)
+            if cursor.at < cursor.text.len() && cursor.text[cursor.at] == ']' {
+                cursor.at++
+                return true
+            }
+            if !json_take(cursor, ',') { return false }
+        }
+    }
+    if byte == '{' {
+        cursor.at++
+        json_skip_ws(cursor)
+        if cursor.at < cursor.text.len() && cursor.text[cursor.at] == '}' {
+            cursor.at++
+            return true
+        }
+        while true {
+            mut key := ""
+            if !json_parse_string(cursor, key) || !json_take(cursor, ':') ||
+                !json_skip_value(cursor, depth + 1) { return false }
+            json_skip_ws(cursor)
+            if cursor.at < cursor.text.len() && cursor.text[cursor.at] == '}' {
+                cursor.at++
+                return true
+            }
+            if !json_take(cursor, ',') { return false }
+        }
+    }
+    for literal : Str in array(Str, "true", "false", "null") {
+        if cursor.text.substr(cursor.at, cursor.text.len() - cursor.at).starts_with(literal) {
+            cursor.at = cursor.at + literal.len()
+            return true
+        }
+    }
+    return json_skip_number(cursor)
+}
+
+priv json_parse_tags := func(mut cursor: JsonCursor, mut canonical: Str) returns Bool {
+    if !json_take(cursor, '[') { return false }
+    mut out := Str.with_capacity(cursor.text.len() - cursor.at + 1)
+    out.push_str("[")
+    json_skip_ws(cursor)
+    if cursor.at < cursor.text.len() && cursor.text[cursor.at] == ']' {
+        cursor.at++
+        canonical = "[]"
+        return true
+    }
+    mut first_tag := true
+    while true {
+        if !json_take(cursor, '[') { return false }
+        if !first_tag { out.push_str(",") }
+        out.push_str("[")
+        mut first_value := true
+        while true {
+            mut value := ""
+            if !json_parse_string(cursor, value) { return false }
+            if !first_value { out.push_str(",") }
+            out.push_str(json_quote(value))
+            first_value = false
+            json_skip_ws(cursor)
+            if cursor.at < cursor.text.len() && cursor.text[cursor.at] == ']' {
+                cursor.at++
+                break
+            }
+            if !json_take(cursor, ',') { return false }
+        }
+        if first_value { return false }
+        out.push_str("]")
+        first_tag = false
+        json_skip_ws(cursor)
+        if cursor.at < cursor.text.len() && cursor.text[cursor.at] == ']' {
+            cursor.at++
+            out.push_str("]")
+            canonical = out
+            return true
+        }
+        if !json_take(cursor, ',') { return false }
+    }
+    return false
+}
+
+priv nostril_parse_event := func(mut cursor: JsonCursor,
+        mut fields: NostrEventFields) returns Bool {
+    if !json_take(cursor, '{') { return false }
+    json_skip_ws(cursor)
+    if cursor.at < cursor.text.len() && cursor.text[cursor.at] == '}' { return false }
+    while true {
+        mut key := ""
+        if !json_parse_string(cursor, key) || !json_take(cursor, ':') { return false }
+        if key == "id" {
+            if fields.has_id || !json_parse_string(cursor, fields.id) { return false }
+            fields.has_id = true
+        } else if key == "pubkey" {
+            if fields.has_pubkey || !json_parse_string(cursor, fields.pubkey) { return false }
+            fields.has_pubkey = true
+        } else if key == "created_at" {
+            if fields.has_created_at || !json_parse_nonnegative_i64(cursor, fields.created_at) { return false }
+            fields.has_created_at = true
+        } else if key == "kind" {
+            if fields.has_kind || !json_parse_nonnegative_i64(cursor, fields.kind) { return false }
+            fields.has_kind = true
+        } else if key == "tags" {
+            if fields.has_tags || !json_parse_tags(cursor, fields.tags) { return false }
+            fields.has_tags = true
+        } else if key == "content" {
+            if fields.has_content || !json_parse_string(cursor, fields.content) { return false }
+            fields.has_content = true
+        } else if key == "sig" {
+            if fields.has_sig || !json_parse_string(cursor, fields.sig) { return false }
+            fields.has_sig = true
+        } else if !json_skip_value(cursor, 0) { return false }
+        json_skip_ws(cursor)
+        if cursor.at < cursor.text.len() && cursor.text[cursor.at] == '}' {
+            cursor.at++
+            break
+        }
+        if !json_take(cursor, ',') { return false }
+    }
+    return fields.has_id && fields.has_pubkey && fields.has_created_at &&
+        fields.has_kind && fields.has_tags && fields.has_content && fields.has_sig &&
+        fields.kind <= 65535
+}
+
+priv nostril_is_lower_hex := func(value: Str, length: USize) returns Bool {
+    if value.len() != length { return false }
+    for i in 0..value.len() {
+        ref byte : I8 = value[i]
+        if !((byte >= '0' && byte <= '9') || (byte >= 'a' && byte <= 'f')) { return false }
+    }
+    return true
+}
+
+priv nostril_serialized_event := func(fields: NostrEventFields) returns Str {
+    return format("[0,", json_quote(fields.pubkey), ",", fields.created_at.to_str(),
+        ",", fields.kind.to_str(), ",", fields.tags, ",", json_quote(fields.content), "]")
+}
+
+priv nostril_valid_fields := proc(fields: NostrEventFields) returns Bool {
+    if !nostril_is_lower_hex(fields.id, 64) ||
+        !nostril_is_lower_hex(fields.pubkey, 64) ||
+        !nostril_is_lower_hex(fields.sig, 128) { return false }
+    digest := crypto.sha256_str(nostril_serialized_event(fields))
+    if digest.to_hex() != fields.id { return false }
+    mut valid := false
+    mut bad_key := false
+    valid = crypto.schnorr_verify(U256.from_hex(fields.pubkey), digest,
+        crypto.Signature.from_hex(fields.sig))?
+    catch (_error: CryptoError) { bad_key = true }
+    return !bad_key && valid
+}
+
+priv nostril_parse_complete_event := func(event_json: Str,
+        mut fields: NostrEventFields) returns Bool {
+    mut cursor := JsonCursor(text = event_json.borrowed_view())
+    if !nostril_parse_event(cursor, fields) { return false }
+    json_skip_ws(cursor)
+    return cursor.at == cursor.text.len()
+}
+
+priv nostril_parse_relay_event := func(message: Str,
+        mut fields: NostrEventFields) returns Bool {
+    mut cursor := JsonCursor(text = message.borrowed_view())
+    if !json_take(cursor, '[') { return false }
+    mut command := ""
+    mut subscription := ""
+    if !json_parse_string(cursor, command) || command != "EVENT" ||
+        !json_take(cursor, ',') || !json_parse_string(cursor, subscription) ||
+        subscription.len() == 0 || nostril_utf8_scalars(subscription) > 64 ||
+        !json_take(cursor, ',') ||
+        !nostril_parse_event(cursor, fields) || !json_take(cursor, ']') { return false }
+    json_skip_ws(cursor)
+    return cursor.at == cursor.text.len()
+}
+
+priv nostril_random_u256 := proc() returns U256 {
+    mut value := U256()
+    mut offset : USize = 0
+    total : USize = 32
+    while offset < total {
+        got := getrandom(ptr_add(value, offset.cast(UPtr)), total - offset, 0)
+        if got <= 0 { panic("getrandom failed while creating an ephemeral key") }
+        offset = offset + got.to_usize()
+    }
+    return value
+}
+
+/// Generate a session key with operating-system entropy. Callers decide its lifetime.
+nostril_generate_secret_key := proc() returns Str {
+    zero := U256()
+    order := U256.from_hex("fffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141")
+    while true {
+        key := nostril_random_u256()
+        if U256.cmp(key, zero) > 0 && U256.cmp(key, order) < 0 { return key.to_hex() }
+    }
+    return ""
+}
+
+/// Derive a lowercase BIP-340 x-only public key from a secret key.
+nostril_pubkey := proc(secret_key: Str) returns Str {
+    if !nostril_is_lower_hex(secret_key, 64) { panic("invalid Nostr secret key encoding") }
+    return crypto.schnorr_pubkey(U256.from_hex(secret_key))!.to_hex()
+}
+
+/// Current Unix timestamp in seconds.
+nostril_now := proc() returns I64 {
+    now := time(to_ptr(0))
+    if now < 0 { panic("could not read the current Unix timestamp") }
+    return now
+}
+
+/// Create and sign a kind-1 NIP-01 event with no tags.
+nostril_sign_text_note := proc(secret_key: Str, content: Str, created_at: I64) returns Str {
+    if created_at < 0 { panic("a Nostr event timestamp cannot be negative") }
+    if !nostril_valid_utf8(content) { panic("Nostr event content must be valid UTF-8") }
+    pubkey := nostril_pubkey(secret_key)
+    mut fields := NostrEventFields(pubkey = pubkey, created_at = created_at,
+        kind = 1, tags = "[]", content = content)
+    digest := crypto.sha256_str(nostril_serialized_event(fields))
+    fields.id = digest.to_hex()
+    fields.sig = crypto.schnorr_sign(U256.from_hex(secret_key), digest, nostril_random_u256())!.to_hex()
+    return format("{\"id\":", json_quote(fields.id), ",\"pubkey\":",
+        json_quote(fields.pubkey), ",\"created_at\":", fields.created_at.to_str(),
+        ",\"kind\":1,\"tags\":[],\"content\":", json_quote(fields.content),
+        ",\"sig\":", json_quote(fields.sig), "}")
+}
+
+/// Verify an event's canonical id and BIP-340 signature.
+nostril_event_is_valid := proc(event_json: Str) returns Bool {
+    mut fields := NostrEventFields()
+    return nostril_parse_complete_event(event_json, fields) && nostril_valid_fields(fields)
+}
+
+/// Return content only from a valid event; invalid events produce an empty string.
+nostril_event_content := proc(event_json: Str) returns Str {
+    mut fields := NostrEventFields()
+    if !nostril_parse_complete_event(event_json, fields) || !nostril_valid_fields(fields) { return "" }
+    return fields.content.clone()
+}
+
+/// Verify a relay-to-client `["EVENT", subscription, event]` message.
+nostril_relay_event_is_valid := proc(message: Str) returns Bool {
+    mut fields := NostrEventFields()
+    return nostril_parse_relay_event(message, fields) && nostril_valid_fields(fields)
+}
+
+/// Return content only from a valid relay EVENT; invalid messages are ignored.
+nostril_relay_event_content := proc(message: Str) returns Str {
+    mut fields := NostrEventFields()
+    if !nostril_parse_relay_event(message, fields) || !nostril_valid_fields(fields) { return "" }
+    return fields.content.clone()
+}

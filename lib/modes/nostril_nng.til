@@ -6,7 +6,8 @@ NOSTRIL_LOCAL_ENDPOINT := "ipc://tmp/nostril.ipc"
 NOSTRIL_LOCAL_REQUEST := "[\"REQ\",\"local\",{\"limit\":0}]"
 NOSTRIL_LOCAL_EOSE := "[\"EOSE\",\"local\"]"
 NOSTRIL_LOCAL_CLOSE := "[\"CLOSE\",\"local\"]"
-NOSTRIL_FAKE_EVENT := "[\"EVENT\",\"local\",{\"id\":\"0000000000000000000000000000000000000000000000000000000000000000\",\"pubkey\":\"1111111111111111111111111111111111111111111111111111111111111111\",\"created_at\":0,\"kind\":1,\"tags\":[],\"content\":\"test event\",\"sig\":\"22222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222\"}]"
+// Fixed valid event with a non-empty tag, wrapped as a relay EVENT.
+NOSTRIL_FAKE_EVENT := "[\"EVENT\",\"local\",{\"id\":\"8aa4018f16be8a8868d70343cd89bc8ddf9b6d7f84da31cced5f157f783cd595\",\"pubkey\":\"f9308a019258c31049344f85f89d5229b531c845836f99b08601f113bce036f9\",\"created_at\":1700000003,\"kind\":1,\"tags\":[[\"p\",\"abc\"]],\"content\":\"tagged\",\"sig\":\"0725cf74dd335927fb4a2dc721eee496cdd958b70e6d61702a8cfa7f289763978309c84672b46e5a7d22bbe8e02a76b9a3a947961f4561277fcd506475e2116e\"}]"
 NOSTRIL_NNG_MAX_MESSAGE : USize = 65536
 
 nostril_nng_read_cstr := func(data: Dynamic) returns Str {

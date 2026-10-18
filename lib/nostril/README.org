@@ -1,9 +1,9 @@
 * libnostril
 
 =nostril.til= is the canonical =mode lib= entry point for reusable Nostril
-behavior. It currently exports only version metadata so that library generation,
-binding consumption, and both application builds can be verified before the
-protocol API is designed.
+behavior. It exports version metadata plus ephemeral key generation, public-key
+derivation, NIP-01 kind-1 signing, event validation, and validated content
+extraction from event objects and relay =EVENT= envelopes.
 
 From the repository root:
 

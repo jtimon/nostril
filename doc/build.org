@@ -4,13 +4,18 @@
 
 ** Requirements
 
-Nostril currently targets installed Til =0.0.1-f24e6004c= (check with
-=til -v=). The =til= executable, Git, CMake 3.15 or newer, and a C compiler must
-be on =PATH=, and the source must be built from a Git checkout. Like Tiled, the
-build driver uses a compile-time macro to derive the =0.0.1-<short-commit>=
-version; it generates the library's shared version constant before building.
-The graphical client also requires the GUI dependencies supplied by the Til
-installation.
+The generated [[file:til-dependency.org][Til build dependency]] records the compiler used by the
+last successful full build; =make.til= updates it automatically.
+
+Nostril requires an installed Til whose support tree includes =std/crypto=,
+=vendor/bindings/secp256k1.til=, and both =libsecp256k1.a= and its interpreter
+shared-library twin (=.so=, or =.dll= on Windows; check the compiler with
+=til -v=). The =til= executable, Git, CMake
+3.15 or newer, and a C compiler must be on =PATH=, and the source must be built
+from a Git checkout. Like Tiled, the build driver uses a compile-time macro to
+derive the =0.0.1-<short-commit>= version; it generates the library's shared
+version constant before building. The graphical client also requires the GUI
+dependencies supplied by the Til installation.
 
 The local client and relay use the project-owned NNG =v1.11= snapshot under
 =vendor/nng/=, pinned to upstream commit
@@ -48,9 +53,10 @@ relay are built with the project-owned modes in =modes.til=. =library= builds
 only the archive, shared object, and generated language bindings. =test=
 rebuilds the library and clients, then runs =tests.til= through Til's =test=
 command. Til interprets the complete suite and then compiles and runs it. The
-suite covers the generated binding, an NNG =inproc://= round trip,
-publisher/subscriber fan-out, a layered two-client fake-relay lifecycle, and
-the separate client and relay over =ipc://=.
+suite covers the generated binding, ephemeral key generation, NIP-01 signing
+and validation, rejection of unsigned and cryptographically invalid events, an
+NNG =inproc://= round trip, publisher/subscriber fan-out, a layered two-client
+fake-relay lifecycle, and the separate client and relay over =ipc://=.
 
 =clean= removes =bin/=, =gen/=, and =tmp/=. The Git-ignored =.inspirations/=
 directory is reserved for reference repositories and is preserved.

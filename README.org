@@ -9,16 +9,19 @@ A [[https://github.com/nostr-protocol/nostr][nostr]] client written in [[https:/
 
 ** Getting started
 
-Nostril targets installed Til =0.0.1-f24e6004c=. From the repository root:
+Nostril requires an installed Til with =std/crypto= and its secp256k1 archive
+and interpreter twin. See the generated [[file:doc/til-dependency.org][Til build dependency]].
+From the repository root:
 
 #+begin_src sh
 ./make.til
 ./bin/nostril-gui
 #+end_src
 
-The GUI starts with an empty local timeline. Type into the composer and press
-Enter or =Send= to see your own messages. They remain only in memory for
-that window session: no event is signed, persisted, or sent to a relay.
+The GUI creates an ephemeral keypair from operating-system entropy and displays
+its public key. Type into the composer and press Enter or =Send= to create a
+signed NIP-01 kind-1 event. The secret key and events remain only in memory for
+that window session; nothing is persisted or sent to a relay yet.
 
 To run the scripted local NIP-01 exchange, start the relay and then run the CLI
 from another terminal:
@@ -56,6 +59,10 @@ There is no need to invent a Nostril-specific mechanism first.
 Nostril is an experimental Til project, not an urgent replacement for mature
 Nostr software. Users who need a complete Nostr client today should use one of
 the existing clients available in other languages.
+
+Til's =std/crypto= is also experimental and has not had a security review. In
+particular, Til does not yet guarantee secure erasure of managed secret-key
+copies. The GUI account is suitable for this prototype, not for valuable keys.
 
 ** Dependencies
 

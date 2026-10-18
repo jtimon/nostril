@@ -1,6 +1,7 @@
 mode lib
 
 import("../../gen/nostril_version")
+_nostril_event := import("event")
 
 nostril_version := func() returns Str {
     return NOSTRIL_VERSION

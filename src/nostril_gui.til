@@ -88,6 +88,9 @@ main := proc(args: ..Str) {
     muted := Color(r = 152, g = 152, b = 152, a = 255)
     action := Color(r = 74, g = 112, b = 170, a = 255)
 
+    // The account exists only for this process. Nothing writes the secret key.
+    secret_key := nostril_generate_secret_key()
+    public_key := nostril_pubkey(secret_key)
     mut messages := Vec(Str).new()
     mut composer := ""
     mut composer_scalars : I32 = 0
@@ -134,7 +137,9 @@ main := proc(args: ..Str) {
             mouse.y >= field_y.to_f32() && mouse.y < (field_y + field_h).to_f32()
         submit := IsKeyPressed(257) || (button_hover && IsMouseButtonPressed(0))
         if submit && composer.trim().len() > 0 {
-            messages.push(own composer.clone())
+            event := nostril_sign_text_note(secret_key, composer, nostril_now())
+            if !nostril_event_is_valid(event) { panic("newly signed event did not verify") }
+            messages.push(own event)
             composer = ""
             composer_scalars = 0
         }
@@ -144,7 +149,10 @@ main := proc(args: ..Str) {
 
         DrawRectangle(0, header_h - 1, width, 1, border)
         DrawText("Nostril".c_str, margin, 12, 20, text)
-        status := "Local only - 0 relays"
+        mut status := format("Ephemeral pubkey ", public_key, " | 0 relays")
+        if MeasureText(status.c_str, 13) > width - 100 {
+            status = format("Ephemeral ", public_key.substr(0, 16), "... | 0 relays")
+        }
         DrawText(status.c_str, width - margin - MeasureText(status.c_str, 13), 16, 13, muted)
 
         timeline_top := header_h + 8
@@ -157,7 +165,8 @@ main := proc(args: ..Str) {
             mut index := messages.len()
             while index > 0 && bottom > timeline_top {
                 index--
-                ref message : Str = messages[index]
+                ref event : Str = messages[index]
+                message := nostril_event_content(event)
                 message_x := content_x + 48
                 message_w := content_w - 48
                 line_count := gui_wrapped_lines(message, message_w, 16)

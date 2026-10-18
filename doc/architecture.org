@@ -11,26 +11,30 @@ presentation.
   modes and their automatically imported NNG support.
 - =src/nostril_cli.til= is the local client host.
 - =src/nostril_relay.til= is the local relay harness.
-- =src/nostril_gui.til= is the =mode gui= host with an in-memory local timeline.
+- =src/nostril_gui.til= is the =mode gui= host with an ephemeral account and
+  in-memory signed-event timeline.
 - =tests.til= is the canonical =mode test= suite for the public library,
   local NNG transports, and client/relay process boundary.
 
-The build creates Til's generated binding and rewrites its library reference
-to the absolute static archive for repository-local consumers. All hosts use
-that same interface; they should not develop separate protocol implementations.
+The build creates Til's generated binding, then selects a narrow public binding
+that links the repository-local static archive and Til's secp256k1 support.
+All hosts use that same interface; they should not develop separate protocol
+implementations.
 
 ** Intended boundaries
 
-The library should eventually own event representation and validation, relay
-messages, filters, subscription state, and transport-independent client
-behavior. Hosts should own argument handling, display state, input, and user
-interaction.
+The library owns NIP-01 kind-1 serialization and signing, event ID and signature
+validation, and parsing of relay =EVENT= envelopes. It should eventually also
+own other event kinds, relay messages, filters, subscription state, and
+transport-independent client behavior. Hosts own argument handling, display
+state, input, and user interaction.
 
-The first GUI deliberately keeps its posts in a host-owned =Vec(Str)=. It opens
-empty and shows only text entered during the current window session. These
-entries are not Nostr events: they have no keys, signatures, IDs, storage, or
-relay delivery. Moving them into the shared event model should happen only
-after that model defines the required NIP-01 serialization and ownership.
+The GUI keeps signed event JSON in a host-owned =Vec(Str)=. It creates one
+OS-random keypair at startup, signs each non-empty composer submission as a
+kind-1 event, verifies it, and displays content only through the shared event
+API. The key and events have process lifetime only: there is no key storage,
+persistence, or relay delivery. Relay-facing consumers use the same validation
+before accepting an =EVENT= message.
 
 User configuration is likewise deferred. Possible forms include a conventional
 =~/.nostril.conf= file or executable Til startup code such as
@@ -46,5 +50,7 @@ state machines rather than duplicate NIP behavior. See
 backend capabilities, and specification-derived issue planning.
 
 Transport-specific resources should have explicit ownership and teardown.
-Persistence, key storage, signing, and supported NIPs likewise need documented
-interfaces and threat models before implementation.
+Persistence, durable key storage, and additional supported NIPs likewise need
+documented interfaces and threat models before implementation. The current
+ephemeral signing path inherits Til =std/crypto='s experimental status and does
+not promise secure erasure of managed secret-key copies.
