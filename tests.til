@@ -3,6 +3,90 @@ mode test
 import("std/sys")
 import("std/file")
 _nostril_test_nng := import("lib/modes/nostril_nng")
+import("lib/modes/nostril_live")
+
+live_wait := proc(socket: nng_socket) returns Str {
+    mut message := ""
+    mut attempts : I64 = 0
+    while attempts < 500 {
+        if nostril_live_receive(socket, message) { return message }
+        sleep_ms(10)
+        attempts++
+    }
+    panic("timed out waiting for a live frame")
+    return ""
+}
+
+test_live_relay_process := test() {
+    mkdir_p("tmp")
+    socket_path := format("tmp/live-", process_id().to_str(), ".ipc")
+    endpoint := format("ipc://", socket_path)
+    // timeout bounds the child lifetime even if the test aborts.
+    relay := Cmd.new("timeout", "60", "bin/nostril-relay", "--live", endpoint)
+    relay.capture()
+    relay_pid := relay.start()
+    mut startup_attempts : I64 = 0
+    while !File.exists(socket_path) && startup_attempts < 500 {
+        sleep_ms(10)
+        startup_attempts++
+    }
+    mut first := nng_socket()
+    mut second := nng_socket()
+    nostril_live_open(first, endpoint, false, false)
+    nostril_live_open(second, endpoint, false, false)
+    event := nostril_sign_text_note(TEST_SECRET_KEY, "first client", 1700000010)
+    nostril_live_send(first, unsigned_event(event))
+    nostril_live_send(first, replace_hex_digit(event, "\"id\":\""))
+    nostril_live_send(first, replace_hex_digit(event, "\"sig\":\""))
+    nostril_live_send(first, "not json")
+    sleep_ms(100)
+    mut rejected := ""
+    no_invalid := !nostril_live_receive(second, rejected)
+    nostril_live_send(first, event)
+    first_echo := live_wait(first)
+    second_note := live_wait(second)
+    reply := nostril_sign_text_note(nostril_generate_secret_key(), "second client", 1700000011)
+    nostril_live_send(second, reply)
+    first_reply := live_wait(first)
+    second_echo := live_wait(second)
+    nostril_nng_close(first)
+    nostril_nng_close(second)
+    Cmd.new("kill", "-TERM", relay_pid.to_str()).run_checked()
+    relay_status := relay.wait()
+    if File.exists(socket_path) { File.remove(socket_path) }
+    assert(relay_status == -15 || relay_status == 143)
+    assert(no_invalid)
+    if first_echo != nostril_live_envelope(event) { panic("first echo: ", first_echo, "; expected: ", nostril_live_envelope(event), "; relay: ", relay.out(), relay.err()) }
+    if second_note != first_echo { panic("second note: ", second_note, "; first echo: ", first_echo, "; relay: ", relay.out(), relay.err()) }
+    assert(first_reply == nostril_live_envelope(reply))
+    assert(second_echo == first_reply)
+    mut timeline := Vec(Str).new()
+    assert(nostril_live_accept(timeline, second_note))
+    assert(!nostril_live_accept(timeline, second_note))
+    assert(!nostril_live_accept(timeline, relay_event(unsigned_event(event))))
+    assert(!nostril_live_accept(timeline, relay_event(replace_hex_digit(event, "\"sig\":\""))))
+    assert(timeline.len() == 1)
+}
+
+test_live_frame_bounds := test() {
+    mut relay := nng_socket()
+    mut client := nng_socket()
+    nostril_live_open(relay, "inproc://nostril-live-bounds", true)
+    nostril_live_open(client, "inproc://nostril-live-bounds", false, false)
+    mut unterminated := "not terminated"
+    nostril_nng_check(nng_send(relay, unterminated.c_str, unterminated.len(), 0), "send unterminated frame")
+    assert(live_wait(client) == "")
+    mut embedded := format("bad", Str.from_byte(0), "frame")
+    nostril_nng_check(nng_send(relay, embedded.c_str, embedded.len() + 1, 0), "send embedded NUL")
+    assert(live_wait(client) == "")
+    mut oversized := repeat_text("x", NOSTRIL_NNG_MAX_MESSAGE + 1)
+    nostril_nng_check(nng_send(relay, oversized.c_str, oversized.len(), 0), "send oversized frame")
+    assert(live_wait(client) == "")
+    assert(nostril_live_send(relay, NOSTRIL_FAKE_EVENT))
+    assert(live_wait(client) == NOSTRIL_FAKE_EVENT)
+    nostril_nng_close(client)
+    nostril_nng_close(relay)
+}
 
 TEST_SECRET_KEY := "0000000000000000000000000000000000000000000000000000000000000003"
 

@@ -25,3 +25,4 @@ nng_recv := ext_proc(shallow socket: nng_socket, mut data: Dynamic, mut size: US
 nng_pair0_open := ext_proc(mut socket: nng_socket) returns shallow I32 {}
 nng_pub0_open := ext_proc(mut socket: nng_socket) returns shallow I32 {}
 nng_sub0_open := ext_proc(mut socket: nng_socket) returns shallow I32 {}
+nng_bus0_open := ext_proc(mut socket: nng_socket) returns shallow I32 {}

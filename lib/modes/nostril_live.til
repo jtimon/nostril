@@ -1,0 +1,66 @@
+import("nostril_nng")
+
+NOSTRIL_LIVE_ENDPOINT := "ipc://tmp/nostril-live.ipc"
+
+// Callers own the socket and close it before leaving the session.
+nostril_live_open := proc(mut socket: nng_socket, endpoint: Str, listen: Bool,
+        asynchronous: Bool = true) {
+    nostril_nng_check(nng_bus0_open(socket), "open local live bus")
+    if listen {
+        mut listener := nng_listener()
+        nostril_nng_check(nng_listen(socket, endpoint.c_str, listener, 0), "listen on live bus")
+    } else {
+        mut dialer := nng_dialer()
+        mut flags : I32 = 0
+        if asynchronous { flags = 2 }
+        nostril_nng_check(nng_dial(socket, endpoint.c_str, dialer, flags), "dial live bus")
+    }
+}
+
+// Nonblocking, bounded framing. An invalid frame is consumed with empty output.
+nostril_live_receive := proc(socket: nng_socket, mut message: Str) returns Bool {
+    message = ""
+    mut buffer := Str.with_capacity(NOSTRIL_NNG_MAX_MESSAGE)
+    mut size := NOSTRIL_NNG_MAX_MESSAGE
+    status := nng_recv(socket, buffer.c_str, size, 2)
+    if status == 8 { return false }
+    if status == 17 { return true }
+    nostril_nng_check(status, "receive live event")
+    if size == 0 || size > NOSTRIL_NNG_MAX_MESSAGE { return true }
+    ref last : I8 = ptr_add(buffer.c_str, (size - 1).to_uptr())
+    if last != 0 { return true }
+    buffer.count = size - 1
+    for byte : I8 in buffer { if byte == 0 { return true } }
+    message = buffer.clone()
+    return true
+}
+
+nostril_live_send := proc(socket: nng_socket, message: Str) returns Bool {
+    if message.len() + 1 > NOSTRIL_NNG_MAX_MESSAGE { return false }
+    mut bytes := message.clone()
+    status := nng_send(socket, bytes.c_str, bytes.len() + 1, 2)
+    if status == 8 { return false }
+    nostril_nng_check(status, "send live event")
+    return true
+}
+
+nostril_live_envelope := func(event: Str) returns Str {
+    return format("[\"EVENT\",\"local\",", event, "]")
+}
+
+// Shared by the GUI and integration tests. Invalid messages never enter state.
+nostril_live_accept := proc(mut timeline: Vec(Str), message: Str) returns Bool {
+    if !nostril_relay_event_is_valid(message) { return false }
+    for saved : Str in timeline { if saved == message { return false } }
+    timeline.push(own message.clone())
+    return true
+}
+
+nostril_live_relay_step := proc(socket: nng_socket) returns Bool {
+    mut event := ""
+    if !nostril_live_receive(socket, event) { return false }
+    if nostril_event_is_valid(event) {
+        nostril_live_send(socket, nostril_live_envelope(event))
+    }
+    return true
+}

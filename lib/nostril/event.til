@@ -194,8 +194,7 @@ priv json_parse_string := func(mut cursor: JsonCursor, mut out: Str) returns Boo
 priv json_quote := func(value: Str) returns Str {
     mut out := Str.with_capacity(value.len() * 6 + 2)
     out.push_str("\"")
-    for i in 0..value.len() {
-        ref byte : I8 = value[i]
+    for byte : I8 in value {
         if byte == '"' { out.push_str("\\\"") }
         else if byte == '\\' { out.push_str("\\\\") }
         else if byte == '\n' { out.push_str("\\n") }
@@ -409,8 +408,7 @@ priv nostril_parse_event := func(mut cursor: JsonCursor,
 
 priv nostril_is_lower_hex := func(value: Str, length: USize) returns Bool {
     if value.len() != length { return false }
-    for i in 0..value.len() {
-        ref byte : I8 = value[i]
+    for byte : I8 in value {
         if !((byte >= '0' && byte <= '9') || (byte >= 'a' && byte <= 'f')) { return false }
     }
     return true

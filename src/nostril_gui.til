@@ -1,6 +1,7 @@
 mode gui
 
 import("../gen/nostril_api")
+import("../lib/modes/nostril_live")
 
 gui_utf8 := func(code: I64) returns Str {
     if code < 0 || code > 0x10ffff || (code >= 0xd800 && code <= 0xdfff) {
@@ -79,7 +80,17 @@ main := proc(args: ..Str) {
         println(nostril_version())
         return
     }
-    if args.len() > 0 { panic("usage: nostril-gui [--version]") }
+    mut live := false
+    mut endpoint := NOSTRIL_LIVE_ENDPOINT
+    if args.len() > 0 {
+        if args[0] != "--relay" || args.len() > 2 { panic("usage: nostril-gui [--version | --relay [ipc-endpoint]]") }
+        live = true
+        if args.len() == 2 { endpoint = args[1].clone() }
+    }
+    mut socket := nng_socket()
+    if live { nostril_live_open(socket, endpoint, false) }
+    mut delivery_status := "Local only"
+    if live { delivery_status = "Local feed (best effort)" }
 
     background := Color(r = 24, g = 24, b = 24, a = 255)
     field := Color(r = 32, g = 32, b = 32, a = 255)
@@ -101,6 +112,15 @@ main := proc(args: ..Str) {
     SetTargetFPS(60)
 
     while !WindowShouldClose() {
+        if live {
+            mut incoming := ""
+            // Bound work per frame so relay traffic cannot starve input/rendering.
+            mut budget : I64 = 32
+            while budget > 0 && nostril_live_receive(socket, incoming) {
+                nostril_live_accept(messages, incoming)
+                budget--
+            }
+        }
         if IsKeyPressed(259) || IsKeyPressedRepeat(259) {
             if composer_scalars > 0 {
                 composer = gui_without_last_scalar(composer)
@@ -139,7 +159,11 @@ main := proc(args: ..Str) {
         if submit && composer.trim().len() > 0 {
             event := nostril_sign_text_note(secret_key, composer, nostril_now())
             if !nostril_event_is_valid(event) { panic("newly signed event did not verify") }
-            messages.push(own event)
+            nostril_live_accept(messages, nostril_live_envelope(event))
+            if live {
+                if nostril_live_send(socket, event) { delivery_status = "Local feed (best effort)" }
+                else { delivery_status = "Send queue full - local only" }
+            }
             composer = ""
             composer_scalars = 0
         }
@@ -149,9 +173,9 @@ main := proc(args: ..Str) {
 
         DrawRectangle(0, header_h - 1, width, 1, border)
         DrawText("Nostril".c_str, margin, 12, 20, text)
-        mut status := format("Ephemeral pubkey ", public_key, " | 0 relays")
+        mut status := format("Ephemeral pubkey ", public_key, " | ", delivery_status)
         if MeasureText(status.c_str, 13) > width - 100 {
-            status = format("Ephemeral ", public_key.substr(0, 16), "... | 0 relays")
+            status = format("Ephemeral ", public_key.substr(0, 8), "... | ", delivery_status)
         }
         DrawText(status.c_str, width - margin - MeasureText(status.c_str, 13), 16, 13, muted)
 
@@ -166,13 +190,13 @@ main := proc(args: ..Str) {
             while index > 0 && bottom > timeline_top {
                 index--
                 ref event : Str = messages[index]
-                message := nostril_event_content(event)
+                message := nostril_relay_event_content(event)
                 message_x := content_x + 48
                 message_w := content_w - 48
                 line_count := gui_wrapped_lines(message, message_w, 16)
                 row_h : I32 = 18 + line_count * 21
                 row_y : I32 = bottom - row_h
-                DrawText("You".c_str, content_x, row_y + 9, 13, muted)
+                DrawText("Note".c_str, content_x, row_y + 9, 13, muted)
                 gui_draw_wrapped(message, message_x, row_y + 7, message_w, 16, 21, text)
                 DrawRectangle(content_x, bottom - 1, content_w, 1, border)
                 bottom = row_y
@@ -216,4 +240,5 @@ main := proc(args: ..Str) {
     }
 
     CloseWindow()
+    if live { nostril_nng_close(socket) }
 }

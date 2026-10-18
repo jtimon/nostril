@@ -94,11 +94,38 @@ and rejection of unsigned, wrong-ID, and bad-signature relay events. The shared
 library parses NIP-01 event objects and relay =EVENT= envelopes, including
 canonical tag arrays; it does not yet parse every relay message, evaluate
 filters, store events, implement post-=CLOSE= delivery suppression, support
-multiple clients in the standalone relay, or implement a public WebSocket
+multiple clients in the Pair0 harness, or implement a public WebSocket
 relay. Pair0 and the fixed 64 KiB receive buffer are prototype constraints, not
 transport-interface decisions.
 
 ** Custom Til modes
+
+*** Local live GUI feed
+
+=nostril-relay --live [endpoint]= listens on an NNG bus0 socket (default
+=ipc://tmp/nostril-live.ipc=). =nostril-gui --relay [endpoint]= attaches to it.
+The relay accepts bare signed event JSON, verifies it, and broadcasts
+=["EVENT","local",event]= to connected peers, including the sender. Clients
+verify again before insertion and suppress byte-identical repeated envelopes.
+
+This is a project-owned local transport contract, not NIP-01 over WebSocket:
+the fixed =local= label identifies the feed, not a negotiated subscription.
+There are no filters, REQ/CLOSE lifecycle, history, persistence, acknowledgements,
+or guaranteed delivery in this live mode. The original Pair0 CLI harness remains
+available without =--live=. Bus traffic is best effort; notes posted while
+disconnected may be lost and are still kept in the sender's local timeline.
+
+Frames retain the prototype's trailing NUL and 64 KiB bound. The live receiver
+checks the returned byte count, final terminator and embedded NULs before
+parsing; malformed frames are consumed and dropped. Socket I/O on the GUI is
+nonblocking. Closing the GUI closes its socket; stopping the relay is done
+through the process signal (Ctrl-C), which releases its OS resources.
+
+The process integration test runs the real live relay with two independent
+clients, checks bidirectional signed delivery and sender echoes, rejects
+unsigned/malformed/tampered publications, and uses the GUI's acceptance helper
+to verify duplicate and invalid-envelope rejection. A bounded timeout owns
+the relay child lifetime even when the test fails.
 
 Til's =examples/custom_modes.til= demonstrates NNG-backed sender, receiver,
 publisher, and subscriber modes. A Nostril-owned =mode mode= definition can

@@ -1,11 +1,26 @@
 mode nostril_relay
 
+import("../lib/modes/nostril_live")
+import("std/sys")
+
 main := proc(args: ..Str) {
     if args.len() == 1 && (args[0] == "-v" || args[0] == "--version") {
         println(nostril_version())
         return
     }
-    if args.len() > 1 { panic("usage: nostril-relay [ipc-endpoint]") }
+    if args.len() > 0 && args[0] == "--live" {
+        if args.len() > 2 { panic("usage: nostril-relay --live [ipc-endpoint]") }
+        mut live_endpoint := NOSTRIL_LIVE_ENDPOINT
+        if args.len() == 2 { live_endpoint = args[1].clone() }
+        mkdir_p("tmp")
+        mut live_socket := nng_socket()
+        nostril_live_open(live_socket, live_endpoint, true)
+        println("nostril-relay live feed on ", live_endpoint)
+        while true {
+            if !nostril_live_relay_step(live_socket) { sleep_ms(5) }
+        }
+    }
+    if args.len() > 1 { panic("usage: nostril-relay [ipc-endpoint] | --live [ipc-endpoint]") }
     mut endpoint := NOSTRIL_LOCAL_ENDPOINT
     if args.len() == 1 { endpoint = args[0].clone() }
 

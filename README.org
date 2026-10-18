@@ -21,7 +21,20 @@ From the repository root:
 The GUI creates an ephemeral keypair from operating-system entropy and displays
 its public key. Type into the composer and press Enter or =Send= to create a
 signed NIP-01 kind-1 event. The secret key and events remain only in memory for
-that window session; nothing is persisted or sent to a relay yet.
+that window session; nothing is persisted. By default the GUI stays local-only.
+
+To exchange notes between GUI sessions, start the local live relay, then run
+two GUI instances from separate terminals in this repository:
+
+#+begin_src sh
+./bin/nostril-relay --live
+./bin/nostril-gui --relay
+#+end_src
+
+Both commands accept an optional IPC endpoint after the flag. This is a
+best-effort local NNG feed, with no delivery acknowledgement or history replay.
+Start the relay first and allow clients to attach before posting. Both relay
+and GUI verify incoming events; repeated identical echoes are suppressed.
 
 To run the scripted local NIP-01 exchange, start the relay and then run the CLI
 from another terminal:
