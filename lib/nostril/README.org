@@ -5,6 +5,12 @@ behavior. It exports version metadata plus ephemeral key generation, public-key
 derivation, NIP-01 kind-1 signing, event validation, and validated content
 extraction from event objects and relay =EVENT= envelopes.
 
+Verified event-ID accessors support transport-independent deduplication.
+Publication helpers produce local OK replies and parse complete matching replies
+into accepted/rejected state. Returned strings are owned by the caller; input
+strings are borrowed for the duration of the call. Transport sockets, outbox
+ownership, retries and session lifetime belong to the host-side live module.
+
 From the repository root:
 
 #+begin_src sh

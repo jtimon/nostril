@@ -102,30 +102,56 @@ transport-interface decisions.
 
 *** Local live GUI feed
 
-=nostril-relay --live [endpoint]= listens on an NNG bus0 socket (default
-=ipc://tmp/nostril-live.ipc=). =nostril-gui --relay [endpoint]= attaches to it.
-The relay accepts bare signed event JSON, verifies it, and broadcasts
-=["EVENT","local",event]= to connected peers, including the sender. Clients
-verify again before insertion and suppress byte-identical repeated envelopes.
+=nostril-relay --live [endpoint]= listens on an NNG bus0 event socket (default
+=ipc://tmp/nostril-live.ipc=) and a REP publication socket at =endpoint.publish=.
+=nostril-gui --relay [endpoint]= attaches its bus and REQ sockets to these two
+addresses. The suffix is part of this local IPC/inproc contract, not a second
+config knob or a mapping for arbitrary TCP/WebSocket addresses.
+
+Publications are bare signed event JSON on REQ/REP. Replies have the NIP-01 OK
+shape: =["OK",id,true,""]= or =["OK",id,false,"invalid: ..."]=. Duplicates
+receive =true= with ="duplicate: already accepted"=. The request/reply protocol
+routes each response only to its requesting client. Invalid input echoes a
+well-formed claimed ID when available, or an empty ID when it cannot be read.
+An ID in a rejection is not a verified identity.
+
+The relay verifies every publication, including retries, and broadcasts a new
+event as =["EVENT","local",event]= to bus peers, including the sender. It
+records accepted IDs in memory and acknowledges repeats without rebroadcasting.
+Clients verify before insertion and deduplicate by event ID, including across
+different JSON whitespace and signature encodings of the same signed payload.
+
+Each GUI outbox entry retains its original signed bytes. One request is active
+at a time; NNG REQ retries every 500 ms and reconnects automatically. A matching,
+well-formed OK makes the entry accepted or rejected. Malformed/wrong-ID replies
+leave it pending and cause resubmission of those same bytes. A rejected entry
+keeps the reason; it is not automatically retried. Oversized local events are
+rejected locally before submission. Bus publications from older clients are
+ignored: clients and relay must be upgraded together for this prototype.
 
 This is a project-owned local transport contract, not NIP-01 over WebSocket:
 the fixed =local= label identifies the feed, not a negotiated subscription.
-There are no filters, REQ/CLOSE lifecycle, history, persistence, acknowledgements,
-or guaranteed delivery in this live mode. The original Pair0 CLI harness remains
-available without =--live=. Bus traffic is best effort; notes posted while
-disconnected may be lost and are still kept in the sender's local timeline.
+There are no filters, REQ/CLOSE lifecycle, history, or persistence in this live
+mode. The original Pair0 CLI harness remains available without =--live=.
+Publication acknowledgements mean in-memory acceptance and attempted fan-out,
+not durable storage or delivery to every subscriber. Bus traffic is best effort:
+disconnected subscribers can miss notes. Pending publishers retry after relay
+restart, while client event-ID deduplication handles a possible repeated fan-out.
 
 Frames retain the prototype's trailing NUL and 64 KiB bound. The live receiver
 checks the returned byte count, final terminator and embedded NULs before
 parsing; malformed frames are consumed and dropped. Socket I/O on the GUI is
-nonblocking. Closing the GUI closes its socket; stopping the relay is done
-through the process signal (Ctrl-C), which releases its OS resources.
+nonblocking. Closing the GUI closes both sockets and discards pending entries.
+SIGINT (Ctrl-C) or SIGTERM stops the relay's loop and closes both server sockets.
 
 The process integration test runs the real live relay with two independent
 clients, checks bidirectional signed delivery and sender echoes, rejects
 unsigned/malformed/tampered publications, and uses the GUI's acceptance helper
-to verify duplicate and invalid-envelope rejection. A bounded timeout owns
-the relay child lifetime even when the test fails.
+to verify duplicate and invalid-envelope rejection. It also restarts the real
+relay with an outstanding publication and verifies acceptance without resigning.
+In-process tests drop a reply after acceptance, verify retries do not rebroadcast,
+check simultaneous clients and queued notes, and exercise mismatched/rejected
+replies. A bounded timeout owns the relay child lifetime even when a test fails.
 
 Til's =examples/custom_modes.til= demonstrates NNG-backed sender, receiver,
 publisher, and subscriber modes. A Nostril-owned =mode mode= definition can

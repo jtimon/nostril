@@ -2,6 +2,10 @@ mode nostril_relay
 
 import("../lib/modes/nostril_live")
 import("std/sys")
+link_c("relay_signal.c")
+
+nostril_relay_signals := ext_proc() returns shallow I32 {}
+nostril_relay_running := ext_proc() returns shallow I32 {}
 
 main := proc(args: ..Str) {
     if args.len() == 1 && (args[0] == "-v" || args[0] == "--version") {
@@ -15,10 +19,21 @@ main := proc(args: ..Str) {
         mkdir_p("tmp")
         mut live_socket := nng_socket()
         nostril_live_open(live_socket, live_endpoint, true)
+        mut requests := nng_socket()
+        nostril_publish_open(requests, live_endpoint, true)
+        mut relay_state := LiveRelay()
+        if nostril_relay_signals() != 0 { panic("cannot install relay signal handlers") }
         println("nostril-relay live feed on ", live_endpoint)
-        while true {
-            if !nostril_live_relay_step(live_socket) { sleep_ms(5) }
+        while nostril_relay_running() != 0 {
+            // Publications use the per-client reply path. Ignore old bus
+            // publications so an unacknowledged path cannot bypass dedup.
+            mut ignored := ""
+            nostril_live_receive(live_socket, ignored)
+            if !nostril_live_relay_step(live_socket, requests, relay_state) { sleep_ms(5) }
         }
+        nostril_nng_close(requests)
+        nostril_nng_close(live_socket)
+        return
     }
     if args.len() > 1 { panic("usage: nostril-relay [ipc-endpoint] | --live [ipc-endpoint]") }
     mut endpoint := NOSTRIL_LOCAL_ENDPOINT

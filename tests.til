@@ -17,6 +17,161 @@ live_wait := proc(socket: nng_socket) returns Str {
     return ""
 }
 
+publication_wait := proc(socket: nng_socket, mut outbox: Vec(Publication), id: Str) returns Str {
+    mut attempts : I64 = 0
+    while attempts < 1000 && nostril_publish_label(outbox, id) == "pending" {
+        nostril_publish_poll(socket, outbox)
+        sleep_ms(10)
+        attempts++
+    }
+    return nostril_publish_label(outbox, id)
+}
+
+publication_pump := proc(client: nng_socket, mut outbox: Vec(Publication), id: Str,
+        events: nng_socket, requests: nng_socket, mut state: LiveRelay) returns Str {
+    mut attempts : I64 = 0
+    while attempts < 1000 && nostril_publish_label(outbox, id) == "pending" {
+        nostril_publish_poll(client, outbox)
+        nostril_live_relay_step(events, requests, state)
+        sleep_ms(5)
+        attempts++
+    }
+    return nostril_publish_label(outbox, id)
+}
+
+test_publication_lost_ack := test() {
+    endpoint := "inproc://nostril-lost-ack"
+    mut events := nng_socket()
+    mut requests := nng_socket()
+    mut subscriber := nng_socket()
+    mut publisher := nng_socket()
+    nostril_live_open(events, endpoint, true)
+    nostril_publish_open(requests, endpoint, true)
+    nostril_live_open(subscriber, endpoint, false, false)
+    nostril_publish_open(publisher, endpoint, false, false)
+    mut state := LiveRelay()
+    mut outbox := Vec(Publication).new()
+    event := nostril_sign_text_note(TEST_SECRET_KEY, "retry exactly this signed event", 1700000020)
+    id := nostril_event_id(event)
+    nostril_publish_queue(outbox, event)
+    nostril_publish_poll(publisher, outbox)
+    mut attempts : I64 = 0
+    while !state.replying && attempts < 500 {
+        nostril_live_relay_step(events, requests, state)
+        sleep_ms(5)
+        attempts++
+    }
+    assert(state.replying)
+    assert(state.accepted.has(id))
+    delivered := live_wait(subscriber)
+    assert(nostril_relay_event_id(delivered) == id)
+    // Lose the reply after acceptance. Retain relay memory but replace the REP
+    // socket: the outstanding NNG REQ must resend the original request.
+    nostril_nng_close(requests)
+    state.replying = false
+    state.reply = ""
+    nostril_publish_open(requests, endpoint, true)
+    assert(publication_pump(publisher, outbox, id, events, requests, state) == "accepted")
+    assert(outbox[0].event == event)
+    assert(state.accepted.len() == 1)
+    mut extra := ""
+    assert(!nostril_live_receive(subscriber, extra))
+
+    // Same ID, different JSON: accepted duplicate, no second fan-out.
+    mut other := nng_socket()
+    nostril_publish_open(other, endpoint, false, false)
+    mut other_outbox := Vec(Publication).new()
+    reformatted := event.replace(",\"kind\":", ", \"kind\" : ")
+    nostril_publish_queue(other_outbox, reformatted)
+    assert(publication_pump(other, other_outbox, id, events, requests, state) == "accepted")
+    assert(state.accepted.len() == 1)
+    assert(!nostril_live_receive(subscriber, extra))
+    nostril_nng_close(other)
+    nostril_nng_close(publisher)
+    nostril_nng_close(subscriber)
+    nostril_nng_close(requests)
+    nostril_nng_close(events)
+}
+
+test_publication_reply_validation := test() {
+    endpoint := "inproc://nostril-reject"
+    mut server := nng_socket()
+    mut client := nng_socket()
+    nostril_publish_open(server, endpoint, true)
+    nostril_publish_open(client, endpoint, false, false)
+    event := nostril_sign_text_note(TEST_SECRET_KEY, "reply validation", 1700000021)
+    id := nostril_event_id(event)
+    mut outbox := Vec(Publication).new()
+    nostril_publish_queue(outbox, event)
+    nostril_publish_poll(client, outbox)
+    assert(live_wait(server) == event)
+    // An unrelated OK must not accept the pending event.
+    assert(nostril_live_send(server, "[\"OK\",\"wrong-id\",true,\"\"]"))
+    mut attempts : I64 = 0
+    while outbox[0].waiting && attempts < 500 {
+        nostril_publish_poll(client, outbox)
+        sleep_ms(5)
+        attempts++
+    }
+    assert(!outbox[0].waiting)
+    assert(outbox[0].status == "pending")
+    nostril_publish_poll(client, outbox)
+    assert(live_wait(server) == event)
+    rejection := format("[\"OK\",\"", id, "\",false,\"blocked: test policy\"]")
+    assert(nostril_live_send(server, rejection))
+    assert(publication_wait(client, outbox, id) == "rejected: blocked: test policy")
+    nostril_publish_poll(client, outbox)
+    mut extra := ""
+    assert(!nostril_live_receive(server, extra))
+    assert(nostril_publication_status(format(rejection, "garbage"), id) == "")
+    assert(nostril_publication_status(format("[\"OK\",\"", id, "\",true]"), id) == "")
+    assert(nostril_publication_status(nostril_live_envelope(event), id) == "")
+    nostril_nng_close(client)
+    nostril_nng_close(server)
+}
+
+test_publication_routing_and_queue := test() {
+    endpoint := "inproc://nostril-publication-routing"
+    mut events := nng_socket()
+    mut requests := nng_socket()
+    mut first := nng_socket()
+    mut second := nng_socket()
+    nostril_live_open(events, endpoint, true)
+    nostril_publish_open(requests, endpoint, true)
+    nostril_publish_open(first, endpoint, false, false)
+    nostril_publish_open(second, endpoint, false, false)
+    mut state := LiveRelay()
+    mut first_outbox := Vec(Publication).new()
+    mut second_outbox := Vec(Publication).new()
+    a := nostril_sign_text_note(TEST_SECRET_KEY, "first queue", 1700000030)
+    b := nostril_sign_text_note(TEST_SECRET_KEY, "second queue", 1700000031)
+    c := nostril_sign_text_note(TEST_SECRET_KEY, "first queue next", 1700000032)
+    nostril_publish_queue(first_outbox, a)
+    nostril_publish_queue(first_outbox, a)
+    nostril_publish_queue(first_outbox, c)
+    nostril_publish_queue(second_outbox, b)
+    assert(first_outbox.len() == 2)
+    // Concurrent outstanding requests exercise NNG's per-client reply routing.
+    nostril_publish_poll(first, first_outbox)
+    nostril_publish_poll(second, second_outbox)
+    mut attempts : I64 = 0
+    while attempts < 1000 && (first_outbox[1].status == "pending" || second_outbox[0].status == "pending") {
+        nostril_live_relay_step(events, requests, state)
+        nostril_publish_poll(first, first_outbox)
+        nostril_publish_poll(second, second_outbox)
+        sleep_ms(5)
+        attempts++
+    }
+    assert(first_outbox[0].status == "accepted")
+    assert(first_outbox[1].status == "accepted")
+    assert(second_outbox[0].status == "accepted")
+    assert(state.accepted.len() == 3)
+    nostril_nng_close(second)
+    nostril_nng_close(first)
+    nostril_nng_close(requests)
+    nostril_nng_close(events)
+}
+
 test_live_relay_process := test() {
     mkdir_p("tmp")
     socket_path := format("tmp/live-", process_id().to_str(), ".ipc")
@@ -26,7 +181,7 @@ test_live_relay_process := test() {
     relay.capture()
     relay_pid := relay.start()
     mut startup_attempts : I64 = 0
-    while !File.exists(socket_path) && startup_attempts < 500 {
+    while !File.exists(format(socket_path, ".publish")) && startup_attempts < 500 {
         sleep_ms(10)
         startup_attempts++
     }
@@ -34,28 +189,60 @@ test_live_relay_process := test() {
     mut second := nng_socket()
     nostril_live_open(first, endpoint, false, false)
     nostril_live_open(second, endpoint, false, false)
+    mut first_publisher := nng_socket()
+    mut second_publisher := nng_socket()
+    nostril_publish_open(first_publisher, endpoint, false, false)
+    nostril_publish_open(second_publisher, endpoint, false, false)
     event := nostril_sign_text_note(TEST_SECRET_KEY, "first client", 1700000010)
-    nostril_live_send(first, unsigned_event(event))
-    nostril_live_send(first, replace_hex_digit(event, "\"id\":\""))
-    nostril_live_send(first, replace_hex_digit(event, "\"sig\":\""))
-    nostril_live_send(first, "not json")
-    sleep_ms(100)
+    for invalid : Str in array(Str, unsigned_event(event),
+            replace_hex_digit(event, "\"id\":\""),
+            replace_hex_digit(event, "\"sig\":\""), "not json") {
+        assert(nostril_live_send(first_publisher, invalid))
+        assert(live_wait(first_publisher).contains("false,\"invalid:"))
+    }
     mut rejected := ""
     no_invalid := !nostril_live_receive(second, rejected)
-    nostril_live_send(first, event)
+    assert(nostril_live_send(first_publisher, event))
+    first_ack := live_wait(first_publisher)
     first_echo := live_wait(first)
     second_note := live_wait(second)
     reply := nostril_sign_text_note(nostril_generate_secret_key(), "second client", 1700000011)
-    nostril_live_send(second, reply)
+    assert(nostril_live_send(second_publisher, reply))
+    second_ack := live_wait(second_publisher)
     first_reply := live_wait(first)
     second_echo := live_wait(second)
-    nostril_nng_close(first)
-    nostril_nng_close(second)
+    // Stop and restart the actual relay while a GUI-style outbox is pending.
     Cmd.new("kill", "-TERM", relay_pid.to_str()).run_checked()
     relay_status := relay.wait()
+    mut outbox := Vec(Publication).new()
+    pending := nostril_sign_text_note(TEST_SECRET_KEY, "after restart", 1700000012)
+    pending_id := nostril_event_id(pending)
+    nostril_publish_queue(outbox, pending)
+    nostril_publish_poll(first_publisher, outbox)
+    sleep_ms(100)
+    nostril_publish_poll(first_publisher, outbox)
+    was_pending := nostril_publish_label(outbox, pending_id) == "pending"
+    restarted := Cmd.new("timeout", "60", "bin/nostril-relay", "--live", endpoint)
+    restarted.capture()
+    restarted_pid := restarted.start()
+    after_restart := publication_wait(first_publisher, outbox, pending_id)
+    unchanged := outbox[0].event == pending
+    nostril_nng_close(first)
+    nostril_nng_close(second)
+    nostril_nng_close(first_publisher)
+    nostril_nng_close(second_publisher)
+    Cmd.new("kill", "-TERM", restarted_pid.to_str()).run_checked()
+    restarted_status := restarted.wait()
     if File.exists(socket_path) { File.remove(socket_path) }
-    assert(relay_status == -15 || relay_status == 143)
+    if File.exists(format(socket_path, ".publish")) { File.remove(format(socket_path, ".publish")) }
+    assert(relay_status == 0)
+    assert(restarted_status == 0)
+    assert(was_pending)
+    assert(after_restart == "accepted")
+    assert(unchanged)
     assert(no_invalid)
+    assert(nostril_publication_status(first_ack, nostril_event_id(event)) == "accepted")
+    assert(nostril_publication_status(second_ack, nostril_event_id(reply)) == "accepted")
     if first_echo != nostril_live_envelope(event) { panic("first echo: ", first_echo, "; expected: ", nostril_live_envelope(event), "; relay: ", relay.out(), relay.err()) }
     if second_note != first_echo { panic("second note: ", second_note, "; first echo: ", first_echo, "; relay: ", relay.out(), relay.err()) }
     assert(first_reply == nostril_live_envelope(reply))
@@ -63,6 +250,7 @@ test_live_relay_process := test() {
     mut timeline := Vec(Str).new()
     assert(nostril_live_accept(timeline, second_note))
     assert(!nostril_live_accept(timeline, second_note))
+    assert(!nostril_live_accept(timeline, second_note.replace(",\"kind\":", ", \"kind\" : ")))
     assert(!nostril_live_accept(timeline, relay_event(unsigned_event(event))))
     assert(!nostril_live_accept(timeline, relay_event(replace_hex_digit(event, "\"sig\":\""))))
     assert(timeline.len() == 1)

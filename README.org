@@ -31,10 +31,13 @@ two GUI instances from separate terminals in this repository:
 ./bin/nostril-gui --relay
 #+end_src
 
-Both commands accept an optional IPC endpoint after the flag. This is a
-best-effort local NNG feed, with no delivery acknowledgement or history replay.
-Start the relay first and allow clients to attach before posting. Both relay
-and GUI verify incoming events; repeated identical echoes are suppressed.
+Both commands accept an optional IPC endpoint after the flag. The GUI shows
+each outgoing note as pending, accepted, or rejected (with the relay's reason).
+Pending notes retry automatically after disconnection or a lost reply, retaining
+the original signed event. Both relay and GUI deduplicate by verified event ID.
+Accepted means the relay accepted the event in memory, not that every subscriber
+received it. The event feed still has no history replay; keys, pending notes,
+and relay deduplication state last only for their process session.
 
 To run the scripted local NIP-01 exchange, start the relay and then run the CLI
 from another terminal:

@@ -533,3 +533,54 @@ nostril_relay_event_content := proc(message: Str) returns Str {
     if !nostril_parse_relay_event(message, fields) || !nostril_valid_fields(fields) { return "" }
     return fields.content.clone()
 }
+
+/// A verified event ID, or empty for invalid input.
+nostril_event_id := proc(event_json: Str) returns Str {
+    mut fields := NostrEventFields()
+    if !nostril_parse_complete_event(event_json, fields) || !nostril_valid_fields(fields) { return "" }
+    return fields.id.clone()
+}
+
+nostril_relay_event_id := proc(message: Str) returns Str {
+    mut fields := NostrEventFields()
+    if !nostril_parse_relay_event(message, fields) || !nostril_valid_fields(fields) { return "" }
+    return fields.id.clone()
+}
+
+/// Local publication reply. Invalid events echo a well-formed claimed ID if
+/// available; this does not validate that ID. An unparseable request uses "".
+nostril_publication_reply := proc(event_json: Str, duplicate: Bool) returns Str {
+    mut fields := NostrEventFields()
+    parsed := nostril_parse_complete_event(event_json, fields)
+    mut id := ""
+    if nostril_is_lower_hex(fields.id, 64) { id = fields.id.clone() }
+    if !parsed || !nostril_valid_fields(fields) {
+        return format("[\"OK\",", json_quote(id), ",false,\"invalid: malformed event, id or signature\"]")
+    }
+    mut reason := ""
+    if duplicate { reason = "duplicate: already accepted" }
+    return format("[\"OK\",", json_quote(id), ",true,", json_quote(reason), "]")
+}
+
+/// Empty means malformed/unrelated reply. Only a matching, complete OK changes
+/// publication state; no EVENT echo can acknowledge a publication.
+nostril_publication_status := func(reply: Str, expected_id: Str) returns Str {
+    mut cursor := JsonCursor(text = reply.borrowed_view())
+    mut command := ""
+    mut id := ""
+    mut reason := ""
+    if !json_take(cursor, '[') || !json_parse_string(cursor, command) || command != "OK" ||
+        !json_take(cursor, ',') || !json_parse_string(cursor, id) || id != expected_id ||
+        !json_take(cursor, ',') { return "" }
+    json_skip_ws(cursor)
+    rest := cursor.text.substr(cursor.at, cursor.text.len() - cursor.at)
+    mut accepted := false
+    if rest.starts_with("true") { accepted = true; cursor.at = cursor.at + 4 }
+    else if rest.starts_with("false") { cursor.at = cursor.at + 5 }
+    else { return "" }
+    if !json_take(cursor, ',') || !json_parse_string(cursor, reason) || !json_take(cursor, ']') { return "" }
+    json_skip_ws(cursor)
+    if cursor.at != cursor.text.len() { return "" }
+    if accepted { return "accepted" }
+    return format("rejected: ", reason)
+}

@@ -50,17 +50,111 @@ nostril_live_envelope := func(event: Str) returns Str {
 
 // Shared by the GUI and integration tests. Invalid messages never enter state.
 nostril_live_accept := proc(mut timeline: Vec(Str), message: Str) returns Bool {
-    if !nostril_relay_event_is_valid(message) { return false }
-    for saved : Str in timeline { if saved == message { return false } }
+    id := nostril_relay_event_id(message)
+    if id.len() == 0 { return false }
+    for saved : Str in timeline { if nostril_relay_event_id(saved) == id { return false } }
     timeline.push(own message.clone())
     return true
 }
 
-nostril_live_relay_step := proc(socket: nng_socket) returns Bool {
-    mut event := ""
-    if !nostril_live_receive(socket, event) { return false }
-    if nostril_event_is_valid(event) {
-        nostril_live_send(socket, nostril_live_envelope(event))
+// One outstanding request per client socket; NNG retains and retransmits the
+// original request after disconnect/reconnect or a lost reply.
+nostril_publish_open := proc(mut socket: nng_socket, endpoint: Str, listen: Bool,
+        asynchronous: Bool = true) {
+    address := format(endpoint, ".publish")
+    if listen {
+        nostril_nng_check(nng_rep0_open(socket), "open publication replies")
+        mut listener := nng_listener()
+        nostril_nng_check(nng_listen(socket, address.c_str, listener, 0), "listen for publications")
+    } else {
+        nostril_nng_check(nng_req0_open(socket), "open publication requests")
+        nostril_nng_check(nng_socket_set_ms(socket, "req:resend-time".c_str, 500), "set publication retry interval")
+        mut dialer := nng_dialer()
+        mut flags : I32 = 0
+        if asynchronous { flags = 2 }
+        nostril_nng_check(nng_dial(socket, address.c_str, dialer, flags), "dial publications")
     }
+}
+
+Publication := struct {
+    event : Str = ""
+    id : Str = ""
+    status : Str = "pending"
+    waiting := false
+}
+
+nostril_publish_queue := proc(mut outbox: Vec(Publication), event: Str) {
+    id := nostril_event_id(event)
+    if id.len() == 0 { panic("cannot queue an invalid local event") }
+    for entry : Publication in outbox { if entry.id == id { return } }
+    mut state := "pending"
+    if nostril_live_envelope(event).len() + 1 > NOSTRIL_NNG_MAX_MESSAGE {
+        state = "rejected: event exceeds local frame limit"
+    }
+    outbox.push(own Publication(event = event.clone(), id = id.clone(), status = state.clone()))
+}
+
+nostril_publish_poll := proc(socket: nng_socket, mut outbox: Vec(Publication)) {
+    for mut entry : Publication in outbox {
+        if entry.status != "pending" { continue }
+        if !entry.waiting {
+            entry.waiting = nostril_live_send(socket, entry.event)
+            return
+        }
+        mut reply := ""
+        if !nostril_live_receive(socket, reply) { return }
+        status := nostril_publication_status(reply, entry.id)
+        if status.len() > 0 { entry.status = status.clone() }
+        // A malformed/mismatched reply consumed the NNG request. Resubmit the
+        // unchanged event on the next poll, rather than accepting that reply.
+        entry.waiting = false
+        return
+    }
+}
+
+nostril_publish_label := func(outbox: Vec(Publication), id: Str) returns Str {
+    for entry : Publication in outbox { if entry.id == id { return entry.status.clone() } }
+    return "received"
+}
+
+// Relay state is session-only. NNG REP routes each OK solely to the requester.
+LiveRelay := struct {
+    accepted := Set(Str).new()
+    reply : Str = ""
+    replying := false
+}
+
+nostril_live_relay_step := proc(events: nng_socket, requests: nng_socket,
+        mut state: LiveRelay) returns Bool {
+    if state.replying {
+        if nostril_live_send(requests, state.reply) {
+            state.replying = false
+            state.reply = ""
+        }
+        return true
+    }
+    mut event := ""
+    if !nostril_live_receive(requests, event) { return false }
+    id := nostril_event_id(event)
+    mut duplicate := false
+    if id.len() > 0 {
+        duplicate = state.accepted.has(id)
+        if !duplicate {
+            envelope := nostril_live_envelope(event)
+            if envelope.len() + 1 > NOSTRIL_NNG_MAX_MESSAGE {
+                state.reply = format("[\"OK\",\"", id, "\",false,\"invalid: event exceeds local frame limit\"]")
+                state.replying = true
+                return true
+            }
+            if !nostril_live_send(events, envelope) {
+                state.reply = format("[\"OK\",\"", id, "\",false,\"error: event broadcast queue full\"]")
+                state.replying = true
+                return true
+            }
+            state.accepted.add(own id.clone())
+        }
+    }
+    state.reply = nostril_publication_reply(event, duplicate)
+    state.replying = true
     return true
 }

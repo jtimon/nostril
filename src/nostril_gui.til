@@ -88,9 +88,14 @@ main := proc(args: ..Str) {
         if args.len() == 2 { endpoint = args[1].clone() }
     }
     mut socket := nng_socket()
-    if live { nostril_live_open(socket, endpoint, false) }
+    mut publisher := nng_socket()
+    mut outbox := Vec(Publication).new()
+    if live {
+        nostril_live_open(socket, endpoint, false)
+        nostril_publish_open(publisher, endpoint, false)
+    }
     mut delivery_status := "Local only"
-    if live { delivery_status = "Local feed (best effort)" }
+    if live { delivery_status = "Local relay" }
 
     background := Color(r = 24, g = 24, b = 24, a = 255)
     field := Color(r = 32, g = 32, b = 32, a = 255)
@@ -113,6 +118,7 @@ main := proc(args: ..Str) {
 
     while !WindowShouldClose() {
         if live {
+            nostril_publish_poll(publisher, outbox)
             mut incoming := ""
             // Bound work per frame so relay traffic cannot starve input/rendering.
             mut budget : I64 = 32
@@ -161,8 +167,7 @@ main := proc(args: ..Str) {
             if !nostril_event_is_valid(event) { panic("newly signed event did not verify") }
             nostril_live_accept(messages, nostril_live_envelope(event))
             if live {
-                if nostril_live_send(socket, event) { delivery_status = "Local feed (best effort)" }
-                else { delivery_status = "Send queue full - local only" }
+                nostril_publish_queue(outbox, event)
             }
             composer = ""
             composer_scalars = 0
@@ -194,10 +199,14 @@ main := proc(args: ..Str) {
                 message_x := content_x + 48
                 message_w := content_w - 48
                 line_count := gui_wrapped_lines(message, message_w, 16)
-                row_h : I32 = 18 + line_count * 21
+                row_h : I32 = 34 + line_count * 21
                 row_y : I32 = bottom - row_h
                 DrawText("Note".c_str, content_x, row_y + 9, 13, muted)
                 gui_draw_wrapped(message, message_x, row_y + 7, message_w, 16, 21, text)
+                mut publication_status := "local only"
+                if live { publication_status = nostril_publish_label(outbox, nostril_relay_event_id(event)) }
+                visible_status := gui_fitting_tail(publication_status, message_w, 11)
+                DrawText(visible_status.c_str, message_x, bottom - 15, 11, muted)
                 DrawRectangle(content_x, bottom - 1, content_w, 1, border)
                 bottom = row_y
             }
@@ -240,5 +249,5 @@ main := proc(args: ..Str) {
     }
 
     CloseWindow()
-    if live { nostril_nng_close(socket) }
+    if live { nostril_nng_close(publisher); nostril_nng_close(socket) }
 }

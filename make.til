@@ -67,7 +67,15 @@ select_api := proc() {
         "til_nostril__nostril_relay_event_is_valid := ext_proc(message: Str) returns shallow Bool {}\n",
         "nostril_relay_event_is_valid := proc(message: Str) returns Bool { return til_nostril__nostril_relay_event_is_valid(message) }\n\n",
         "til_nostril__nostril_relay_event_content := ext_proc(message: Str) returns shallow Str {}\n",
-        "nostril_relay_event_content := proc(message: Str) returns Str { return til_nostril__nostril_relay_event_content(message) }\n"))
+        "nostril_relay_event_content := proc(message: Str) returns Str { return til_nostril__nostril_relay_event_content(message) }\n",
+        "til_nostril__nostril_event_id := ext_proc(event_json: Str) returns shallow Str {}\n",
+        "nostril_event_id := proc(event_json: Str) returns Str { return til_nostril__nostril_event_id(event_json) }\n",
+        "til_nostril__nostril_relay_event_id := ext_proc(message: Str) returns shallow Str {}\n",
+        "nostril_relay_event_id := proc(message: Str) returns Str { return til_nostril__nostril_relay_event_id(message) }\n",
+        "til_nostril__nostril_publication_reply := ext_proc(event_json: Str, shallow duplicate: Bool) returns shallow Str {}\n",
+        "nostril_publication_reply := proc(event_json: Str, duplicate: Bool) returns Str { return til_nostril__nostril_publication_reply(event_json, duplicate) }\n",
+        "til_nostril__nostril_publication_status := ext_func(reply: Str, expected_id: Str) returns shallow Str {}\n",
+        "nostril_publication_status := func(reply: Str, expected_id: Str) returns Str { return til_nostril__nostril_publication_status(reply, expected_id) }\n"))
 }
 
 build_nng := proc() {
