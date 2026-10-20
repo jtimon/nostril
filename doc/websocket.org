@@ -1,0 +1,123 @@
+* WebSocket dependency selection
+
+[[file:../README.org][Nostril]] | [[file:build.org][Build requirements]] | [[file:transports.org][Transport design]]
+
+** Selected: libwebsockets
+
+Nostril selects [[https://github.com/warmcat/libwebsockets][libwebsockets]] for the upcoming public-relay transport.
+It is C, permissively licensed, and supplies the HTTP opening handshake,
+WebSocket framing, nonblocking client lifecycle, TLS integration, and write
+backpressure. This keeps those mechanisms out of Nostril's protocol library.
+The upstream source tree is broad; our compiled profile is deliberately narrow.
+
+The source under =vendor/libwebsockets/= is the unmodified =v5.0-stable=
+snapshot at commit =a842936f881921b6462b3328cce8e700b7a7ecd2= (version 5.0.0).
+The branch name is provenance, not a floating dependency. Build configuration
+is maintained separately in =lib/websocket/CMakeLists.txt=.
+
+- Source archive: https://codeload.github.com/warmcat/libwebsockets/tar.gz/a842936f881921b6462b3328cce8e700b7a7ecd2
+- Archive SHA-256: =aec47546b8b298fb10b021896873637d9bd1efcb9e0f6f165ac045f24e275cc2=
+- License: upstream =LICENSE=; primarily MIT, with the documented permissive
+  component licenses preserved. Upstream examples and test fixtures are retained
+  for provenance but are not enabled by the application build.
+- Updates must select an exact upstream revision, replace the snapshot, review
+  changed options and licenses, and rerun the dependency and application tests.
+
+** Build and TLS choice
+
+The native profile builds PIC static and shared libraries with HTTP/1.1,
+WebSocket client support, OpenSSL TLS, and the built-in poll event loop. It
+disables the server, examples, HTTP/2, HTTP/3/QUIC, MQTT, Secure Streams,
+compression extensions, image/HTML helpers, and external event-loop plugins.
+Generic crypto helpers remain enabled because this snapshot's TLS certificate
+fingerprint and HMAC code uses them even without Secure Streams.
+The small LEJP parser also remains enabled because the upstream system-policy
+object references it; Nostril continues to use its own NIP JSON parsing.
+
+OpenSSL is a system dependency, not another vendored tree. Install its development
+package (Ubuntu/Debian: =libssl-dev=) and system CA certificates. Normal OpenSSL
+discovery is performed by CMake. An alternate development prefix can be supplied
+through CMake's standard =CMAKE_PREFIX_PATH= environment variable. Builds do not
+download or install dependencies automatically.
+
+=./make.til= and =./make.til test= build into =gen/websocket/=. The =library=
+target continues to build only libnostril. Native static/shared smoke executables
+verify the configured protocol features, upstream revision, and repeated client
+TLS context creation/destruction. The Til suite runs both executables in its
+interpreted and compiled passes; these tests do not contact the network.
+
+This commit stages and verifies the dependency. The GUI still uses local NNG;
+it does not connect to public WebSocket relays yet. Certificate rejection,
+fragmentation, actual message exchange and reconnect tests belong to the next
+transport-adapter step, not to the context smoke test.
+
+** Intended integration boundary
+
+A project-owned C adapter should own libwebsockets contexts, connections, native
+callbacks, and bounded frame assembly. Til should receive complete owned UTF-8
+messages and connection events. Event validation, subscriptions, publication
+status, retry decisions, and session ownership remain in Nostril.
+
+Use ordinary WebSocket text messages with no NNG framing or trailing NUL.
+Send only from libwebsockets writable callbacks. Public =wss://= connections
+must use certificate-chain and hostname verification and the system CA store.
+Do not expose vendor structs or callback lifetimes through the public libnostril
+ABI. The existing local NNG backend remains useful for deterministic tests.
+
+** Alternatives considered
+
+These comparisons concern architecture and integration effort, not benchmarked
+binary size or throughput. A small frame parser is not a complete TLS client.
+
+*** Wslay
+
+[[https://github.com/tatsuhiro-t/wslay][Wslay]] is a small MIT-licensed C99 WebSocket engine; its library CMake build
+lists four C sources. It provides framing, callbacks, UTF-8 checks, fragmentation,
+and automatic ping replies, while leaving I/O to the caller. It does not perform
+the HTTP opening handshake, DNS, connection establishment, or TLS.
+
+It would suit a deliberately transport-independent low-level design, but would
+leave more networking code for Nostril to own. The default-branch tip observed
+during evaluation was =0e7d106ff89ad6638090fd811a9b2e4c5dda8d40=, dated
+2022-08-25. Its unit tests, sanitizer CI and linked Autobahn reports are useful
+evidence, but its quiet upstream is a maintenance consideration.
+
+*** libcurl
+
+[[https://curl.se/libcurl/c/libcurl-ws.html][libcurl's WebSocket API]] supports =ws://= and =wss://= with HTTP upgrade, TLS,
+proxy support, and =curl_ws_send=/=curl_ws_recv=. It is C under the permissive
+curl license. Its multi interface can drive connection setup without blocking
+the GUI; the adapter still needs to assemble bounded messages from frame chunks.
+
+It is a strong alternative if HTTP downloads, relay metadata, and proxy support
+become central. Its broad source surface is less attractive for a dependency
+chosen solely for WebSockets, but it could replace other future HTTP tooling.
+
+*** bq_websocket
+
+[[https://github.com/bqqbarbhg/bq_websocket][bq_websocket]] offers a single-source-file C core, optional platform adapter,
+and MIT/public-domain license choice. Explicit message ownership and external
+I/O are attractive. The observed default-branch tip was
+=6c188d3f0edca38d7a8926e0d30f4c145414ba4c=, dated 2021-01-09.
+The reference POSIX/Windows adapter performs DNS and connect before making the
+socket nonblocking, so it should not be called unchanged from the GUI thread.
+It was not selected given the additional integration and maintenance review.
+
+*** CivetWeb
+
+[[https://github.com/civetweb/civetweb][CivetWeb]] is a permissively licensed C embedded web server with WS/WSS client
+APIs. It is worth considering if embedding an HTTP server becomes important;
+its server-oriented scope is broader than this client transport needs.
+
+*** Reuse NNG's stream WebSocket support
+
+NNG protocol sockets use its SP WebSocket mapping, which is not ordinary Nostr
+WebSocket traffic. Its lower-level =nng_stream= API does support text frames via
+=NNG_OPT_WS_SEND_TEXT= and =NNG_OPT_WS_RECV_TEXT=. It is therefore a real option,
+not categorically incompatible with Nostr.
+
+However, its stream API's message-boundary and partial-send semantics need
+careful evaluation, and the vendored documentation explicitly assigns text
+UTF-8 validation to the application. Our NNG build also disables TLS, so WSS
+would still require a TLS backend. A dedicated WebSocket client API was selected
+instead of adapting the byte-stream interface or depending on private NNG APIs.

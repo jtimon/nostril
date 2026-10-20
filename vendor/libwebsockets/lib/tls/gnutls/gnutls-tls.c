@@ -1,0 +1,790 @@
+/*
+ * libwebsockets - small server side websockets and web server implementation
+ *
+ * Copyright (C) 2010 - 2026 Andy Green <andy@warmcat.com>
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to
+ * deal in the Software without restriction, including without limitation the
+ * rights to use, copy, modify, merge, publish, distribute, sublicense, and/or
+ * sell copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+ * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
+ * IN THE SOFTWARE.
+ */
+
+#include "private-lib-core.h"
+#include "private-lib-tls.h"
+
+#if defined(LWS_WITH_TLS_KEYLOG) && \
+    defined(LWS_WITH_TLS) && (defined(LWS_WITH_CLIENT) || defined(LWS_WITH_SERVER))
+
+static int
+lws_gnutls_keylog_cb(gnutls_session_t session, const char *label, const gnutls_datum_t *secret)
+{
+	struct lws *wsi = (struct lws *)gnutls_session_get_ptr(session);
+	gnutls_datum_t crandom;
+	int fd;
+	char crand_hex[65];
+	char secret_hex[129];
+	unsigned int i;
+	char buf[256];
+
+	if (!wsi || !wsi->a.context->keylog_file[0])
+		return 0;
+
+	gnutls_session_get_random(session, &crandom, NULL);
+	if (crandom.size != 32)
+		return 0;
+
+	for (i = 0; i < crandom.size; i++)
+		lws_snprintf(&crand_hex[i * 2], sizeof(crand_hex) - (i * 2), "%02x", crandom.data[i]);
+	for (i = 0; i < secret->size; i++)
+		lws_snprintf(&secret_hex[i * 2], sizeof(secret_hex) - (i * 2), "%02x", secret->data[i]);
+
+	fd = open(wsi->a.context->keylog_file, O_WRONLY | O_CREAT | O_APPEND, 0600);
+	if (fd < 0)
+		return 0;
+
+	snprintf(buf, sizeof(buf), "%s %s %s\n", label, crand_hex, secret_hex);
+	if (write(fd, buf, strlen(buf))) {}
+	close(fd);
+
+	return 0;
+}
+#endif
+
+int
+lws_context_init_ssl_library(struct lws_context *context,
+			     const struct lws_context_creation_info *info)
+{
+	gnutls_global_init();
+	return 0;
+}
+
+void
+lws_context_deinit_ssl_library(struct lws_context *context)
+{
+	gnutls_global_deinit();
+}
+
+#if defined(LWS_WITH_NETWORK)
+
+void
+lws_tls_vhost_backend_free_ctx(lws_tls_ctx *ctx)
+{
+	if (!ctx)
+		return;
+
+	gnutls_certificate_free_credentials(ctx->creds);
+	gnutls_priority_deinit(ctx->priority);
+#if GNUTLS_VERSION_NUMBER >= 0x030603
+	if (ctx->ticket_key_valid) {
+		gnutls_free(ctx->ticket_key.data);
+		ctx->ticket_key_valid = 0;
+	}
+#endif
+	lws_free(ctx);
+}
+
+int
+lws_tls_vhost_backend_create_ctx(struct lws_vhost *vhost)
+{
+	vhost->tls.ssl_ctx = lws_zalloc(sizeof(*vhost->tls.ssl_ctx), "gnutls_ctx");
+	if (!vhost->tls.ssl_ctx)
+		return 1;
+
+	if (gnutls_certificate_allocate_credentials(&vhost->tls.ssl_ctx->creds) < 0) {
+		lws_free(vhost->tls.ssl_ctx);
+		vhost->tls.ssl_ctx = NULL;
+		return 1;
+	}
+
+	if (gnutls_priority_init(&vhost->tls.ssl_ctx->priority,
+				 vhost->tls.cfg_ssl_cipher_list ?
+				 vhost->tls.cfg_ssl_cipher_list : "NORMAL", NULL) < 0) {
+		lwsl_err("%s: gnutls_priority_init failed\n", __func__);
+		gnutls_certificate_free_credentials(vhost->tls.ssl_ctx->creds);
+		lws_free(vhost->tls.ssl_ctx);
+		vhost->tls.ssl_ctx = NULL;
+		return 1;
+	}
+
+#if GNUTLS_VERSION_NUMBER >= 0x030603
+	if (gnutls_session_ticket_key_generate(&vhost->tls.ssl_ctx->ticket_key) == 0)
+		vhost->tls.ssl_ctx->ticket_key_valid = 1;
+#endif
+
+	return 0;
+}
+
+#if defined(LWS_WITH_SERVER)
+
+#if GNUTLS_VERSION_NUMBER >= 0x030605
+struct lws_gnutls_ar_entry {
+        lws_dll2_t list;
+        size_t size;
+        uint8_t key[128];
+};
+
+static int
+lws_gnutls_anti_replay_db_add(void *db_ptr, long int exp_time,
+                              const gnutls_datum_t *key,
+                              const gnutls_datum_t *data)
+{
+        lws_dll2_owner_t *owner = (lws_dll2_owner_t *)db_ptr;
+        struct lws_gnutls_ar_entry *e;
+
+        lws_start_foreach_dll(struct lws_dll2 *, d, lws_dll2_get_head(owner)) {
+                e = lws_container_of(d, struct lws_gnutls_ar_entry, list);
+                if (e->size == key->size && !memcmp(e->key, key->data, key->size))
+                        return GNUTLS_E_DB_ENTRY_EXISTS;
+        } lws_end_foreach_dll(d);
+
+        if (owner->count >= 256) {
+                e = lws_container_of(lws_dll2_get_head(owner), struct lws_gnutls_ar_entry, list);
+                lws_dll2_remove(&e->list);
+                lws_free(e);
+        }
+
+        e = lws_zalloc(sizeof(*e), "anti_replay");
+        if (!e) return GNUTLS_E_MEMORY_ERROR;
+        e->size = key->size < sizeof(e->key) ? key->size : sizeof(e->key);
+        memcpy(e->key, key->data, e->size);
+        lws_dll2_add_tail(&e->list, owner);
+        return 0;
+}
+#endif
+
+int
+lws_tls_server_vhost_backend_init(const struct lws_context_creation_info *info,
+				  struct lws_vhost *vhost, struct lws *wsi)
+{
+	int n;
+
+	if (lws_tls_vhost_backend_create_ctx(vhost))
+		return 1;
+
+	if (!vhost->tls.use_ssl ||
+	    (!info->ssl_cert_filepath && !info->server_ssl_cert_mem))
+		return 0;
+
+	n = (int)lws_tls_generic_cert_checks(vhost, info->ssl_cert_filepath,
+					     info->ssl_private_key_filepath);
+
+	if (n == LWS_TLS_EXTANT_NO &&
+	    (vhost->options & LWS_SERVER_OPTION_IGNORE_MISSING_CERT)) {
+		lwsl_notice("No certs found, continuing without SSL_CTX\n");
+		lws_free_set_NULL(vhost->tls.ssl_ctx);
+		return 0;
+	}
+
+	n = lws_tls_server_certs_load(vhost, wsi, info->ssl_cert_filepath,
+					 info->ssl_private_key_filepath,
+					 info->server_ssl_cert_mem,
+					 info->server_ssl_cert_mem_len,
+					 info->server_ssl_private_key_mem,
+					 info->server_ssl_private_key_mem_len);
+	if (n) {
+		lwsl_err("%s: failed to load certs\n", __func__);
+		return 1;
+	}
+
+#if GNUTLS_VERSION_NUMBER >= 0x030605
+        if (gnutls_anti_replay_init((gnutls_anti_replay_t *)&vhost->tls.anti_replay) < 0) {
+                lwsl_err("%s: failed to init anti-replay\n", __func__);
+                return 1;
+        }
+        
+        lws_dll2_owner_t *ar_owner = lws_zalloc(sizeof(*ar_owner), "anti_replay_owner");
+        if (ar_owner) {
+                vhost->tls.anti_replay_owner = ar_owner;
+                gnutls_anti_replay_set_ptr((gnutls_anti_replay_t)vhost->tls.anti_replay, ar_owner);
+                gnutls_anti_replay_set_add_function((gnutls_anti_replay_t)vhost->tls.anti_replay,
+                                                    (gnutls_db_add_func)lws_gnutls_anti_replay_db_add);
+        }
+#endif
+
+	return 0;
+}
+#endif
+
+#if defined(LWS_WITH_CLIENT)
+int
+lws_tls_client_create_vhost_context(struct lws_vhost *vh,
+				    const struct lws_context_creation_info *info,
+				    const char *cipher_list,
+				    const char *ca_filepath,
+				    const void *ca_mem,
+				    unsigned int ca_mem_len,
+				    const char *cert_filepath,
+				    const void *cert_mem,
+				    unsigned int cert_mem_len,
+				    const char *private_key_filepath,
+				    const void *key_mem,
+				    unsigned int key_mem_len)
+{
+	vh->tls.ssl_client_ctx = lws_zalloc(sizeof(*vh->tls.ssl_client_ctx), "gnutls_client_ctx");
+	if (!vh->tls.ssl_client_ctx)
+		return 1;
+
+	if (gnutls_certificate_allocate_credentials(&vh->tls.ssl_client_ctx->creds) < 0) {
+		lws_free(vh->tls.ssl_client_ctx);
+		vh->tls.ssl_client_ctx = NULL;
+		return 1;
+	}
+
+	if (ca_filepath) {
+		gnutls_certificate_set_x509_trust_file(vh->tls.ssl_client_ctx->creds,
+						      ca_filepath, GNUTLS_X509_FMT_PEM);
+	} else if (ca_mem && ca_mem_len) {
+		if (lws_tls_client_vhost_ca_mem_parse(vh, ca_mem, ca_mem_len)) {
+			lwsl_err("%s: Unable to load x.509 ca_mem\n", __func__);
+			return 1;
+		}
+	} else {
+		gnutls_certificate_set_x509_system_trust(vh->tls.ssl_client_ctx->creds);
+	}
+
+	if (gnutls_priority_init(&vh->tls.ssl_client_ctx->priority,
+				 cipher_list ? cipher_list : "NORMAL", NULL) < 0) {
+		lwsl_err("%s: gnutls_priority_init failed\n", __func__);
+		gnutls_certificate_free_credentials(vh->tls.ssl_client_ctx->creds);
+		lws_free(vh->tls.ssl_client_ctx);
+		vh->tls.ssl_client_ctx = NULL;
+		return 1;
+	}
+
+#if defined(LWS_WITH_TLS_SESSIONS)
+	vh->tls_session_cache_max = (info && info->tls_session_cache_max) ?
+				    info->tls_session_cache_max : 10;
+	lws_tls_session_cache(vh, info ? info->tls_session_timeout : 0);
+#endif
+
+	return 0;
+}
+#endif
+
+#if defined(LWS_WITH_SERVER)
+static int
+lws_gnutls_server_name_cb(gnutls_session_t session)
+{
+	struct lws *wsi = (struct lws *)gnutls_session_get_ptr(session);
+	struct lws_vhost *vhost;
+	char servername[256];
+	size_t len = sizeof(servername) - 1;
+	unsigned int type;
+
+	if (!wsi)
+		return 0;
+
+	if (gnutls_server_name_get(session, servername, &len, &type, 0) < 0) {
+		lwsl_info("SNI: Unknown ServerName\n");
+		return 0;
+	}
+	servername[len] = '\0';
+
+	vhost = lws_select_vhost(wsi->a.context, wsi->a.vhost->listen_port, servername);
+	if (!vhost) {
+		lwsl_info("SNI: none: %s:%d\n", servername, wsi->a.vhost->listen_port);
+		return 0;
+	}
+
+	lwsl_info("SNI: Found: %s:%d\n", servername, wsi->a.vhost->listen_port);
+
+	if (!vhost->tls.ssl_ctx) {
+		lwsl_info("SNI: %s has no tls ctx yet\n", servername);
+		return 0;
+	}
+
+	/* select the credentials from the selected vhost for this session */
+	gnutls_credentials_set(session, GNUTLS_CRD_CERTIFICATE, vhost->tls.ssl_ctx->creds);
+
+	/* And update wsi's bound vhost! */
+	lws_vhost_bind_wsi(vhost, wsi);
+
+	return 0;
+}
+
+// static void my_gnutls_log(int level, const char *msg) {
+//     fprintf(stderr, "GNUTLS_LOG[%d]: %s", level, msg);
+//     fflush(stderr);
+// }
+
+int
+lws_tls_server_new_nonblocking(struct lws *wsi, lws_sockfd_type accept_fd)
+{
+	gnutls_session_t session;
+	unsigned int flags = GNUTLS_SERVER;
+
+	if (!wsi->a.vhost) {
+		lwsl_err("%s: NULL vhost\n", __func__);
+		return 1;
+	}
+
+#if GNUTLS_VERSION_NUMBER >= 0x030605
+        if (wsi->a.vhost->options & LWS_SERVER_OPTION_ALLOW_EARLY_DATA) {
+                flags |= GNUTLS_ENABLE_EARLY_DATA;
+#if defined(LWS_ROLE_QUIC) && GNUTLS_VERSION_NUMBER >= 0x030702
+                extern const struct lws_role_ops role_ops_quic;
+                if (wsi->role_ops == &role_ops_quic) {
+                        flags |= GNUTLS_NO_END_OF_EARLY_DATA;
+                        lwsl_notice("gnutls_init: enabling server 0-RTT with GNUTLS_NO_END_OF_EARLY_DATA\n");
+                } else
+#endif
+                lwsl_notice("gnutls_init: enabling server 0-RTT/early data\n");
+        }
+#endif
+	if (gnutls_init(&session, flags) < 0)
+		return 1;
+	// gnutls_global_set_log_level(99);
+	// gnutls_global_set_log_function(my_gnutls_log);
+	if (0)
+		return 1;
+
+#if GNUTLS_VERSION_NUMBER >= 0x030605
+        if (flags & GNUTLS_ENABLE_EARLY_DATA) {
+                gnutls_record_set_max_early_data_size(session, wsi->a.context->quic_0rtt_max_size ? wsi->a.context->quic_0rtt_max_size : 0xFFFFFFFF);
+                if (wsi->a.vhost->tls.anti_replay)
+                        gnutls_anti_replay_enable(session, (gnutls_anti_replay_t)wsi->a.vhost->tls.anti_replay);
+        }
+#endif
+
+       // gnutls_global_set_log_level(99);
+       // gnutls_global_set_log_function(my_gnutls_log);
+
+	wsi->tls.ssl = (lws_tls_conn *)session;
+
+	wsi->tls.ctx_ref = lws_tls_ctx_ref_get(wsi->a.vhost);
+	if (!wsi->tls.ctx_ref && (!wsi->a.vhost->tls.ssl_ctx)) {
+		lwsl_err("%s: No server SSL context on vhost\n", __func__);
+		gnutls_deinit(session);
+		return 1;
+	}
+	gnutls_priority_set(session, wsi->tls.ctx_ref ? wsi->tls.ctx_ref->ctx->priority : wsi->a.vhost->tls.ssl_ctx->priority);
+	gnutls_credentials_set(session, GNUTLS_CRD_CERTIFICATE, wsi->tls.ctx_ref ? wsi->tls.ctx_ref->ctx->creds : wsi->a.vhost->tls.ssl_ctx->creds);
+	gnutls_transport_set_int((gnutls_session_t)wsi->tls.ssl, (int)accept_fd);
+
+	gnutls_session_set_ptr(session, wsi);
+
+#if defined(LWS_WITH_TLS_KEYLOG) && \
+    defined(LWS_WITH_TLS) && (defined(LWS_WITH_CLIENT) || defined(LWS_WITH_SERVER))
+	gnutls_session_set_keylog_function(session, lws_gnutls_keylog_cb);
+#endif
+
+	gnutls_handshake_set_post_client_hello_function(session, lws_gnutls_server_name_cb);
+
+	if (wsi->a.vhost->tls.alpn_ctx.len) {
+		gnutls_datum_t alpn[4];
+		unsigned int i = 0, p = 0;
+		while (p < wsi->a.vhost->tls.alpn_ctx.len && i < 4) {
+			alpn[i].data = &wsi->a.vhost->tls.alpn_ctx.data[p + 1];
+			alpn[i].size = wsi->a.vhost->tls.alpn_ctx.data[p];
+			p += alpn[i].size + 1;
+			i++;
+		}
+		gnutls_alpn_set_protocols(session, alpn, i, 0);
+	}
+
+	return 0;
+}
+#endif
+
+#if defined(LWS_WITH_CLIENT)
+int
+lws_ssl_client_bio_create(struct lws *wsi)
+{
+	char hostname[128], *p;
+	gnutls_session_t session;
+
+	if (wsi->stash) {
+		lws_strncpy(hostname, wsi->stash->cis[CIS_HOST], sizeof(hostname));
+	} else {
+#if defined(LWS_ROLE_H1) || defined(LWS_ROLE_H2)
+		if (lws_hdr_copy(wsi, hostname, sizeof(hostname),
+				 _WSI_TOKEN_CLIENT_HOST) <= 0)
+#endif
+		{
+			lwsl_err("%s: Unable to get hostname\n", __func__);
+
+			return -1;
+		}
+	}
+
+	/*
+	 * remove any :port part on the hostname... necessary for network
+	 * connection but typical certificates do not contain it
+	 */
+	p = hostname;
+	while (*p) {
+		if (*p == ':') {
+			*p = '\0';
+			break;
+		}
+		p++;
+	}
+
+	unsigned int flags = GNUTLS_CLIENT;
+#if GNUTLS_VERSION_NUMBER >= 0x030605
+	if (wsi->flags & LCCSCF_ALLOW_EARLY_DATA) {
+		flags |= GNUTLS_ENABLE_EARLY_DATA;
+#if defined(LWS_ROLE_QUIC) && GNUTLS_VERSION_NUMBER >= 0x030702
+		extern const struct lws_role_ops role_ops_quic;
+		if (wsi->role_ops == &role_ops_quic) {
+			flags |= GNUTLS_NO_END_OF_EARLY_DATA;
+			lwsl_notice("gnutls_init: enabling client 0-RTT with GNUTLS_NO_END_OF_EARLY_DATA\n");
+		} else
+#endif
+		lwsl_notice("gnutls_init: enabling client 0-RTT/early data\n");
+	}
+#endif
+	if (gnutls_init(&session, flags) < 0)
+		return 1;
+	// gnutls_global_set_log_level(99);
+	// gnutls_global_set_log_function(my_gnutls_log);
+	if (0)
+		return 1;
+
+	if (!wsi->a.vhost->tls.ssl_client_ctx) {
+		if (lws_tls_client_create_vhost_context(wsi->a.vhost, NULL, NULL, NULL, NULL, 0, NULL, NULL, 0, NULL, NULL, 0) ||
+		    !wsi->a.vhost->tls.ssl_client_ctx) {
+			lwsl_err("%s: No client SSL context on vhost %s\n", __func__, wsi->a.vhost->name);
+			gnutls_deinit(session);
+			return -1;
+		}
+	}
+
+	wsi->tls.ssl = (lws_tls_conn *)session;
+
+	gnutls_priority_set(session, wsi->a.vhost->tls.ssl_client_ctx->priority);
+	gnutls_credentials_set(session, GNUTLS_CRD_CERTIFICATE, wsi->a.vhost->tls.ssl_client_ctx->creds);
+	gnutls_transport_set_int(session, (int)wsi->desc.sockfd);
+
+	gnutls_server_name_set(session, GNUTLS_NAME_DNS, hostname, strlen(hostname));
+	gnutls_session_set_ptr(session, wsi);
+
+#if defined(LWS_WITH_TLS_KEYLOG) && \
+    defined(LWS_WITH_TLS) && (defined(LWS_WITH_CLIENT) || defined(LWS_WITH_SERVER))
+	gnutls_session_set_keylog_function(session, lws_gnutls_keylog_cb);
+#endif
+
+#if defined(LWS_WITH_TLS_SESSIONS)
+	lws_tls_reuse_session(wsi);
+#endif
+
+	if (wsi->alpn[0]) {
+		gnutls_datum_t alpn[4];
+		unsigned int i = 0;
+		char *p = wsi->alpn;
+		char *end = p + strlen(p);
+		
+		while (p < end && i < 4) {
+			char *comma = strchr(p, ',');
+			alpn[i].data = (uint8_t *)p;
+			if (comma) {
+				alpn[i].size = (unsigned int)lws_ptr_diff_size_t(comma, p);
+				p = comma + 1;
+			} else {
+				alpn[i].size = (unsigned int)lws_ptr_diff_size_t(end, p);
+				p = end;
+			}
+			i++;
+		}
+		gnutls_alpn_set_protocols(session, alpn, i, 0);
+	} else if (wsi->a.vhost->tls.alpn_ctx.len) {
+		gnutls_datum_t alpn[4];
+		unsigned int i = 0, p = 0;
+		while (p < wsi->a.vhost->tls.alpn_ctx.len && i < 4) {
+			alpn[i].data = &wsi->a.vhost->tls.alpn_ctx.data[p + 1];
+			alpn[i].size = wsi->a.vhost->tls.alpn_ctx.data[p];
+			p += alpn[i].size + 1;
+			i++;
+		}
+		gnutls_alpn_set_protocols(session, alpn, i, 0);
+	}
+
+	return 0;
+}
+#endif
+
+void
+lws_ssl_SSL_CTX_destroy(struct lws_vhost *vhost)
+{
+#if defined(LWS_WITH_SERVER) && GNUTLS_VERSION_NUMBER >= 0x030605
+        if (vhost->tls.anti_replay) {
+                lws_dll2_owner_t *owner = (lws_dll2_owner_t *)vhost->tls.anti_replay_owner;
+                if (owner) {
+                        lws_start_foreach_dll_safe(struct lws_dll2 *, d, d1, lws_dll2_get_head(owner)) {
+                                lws_dll2_remove(d);
+                                lws_free(lws_container_of(d, struct lws_gnutls_ar_entry, list));
+                        } lws_end_foreach_dll_safe(d, d1);
+                        lws_free(owner);
+                }
+                gnutls_anti_replay_deinit((gnutls_anti_replay_t)vhost->tls.anti_replay);
+                vhost->tls.anti_replay = NULL;
+                vhost->tls.anti_replay_owner = NULL;
+        }
+#endif
+	if (vhost->tls.ssl_ctx) {
+		lws_tls_vhost_backend_free_ctx(vhost->tls.ssl_ctx);
+		vhost->tls.ssl_ctx = NULL;
+	}
+#if defined(LWS_WITH_CLIENT)
+	if (vhost->tls.ssl_client_ctx) {
+		gnutls_certificate_free_credentials(vhost->tls.ssl_client_ctx->creds);
+		gnutls_priority_deinit(vhost->tls.ssl_client_ctx->priority);
+		lws_free(vhost->tls.ssl_client_ctx);
+		vhost->tls.ssl_client_ctx = NULL;
+	}
+#endif
+}
+
+lws_tls_ctx *
+lws_tls_ctx_from_wsi(struct lws *wsi)
+{
+	if (!wsi || !wsi->a.vhost)
+		return NULL;
+
+	return wsi->a.vhost->tls.ssl_ctx;
+}
+
+void
+lws_ssl_context_destroy(struct lws_context *context)
+{
+	/* Global init already handled by global_deinit */
+}
+
+
+
+#if defined(LWS_WITH_CLIENT)
+int
+lws_tls_client_vhost_extra_cert_mem(struct lws_vhost *vh, const uint8_t *der, size_t len)
+{
+	gnutls_datum_t mem;
+
+	if (!vh->tls.ssl_client_ctx || !vh->tls.ssl_client_ctx->creds)
+		return -1;
+
+	mem.data = (uint8_t *)der;
+	mem.size = (unsigned int)len;
+
+	if (gnutls_certificate_set_x509_trust_mem(vh->tls.ssl_client_ctx->creds,
+						  &mem, GNUTLS_X509_FMT_DER) < 0) {
+		lwsl_err("%s: Failed to load extra client cert\n", __func__);
+		return -1;
+	}
+
+	return 0;
+}
+#endif
+
+int
+lws_tls_vhost_cert_info(struct lws_vhost *vhost, enum lws_tls_cert_info type,
+		       union lws_tls_cert_info_results *buf, size_t len)
+{
+	gnutls_x509_crt_t *crt_list;
+	unsigned int crt_list_size = 0;
+	time_t t;
+
+	if (!vhost->tls.ssl_ctx || !vhost->tls.ssl_ctx->creds)
+		return -1;
+
+	/* Get the certificates explicitly configured on this server */
+	if (gnutls_certificate_get_x509_crt(vhost->tls.ssl_ctx->creds, 0, &crt_list, &crt_list_size) < 0 || crt_list_size == 0)
+		return -1;
+
+	switch (type) {
+	case LWS_TLS_CERT_INFO_VALIDITY_TO:
+		t = gnutls_x509_crt_get_expiration_time(crt_list[0]);
+		if (t == (time_t)-1)
+			return -1;
+		buf->time = t;
+		return 0;
+
+	case LWS_TLS_CERT_INFO_VALIDITY_FROM:
+		t = gnutls_x509_crt_get_activation_time(crt_list[0]);
+		if (t == (time_t)-1)
+			return -1;
+		buf->time = t;
+		return 0;
+
+	case LWS_TLS_CERT_INFO_ISSUER_NAME:
+		if (gnutls_x509_crt_get_issuer_dn(crt_list[0], buf->ns.name, &len) < 0)
+			return -1;
+		buf->ns.len = (int)len;
+		return 0;
+
+	case LWS_TLS_CERT_INFO_COMMON_NAME:
+		if (gnutls_x509_crt_get_dn(crt_list[0], buf->ns.name, &len) < 0)
+			return -1;
+		buf->ns.len = (int)len;
+		return 0;
+
+	case LWS_TLS_CERT_INFO_DER_RAW:
+		/* We don't have direct access to DER raw via this accessor cleanly here. */
+		return -1;
+
+	case LWS_TLS_CERT_INFO_AUTHORITY_KEY_ID:
+	case LWS_TLS_CERT_INFO_AUTHORITY_KEY_ID_ISSUER:
+	case LWS_TLS_CERT_INFO_AUTHORITY_KEY_ID_SERIAL:
+		/* Not fully mapped to generic lws_tls_cert_info type yet */
+		return -1;
+
+	default:
+		break;
+	}
+
+	return -1;
+}
+
+#if defined(LWS_WITH_SERVER)
+int
+lws_tls_server_certs_load(struct lws_vhost *vhost, struct lws *wsi,
+			  const char *cert, const char *private_key,
+			  const char *mem_cert, size_t len_mem_cert,
+			  const char *mem_privkey, size_t mem_privkey_len)
+{
+	int n;
+
+	if (mem_cert && mem_privkey) {
+		gnutls_datum_t c, k;
+
+		c.data = (uint8_t *)mem_cert;
+		c.size = (unsigned int)len_mem_cert;
+		k.data = (uint8_t *)mem_privkey;
+		k.size = (unsigned int)mem_privkey_len;
+
+		n = gnutls_certificate_set_x509_key_mem(vhost->tls.ssl_ctx->creds,
+						       &c, &k, GNUTLS_X509_FMT_PEM);
+	} else if (cert && private_key) {
+		lwsl_notice("%s: loading cert %s, key %s\n", __func__, cert, private_key);
+		n = gnutls_certificate_set_x509_key_file(vhost->tls.ssl_ctx->creds,
+							cert, private_key,
+							GNUTLS_X509_FMT_PEM);
+	} else {
+		return 1;
+	}
+
+	if (n < 0) {
+		lwsl_err("Failed to load server certs: %s\n", gnutls_strerror(n));
+		return 1;
+	}
+
+	return 0;
+}
+
+int
+lws_tls_server_client_cert_verify_config(struct lws_vhost *vh)
+{
+	/* In GnuTLS, this is typically handled per-session during handshake setup,
+	 * but we don't have a vhost-wide global option for it outside of the credentials.
+	 * We can note that it's active. lws_tls_server_new_nonblocking would normally
+	 * call gnutls_certificate_server_set_request(session, GNUTLS_CERT_REQUEST);
+	 * Since GnuTLS doesn't store this state purely in the credential context like OpenSSL,
+	 * we will just return 0 to indicate it was "configured" and the LWS core should
+	 * apply it dynamically when creating sessions if LWS_SERVER_OPTION_REQUIRE_VALID_CLIENT_CERT is set. */
+	return 0;
+}
+#endif
+
+int
+lws_tls_peer_cert_info(struct lws *wsi, enum lws_tls_cert_info type,
+		       union lws_tls_cert_info_results *buf, size_t len)
+{
+	const gnutls_datum_t *cert_list;
+	unsigned int cert_list_size = 0;
+	gnutls_x509_crt_t crt;
+	time_t t;
+	int ret = -1;
+
+	if (!wsi->tls.ssl)
+		return -1;
+
+	cert_list = gnutls_certificate_get_peers((gnutls_session_t)wsi->tls.ssl, &cert_list_size);
+	if (!cert_list || cert_list_size == 0)
+		return -1;
+
+	if (gnutls_x509_crt_init(&crt) < 0)
+		return -1;
+
+	if (gnutls_x509_crt_import(crt, &cert_list[0], GNUTLS_X509_FMT_DER) < 0)
+		goto bail;
+
+	switch (type) {
+	case LWS_TLS_CERT_INFO_VALIDITY_TO:
+		t = gnutls_x509_crt_get_expiration_time(crt);
+		if (t == (time_t)-1)
+			goto bail;
+		buf->time = t;
+		ret = 0;
+		break;
+
+	case LWS_TLS_CERT_INFO_VALIDITY_FROM:
+		t = gnutls_x509_crt_get_activation_time(crt);
+		if (t == (time_t)-1)
+			goto bail;
+		buf->time = t;
+		ret = 0;
+		break;
+
+	case LWS_TLS_CERT_INFO_ISSUER_NAME:
+		if (gnutls_x509_crt_get_issuer_dn(crt, buf->ns.name, &len) < 0)
+			goto bail;
+		buf->ns.len = (int)len;
+		ret = 0;
+		break;
+
+	case LWS_TLS_CERT_INFO_COMMON_NAME:
+		if (gnutls_x509_crt_get_dn(crt, buf->ns.name, &len) < 0)
+			goto bail;
+		buf->ns.len = (int)len;
+		ret = 0;
+		break;
+
+	default:
+		break;
+	}
+
+bail:
+	gnutls_x509_crt_deinit(crt);
+	return ret;
+}
+
+int
+lws_tls_session_is_reused(struct lws *wsi)
+{
+	if (!wsi->tls.ssl)
+		return 0;
+
+	return (int)gnutls_session_is_resumed((gnutls_session_t)wsi->tls.ssl);
+}
+
+#if !defined(LWS_WITH_TLS_SESSIONS)
+int
+lws_tls_session_dump_save(struct lws_vhost *vh, const char *host, uint16_t port,
+			   lws_tls_sess_cb_t cb_save, void *opq)
+{
+	return -1;
+}
+
+int
+lws_tls_session_dump_load(struct lws_vhost *vh, const char *host, uint16_t port,
+			   lws_tls_sess_cb_t cb_load, void *opq)
+{
+	return -1;
+}
+#endif
+
+
+
+
+#endif

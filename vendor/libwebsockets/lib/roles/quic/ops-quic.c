@@ -1,0 +1,4507 @@
+/*
+ * libwebsockets - small server side websockets and web server implementation
+ *
+ * Copyright (C) 2010 - 2026 Andy Green <andy@warmcat.com>
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to
+ * deal in the Software without restriction, including without limitation the
+ * rights to use, copy, modify, merge, publish, distribute, sublicense, and/or
+ * sell copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in
+ * all copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING
+ * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
+ * IN THE SOFTWARE.
+ */
+
+#include "private-lib-core.h"
+
+#include "private-lib-core.h"
+#include "roles/quic/private-lib-roles-quic.h"
+
+static int quic_secret_cb(struct lws *wsi, enum lws_tls_quic_secret_type type, const uint8_t *secret, size_t secret_len);
+
+/*
+ * 0-RTT debug accounting helper for the QUIC-Interop-Runner "zerortt"
+ * failure mode (client emits too many bytes in 1-RTT packets after
+ * attempting 0-RTT; the runner fails the test if 1-RTT payload bytes
+ * exceed 0.5 * NUM_FILES * FILENAMELEN, i.e. 5000 bytes for the default
+ * 40-file / 250-char-name case).
+ *
+ * Fires ONLY on the bad path: client-side connections that attempted
+ * 0-RTT (early_data_status == LWS_0RTT_STATUS_ATTEMPTED).  In every
+ * other case it collapses to a single cheap branch and returns, so it
+ * is safe to call from every frame-queueing site without polluting
+ * normal H3 / server logs.  Defined here, above its first caller, so no
+ * forward declaration is needed.
+ */
+static void
+lws_quic_dbg_1rtt_account(struct lws_quic_netconn *qn,
+			  const struct lws_quic_tx_frame *f,
+			  const char *where)
+{
+	uint64_t bytes;
+
+	if (!qn || !f || qn->is_server ||
+	    qn->early_data_status != LWS_0RTT_STATUS_ATTEMPTED)
+		return;
+
+	bytes = (uint64_t)f->len;
+
+	/*
+	 * The byte/frame counters stay maintained at every log level so a
+	 * future dump of qn->dbg_1rtt_* works regardless; only the per-frame
+	 * notice line and its label build are compiled out under no-logs.
+	 */
+	qn->dbg_1rtt_frames++;
+	qn->dbg_1rtt_bytes += bytes;
+	if (!qn->handshake_done) {
+		qn->dbg_1rtt_pre_hs_frames++;
+		qn->dbg_1rtt_pre_hs_bytes += bytes;
+	}
+
+#if (_LWS_ENABLED_LOGS & LLL_INFO)
+	{
+		const char *name;
+		uint8_t type = (uint8_t)f->type;
+
+		/* STREAM frames carry 0x08-0x0f depending on OFF/LEN/FIN bits;
+		 * the enum is laid out so LWS_QUIC_FT_MAX_DATA (0x10) is the
+		 * next named value, so it bounds the STREAM range cleanly */
+		if (type >= LWS_QUIC_FT_STREAM && type < LWS_QUIC_FT_MAX_DATA)
+			name = "STREAM";
+		else switch (type) {
+		case LWS_QUIC_FT_PADDING:		  name = "PADDING";		break;
+		case LWS_QUIC_FT_PING:			  name = "PING";		break;
+		case LWS_QUIC_FT_ACK:			  name = "ACK";			break;
+		case LWS_QUIC_FT_ACK_ECN:		  name = "ACK_ECN";		break;
+		case LWS_QUIC_FT_RESET_STREAM:		  name = "RESET_STREAM";	break;
+		case LWS_QUIC_FT_STOP_SENDING:		  name = "STOP_SENDING";	break;
+		case LWS_QUIC_FT_CRYPTO:		  name = "CRYPTO";		break;
+		case LWS_QUIC_FT_MAX_DATA:		  name = "MAX_DATA";		break;
+		case LWS_QUIC_FT_MAX_STREAM_DATA:	  name = "MAX_STREAM_DATA";	break;
+		case LWS_QUIC_FT_MAX_STREAMS_BIDI:	  name = "MAX_STREAMS_BIDI";	break;
+		case LWS_QUIC_FT_MAX_STREAMS_UNIDI:	  name = "MAX_STREAMS_UNIDI";	break;
+		case LWS_QUIC_FT_DATA_BLOCKED:		  name = "DATA_BLOCKED";	break;
+		case LWS_QUIC_FT_STREAM_DATA_BLOCKED:	  name = "STREAM_DATA_BLOCKED";	break;
+		case LWS_QUIC_FT_STREAMS_BLOCKED_BIDI:	  name = "STREAMS_BLOCKED_B";	break;
+		case LWS_QUIC_FT_STREAMS_BLOCKED_UNIDI:	  name = "STREAMS_BLOCKED_U";	break;
+		case LWS_QUIC_FT_NEW_CONNECTION_ID:	  name = "NEW_CONNECTION_ID";	break;
+		case LWS_QUIC_FT_RETIRE_CONNECTION_ID:	  name = "RETIRE_CONNECTION_ID";break;
+		case LWS_QUIC_FT_PATH_CHALLENGE:	  name = "PATH_CHALLENGE";	break;
+		case LWS_QUIC_FT_PATH_RESPONSE:		  name = "PATH_RESPONSE";	break;
+		case LWS_QUIC_FT_CONNECTION_CLOSE:	  name = "CONNECTION_CLOSE";	break;
+		case LWS_QUIC_FT_CONNECTION_CLOSE_APP:	  name = "CC_APP";		break;
+		case LWS_QUIC_FT_HANDSHAKE_DONE:	  name = "HANDSHAKE_DONE";	break;
+		case LWS_QUIC_FT_DATAGRAM:		  name = "DATAGRAM";		break;
+		case LWS_QUIC_FT_DATAGRAM + 1:		  name = "DATAGRAM_LEN";	break;
+		default:				  name = "OTHER";		break;
+		}
+
+		lwsl_wsi_notice(qn->nwsi, "0RTTDBG app-queue %-18s type=0x%02x len=%5llu "
+				"stream=%u sid=0x%x @%s (hs_done=%d) | "
+				"app-total: %llu frames / %llu bytes (pre-hs %llu / %llu)",
+				name, type, (unsigned long long)bytes,
+				f->stream_id != 0, (unsigned)f->stream_id, where,
+				qn->handshake_done,
+				(unsigned long long)qn->dbg_1rtt_frames,
+				(unsigned long long)qn->dbg_1rtt_bytes,
+				(unsigned long long)qn->dbg_1rtt_pre_hs_frames,
+				(unsigned long long)qn->dbg_1rtt_pre_hs_bytes);
+		(void)name;
+	}
+#endif
+}
+
+void
+lws_quic_queue_path_challenge(struct lws *nwsi)
+{
+        if (!nwsi || !nwsi->quic.qn) return;
+        struct lws_quic_tx_frame *f_pc = lws_zalloc(sizeof(*f_pc) + 8, "quic path_chall");
+        if (f_pc) {
+                f_pc->type = LWS_QUIC_FT_PATH_CHALLENGE;
+                f_pc->len = 8;
+                f_pc->data = (uint8_t *)&f_pc[1];
+                if (lws_get_random(nwsi->a.context, f_pc->data, 8) != 8) {
+                        lws_free(f_pc);
+                        return;
+                }
+		memcpy(nwsi->quic.qn->path_challenge, f_pc->data, 8);
+		nwsi->quic.qn->path_challenge_pending = 1;
+
+		lws_quic_dbg_1rtt_account(nwsi->quic.qn, f_pc, "path-challenge");
+		lws_dll2_add_tail(&f_pc->list, &nwsi->quic.qn->pending_tx[LWS_QUIC_LEVEL_APP]);
+		lws_callback_on_writable(nwsi);
+	}
+}
+
+/*
+ * Client preferred_address active migration (RFC 9000 §9.5/§9.6).
+ *
+ * Swap the nwsi onto a fresh UDP socket (new source port) connected to the
+ * server's preferred address, and start using the new DCID the server
+ * advertised.  This is "break-before-make": the old path is abandoned at probe
+ * start and in-flight data is recovered by QUIC loss detection.  A PATH_RESPONSE
+ * validates the new path; a timeout reverts to a fresh socket on the original
+ * server address with the original DCID.
+ */
+#define LWS_QUIC_PREFADDR_DEADLINE_US (10 * LWS_USEC_PER_SEC)
+
+static int
+lws_quic_prefaddr_swap_socket(struct lws *nwsi, const lws_sockaddr46 *to_sa46)
+{
+	struct lws_context *cx = nwsi->a.context;
+	struct lws_context_per_thread *pt = &cx->pt[(int)nwsi->tsi];
+	lws_sock_file_fd_type new_sock;
+	int fam = to_sa46->sa4.sin_family;
+	lws_sockfd_type n_fd;
+
+	n_fd = socket(fam, SOCK_DGRAM, 0);
+	if (!lws_socket_is_valid(n_fd)) {
+		lwsl_wsi_warn(nwsi, "prefaddr: socket fail errno=%d", LWS_ERRNO);
+		return 1;
+	}
+	if (lws_plat_apply_FD_CLOEXEC((int)n_fd) ||
+	    lws_plat_set_nonblocking(n_fd)) {
+		compatible_close(n_fd);
+		return 1;
+	}
+	{
+		int opt = 4 * 1024 * 1024;
+		if (setsockopt(n_fd, SOL_SOCKET, SO_RCVBUF, (const char *)&opt, sizeof(opt)) < 0)
+			lwsl_wsi_warn(nwsi, "prefaddr: set SO_RCVBUF failed");
+		if (setsockopt(n_fd, SOL_SOCKET, SO_SNDBUF, (const char *)&opt, sizeof(opt)) < 0)
+			lwsl_wsi_warn(nwsi, "prefaddr: set SO_SNDBUF failed");
+	}
+	if (connect(n_fd, sa46_sockaddr((lws_sockaddr46 *)to_sa46),
+		    sa46_socklen((lws_sockaddr46 *)to_sa46)) < 0)
+		lwsl_wsi_warn(nwsi, "prefaddr: connect fail errno=%d", LWS_ERRNO);
+
+	new_sock.sockfd = n_fd;
+
+	lws_pt_lock(pt, __func__);
+	if (lws_socket_is_valid(nwsi->desc.sockfd))
+		__remove_wsi_socket_from_fds(nwsi);
+
+	/*
+	 * The fd number itself is changing: the event-loop handle that was
+	 * bound to the old fd at accept time cannot be repointed to the new
+	 * fd.  For libuv, leaving it in place leaks libuv's per-fd watcher
+	 * entry for the old fd (which was already closed below); when the
+	 * kernel later recycles that fd number, uv_poll_init_socket() trips
+	 * UV_EEXIST on the unrelated new socket.  Tear down the old handle
+	 * through the event-lib ops (which also closes the old kernel fd),
+	 * then build a fresh handle for the new fd, exactly as the redirect
+	 * / fd-handoff paths do.
+	 */
+#if defined(LWS_WITH_EVENT_LIBS)
+	if (cx->event_loop_ops->close_handle_manually)
+		cx->event_loop_ops->close_handle_manually(nwsi);
+	else
+#endif
+	{
+		if (lws_socket_is_valid(nwsi->desc.sockfd))
+			compatible_close(nwsi->desc.sockfd);
+		nwsi->desc.sockfd = LWS_SOCK_INVALID;
+	}
+
+	nwsi->desc = new_sock;
+
+#if defined(LWS_WITH_EVENT_LIBS)
+	if (cx->event_loop_ops->sock_accept)
+		if (cx->event_loop_ops->sock_accept(nwsi)) {
+			lws_pt_unlock(pt);
+			compatible_close(n_fd);
+			return 1;
+		}
+#endif
+
+	if (__insert_wsi_socket_into_fds(cx, nwsi)) {
+		lws_pt_unlock(pt);
+		compatible_close(n_fd);
+		return 1;
+	}
+	lws_pt_unlock(pt);
+
+	nwsi->udp->sa46 = *to_sa46;
+
+	return 0;
+}
+
+static void
+lws_quic_prefaddr_sul_cb(lws_sorted_usec_list_t *sul)
+{
+	struct lws_quic_netconn *qn = lws_container_of(sul,
+					struct lws_quic_netconn, prefaddr_sul);
+	struct lws *nwsi = qn->nwsi;
+
+	if (!nwsi)
+		return;
+
+	lwsl_wsi_notice(nwsi, "QUIC: preferred_address path validation timed out, "
+			   "reverting to original server path");
+
+	qn->probing_sa46_valid = 0;
+	qn->path_challenge_pending = 0;
+	qn->prefaddr_active = 0;
+	qn->rem_cid = qn->prefaddr_original_rem_cid;
+
+	if (lws_quic_prefaddr_swap_socket(nwsi, &qn->prefaddr_original_sa46))
+		lwsl_wsi_err(nwsi, "prefaddr: revert socket failed");
+
+	lws_callback_on_writable(nwsi);
+}
+
+int
+lws_quic_client_probe_preferred_address(struct lws *nwsi,
+					const lws_sockaddr46 *pref_sa46,
+					const struct lws_quic_cid *pref_cid,
+					const uint8_t *pref_token)
+{
+	struct lws_quic_netconn *qn;
+
+	if (!nwsi || !nwsi->quic.qn || !nwsi->udp || !pref_sa46)
+		return 1;
+	qn = nwsi->quic.qn;
+
+	if (qn->is_server)
+		return 1;
+
+	/*
+	 * Remember how to get back before we change anything, so the probe
+	 * timeout can revert to a fresh socket on the original server path
+	 * (and original DCID).  This is entered at most twice for one probe
+	 * (once at TP parse, once at HANDSHAKE_DONE), both before any swap.
+	 */
+	qn->prefaddr_original_sa46 = nwsi->udp->sa46;
+	qn->prefaddr_original_rem_cid = qn->rem_cid;
+
+	/* Save the migration parameters for later */
+	qn->probing_sa46 = *pref_sa46;
+	if (pref_cid) {
+		qn->prefaddr_rem_cid = *pref_cid;
+		if (pref_token)
+			memcpy(qn->prefaddr_rem_token, pref_token, 16);
+	}
+
+	/*
+	 * Defer the actual socket swap + DCID change until the server confirms
+	 * handshake completion via HANDSHAKE_DONE.  The preferred_address TP
+	 * arrives during the handshake; swapping before both sides have APP
+	 * keys strands the migration.
+	 */
+	if (!qn->handshake_done) {
+		qn->prefaddr_pending = 1;
+		return 0;
+	}
+
+	qn->prefaddr_pending = 0;
+	qn->prefaddr_active = 1;
+	qn->prefaddr_committed = 0;
+
+	if (lws_quic_prefaddr_swap_socket(nwsi, pref_sa46))
+		return 1;
+
+	if (pref_cid && pref_cid->len)
+		qn->rem_cid = *pref_cid;
+
+	lws_quic_queue_path_challenge(nwsi);
+
+	lws_sul_schedule(nwsi->a.context, nwsi->tsi, &qn->prefaddr_sul,
+			 lws_quic_prefaddr_sul_cb, LWS_QUIC_PREFADDR_DEADLINE_US);
+
+	return 0;
+}
+
+/*
+ * Find a server connection on this listener by DCID: either the CID we
+ * allocated for the connection, the original client DCID (it may not have
+ * switched yet), or the preferred_address CID we advertised (RFC 9000 9.6).
+ */
+static struct lws *
+lws_quic_find_child_by_dcid(struct lws *listener,
+			    const struct lws_quic_cid *dcid)
+{
+	lws_start_foreach_dll(struct lws_dll2 *, d,
+			      listener->mux.child_list_owner.head) {
+		struct lws *w = lws_container_of(d, struct lws,
+						 mux.sibling_list);
+		if (!w->quic.qn)
+			continue;
+		if ((w->quic.qn->loc_cid.len == dcid->len &&
+		     !memcmp(w->quic.qn->loc_cid.id, dcid->id, dcid->len)) ||
+		    (w->quic.qn->orig_dcid.len == dcid->len &&
+		     !memcmp(w->quic.qn->orig_dcid.id, dcid->id, dcid->len)) ||
+		    (w->quic.qn->prefaddr_rem_cid.len == dcid->len &&
+		     !memcmp(w->quic.qn->prefaddr_rem_cid.id, dcid->id,
+			     dcid->len)))
+			return w;
+	} lws_end_foreach_dll(d);
+
+	return NULL;
+}
+
+#if defined(LWS_WITH_SERVER)
+/*
+ * Server egress fd for a peer that may have migrated onto a different address
+ * family than the listener that accepted the connection (eg, an IPv6
+ * connection actively migrating to our IPv4 preferred address): use the
+ * vhost's QUIC listener bound to the destination's family.
+ */
+static lws_sockfd_type
+lws_quic_server_egress_fd(struct lws_vhost *vh, int family,
+			  lws_sockfd_type fall_back)
+{
+	if (vh) {
+		lws_start_foreach_dll_safe(struct lws_dll2 *, d, d1,
+				lws_dll2_get_head(&vh->listen_wsi)) {
+			struct lws *lw = lws_container_of(d, struct lws,
+							  listen_list);
+			if (lw->role_ops != &role_ops_quic || !lw->udp)
+				continue;
+			if (lw->udp->sa46.sa4.sin_family == family &&
+			    lws_socket_is_valid(lw->desc.sockfd))
+				return lw->desc.sockfd;
+		} lws_end_foreach_dll_safe(d, d1);
+	}
+
+	return fall_back;
+}
+#endif
+
+static void
+lws_quic_pacer_cb(lws_sorted_usec_list_t *sul)
+{
+	struct lws_quic_netconn *qn = lws_container_of(sul, struct lws_quic_netconn, pacer_sul);
+	if (qn && qn->nwsi)
+		lws_callback_on_writable(qn->nwsi);
+}
+
+/*
+ * Delayed-ACK timer (RFC 9000 §13.2.1).  When it fires, a deferred App-space
+ * ACK is due; just wake the network wsi so rops_handle_POLLOUT_quic builds and
+ * sends it (the TX path cancels this sul and resets the counters as it emits
+ * the ACK frame).  We bypass CC/pacing there exactly as for an immediate ACK.
+ */
+static void
+lws_quic_ack_delay_cb(lws_sorted_usec_list_t *sul)
+{
+	struct lws_quic_netconn *qn = lws_container_of(sul, struct lws_quic_netconn,
+							ack_delay_sul);
+	if (qn) {
+		qn->ack_delay_armed = 0;
+		if (qn->nwsi)
+			lws_callback_on_writable(qn->nwsi);
+	}
+}
+
+/*
+ * RFC 9002 5.3 PTO interval without an RTT sample yet, or with the current
+ * smoothed_rtt / rttvar estimate.
+ */
+static lws_usec_t
+lws_quic_pto_base_us(const struct lws_quic_netconn *qn)
+{
+	return qn->smoothed_rtt ?
+		(qn->smoothed_rtt + (4 * qn->rttvar) + 25000) :
+		LWS_QUIC_DEFAULT_PTO_US;
+}
+
+/*
+ * RFC 9002 6.2 PTO interval with exponential backoff: pto_count consecutive
+ * PTO firings double the delay.  The shift is clamped so a large pto_count
+ * (which the count-based death conditions do not always bound) saturates
+ * instead of producing an out-of-range shift.
+ *
+ * While the TLS handshake is still incomplete, the backoff is capped at 4x the
+ * base interval.  Pre-handshake_done, the death of a peer we have heard
+ * nothing from is owned by the wsi connect timeout
+ * (PENDING_TIMEOUT_AWAITING_CONNECT_RESPONSE, default 20s), not by this
+ * backoff; with unbounded doubling from the 500ms default base only ~6
+ * Initial probes fit in that window, which is too few to ride out a
+ * corruption streak (interop corrupt-rate scenario, 30% each direction:
+ * P(all 6 probes corrupted) ~ 7e-4 per connection).  Capping the probe
+ * spacing fits ~12 probes in the same window (P ~ 5e-7).  For handshakes that
+ * did make some progress, the RFC 9002 A.11 backoff reset on PN space discard
+ * in lws_quic_discard_keys() handles the accumulated backoff instead.
+ */
+static lws_usec_t
+lws_quic_pto_delay_us(const struct lws_quic_netconn *qn, uint8_t count)
+{
+	lws_usec_t base = lws_quic_pto_base_us(qn);
+	uint8_t shift = count > 6 ? 6 : count;
+	lws_usec_t delay = base << shift;
+
+	if (!qn->handshake_done && delay > base * 4)
+		delay = base * 4;
+	if (delay > 10000000)
+		delay = 10000000;
+
+	return delay;
+}
+
+static void
+lws_quic_pto_cb(lws_sorted_usec_list_t *sul)
+{
+	struct lws_quic_netconn *qn = lws_container_of(sul, struct lws_quic_netconn, pto_sul);
+	if (qn && qn->nwsi) {
+		qn->pto_count++;
+		/*
+		 * Pre-handshake_done on the client, leave the death of a silent
+		 * peer to the wsi connect timeout so the capped probe spacing in
+		 * lws_quic_pto_delay_us() can keep probing for the whole
+		 * connect window (otherwise the counter would kill it at
+		 * ~4x base x 8 first).  Server-side, keep the reap: it is the
+		 * only bound on half-open connections from clients that vanish
+		 * mid-handshake, and the capped spacing only makes it fire
+		 * sooner.
+		 */
+		if (qn->pto_count >= 8 && (qn->is_server || qn->handshake_done)) {
+			lwsl_wsi_notice(qn->nwsi, "QUIC connection dead: max PTO count (%d) reached\n", qn->pto_count);
+			lws_close_free_wsi(qn->nwsi, LWS_CLOSE_STATUS_NOSTATUS, "quic pto timeout");
+			return;
+		}
+
+		qn->pto_probe_needed = 2;
+#if (_LWS_ENABLED_LOGS & LLL_INFO)
+		LWS_RATELIMIT_DEFINE_STATIC(rl);
+		lwsl_ratelimit_info(&rl, 1000000, "QUIC PTO Timer Fired! Forcing POLLOUT for retransmission sweep\n");
+#endif
+		int sent_ping = 0;
+		size_t total_bytes_lost = 0;
+		/* Aggressively retransmit Initial/Handshake frames (RFC 9002 6.2.4) */
+		for (int i = 0; i < LWS_QUIC_LEVEL_APP; i++) {
+			if (qn->in_flight[i].count) {
+				lws_start_foreach_dll_safe(struct lws_dll2 *, d, d1, qn->in_flight[i].head) {
+					struct lws_quic_tx_frame *f = lws_container_of(d, struct lws_quic_tx_frame, list);
+					lws_dll2_remove(d);
+					total_bytes_lost += f->wire_len;
+					f->wire_len = 0; /* CRITICAL: Reset wire_len */
+					lws_dll2_add_tail(&f->list, &qn->pending_tx[i]);
+				} lws_end_foreach_dll_safe(d, d1);
+				lwsl_wsi_info(qn->nwsi, "QUIC PTO: Retransmitting Initial/Handshake for level %d", i);
+				sent_ping = 1;
+			}
+		}
+
+		if (total_bytes_lost && qn->cc_ops && qn->cc_ops->on_discard)
+			qn->cc_ops->on_discard(qn->nwsi, total_bytes_lost);
+
+		/* For App Data, just send a PING to elicit an ACK */
+		if (!sent_ping && qn->in_flight[LWS_QUIC_LEVEL_APP].count) {
+			struct lws_quic_tx_frame *ping = lws_zalloc(sizeof(*ping), "pto ping");
+			if (ping) {
+				ping->type = LWS_QUIC_FT_PING;
+				/* Add at HEAD so the PING is serialized first, before data frames
+				 * fill the MTU and cause pto_probe_needed to decrement prematurely */
+				lws_quic_dbg_1rtt_account(qn, ping, "pto-ping");
+				lws_dll2_add_head(&ping->list, &qn->pending_tx[LWS_QUIC_LEVEL_APP]);
+				lwsl_wsi_info(qn->nwsi, "QUIC PTO: Enqueued PING for level 3");
+                                qn->pto_probe_needed = 1;
+			}
+			sent_ping = 1;
+		}
+
+		if (!sent_ping && !qn->handshake_done) {
+			int target_level = LWS_QUIC_LEVEL_INITIAL;
+			if (qn->keys[LWS_QUIC_LEVEL_HANDSHAKE]) target_level = LWS_QUIC_LEVEL_HANDSHAKE;
+			struct lws_quic_tx_frame *ping = lws_zalloc(sizeof(*ping), "pto ping");
+			if (ping) {
+				ping->type = LWS_QUIC_FT_PING;
+				lws_dll2_add_tail(&ping->list, &qn->pending_tx[target_level]);
+				lwsl_wsi_info(qn->nwsi, "QUIC PTO: Enqueued PING for level %d (no in-flight, handshake incomplete)", target_level);
+				qn->pto_probe_needed = 1;
+			}
+			sent_ping = 1;
+		}
+
+		lws_callback_on_writable(qn->nwsi);
+
+		/* Always ensure the timer is running as long as there is data in flight, or client handshake incomplete! */
+		int any_in_flight = 0;
+		for (int i = 0; i < LWS_QUIC_LEVEL_COUNT; i++) {
+			if (qn->in_flight[i].count) {
+				any_in_flight = 1;
+				break;
+			}
+		}
+
+		if (any_in_flight || !qn->handshake_done) {
+			lws_usec_t pto_delay = lws_quic_pto_delay_us(qn, qn->pto_count);
+			lws_sul_schedule(qn->nwsi->a.context, 0, &qn->pto_sul, lws_quic_pto_cb, pto_delay);
+		}
+	}
+}
+
+/* RFC 9000 Section 17.1 */
+static uint64_t
+lws_quic_decode_packet_number(uint64_t largest_pn, uint64_t truncated_pn, int pn_nbits)
+{
+	uint64_t expected_pn = largest_pn + 1;
+	uint64_t pn_win = 1ULL << pn_nbits;
+	uint64_t pn_hwin = pn_win / 2;
+	uint64_t pn_mask = pn_win - 1;
+	uint64_t candidate_pn = (expected_pn & ~pn_mask) | truncated_pn;
+
+	if (candidate_pn + pn_hwin <= expected_pn && candidate_pn < (1ULL << 62) - pn_win)
+		return candidate_pn + pn_win;
+	if (candidate_pn > expected_pn + pn_hwin && candidate_pn >= pn_win)
+		return candidate_pn - pn_win;
+
+	return candidate_pn;
+}
+
+void
+lws_quic_detect_loss(struct lws *nwsi, int level, uint64_t largest_acked)
+{
+        struct lws_quic_netconn *qn = nwsi->quic.qn;
+        if (!qn) return;
+
+        size_t total_bytes_lost = 0;
+        lws_usec_t now = lws_now_usecs();
+        lws_usec_t loss_time = qn->smoothed_rtt ? (qn->smoothed_rtt * 9 / 8) : 50000;
+        lws_usec_t oldest_lost = 0, newest_lost = 0;
+
+	int check_levels[] = { level, level == LWS_QUIC_LEVEL_APP ? LWS_QUIC_LEVEL_EARLY : -1 };
+	for (int i = 0; i < 2; i++) {
+		int curlvl = check_levels[i];
+		if (curlvl == -1) continue;
+
+		lws_start_foreach_dll_safe(struct lws_dll2 *, d, d1, qn->in_flight[curlvl].head) {
+			struct lws_quic_tx_frame *f = lws_container_of(d, struct lws_quic_tx_frame, list);
+
+			if (f->sent_in_pn <= largest_acked &&
+				(f->sent_in_pn + 3 <= largest_acked || (f->sent_in_pn < largest_acked && now > f->sent_time_us + loss_time))) {
+				
+				/* Mark as lost */
+				total_bytes_lost += f->wire_len;
+				lwsl_wsi_info(nwsi, "QUIC LOSS: Packet %llu lost, frame %d", (unsigned long long)f->sent_in_pn, f->type);
+				
+				if (!oldest_lost || f->sent_time_us < oldest_lost)
+					oldest_lost = f->sent_time_us;
+				if (!newest_lost || f->sent_time_us > newest_lost)
+					newest_lost = f->sent_time_us;
+
+				lws_dll2_remove(&f->list);
+
+				int pending_lvl = curlvl;
+				if (curlvl == LWS_QUIC_LEVEL_EARLY)
+					pending_lvl = LWS_QUIC_LEVEL_APP;
+
+				if ((f->type & 0xfe) == LWS_QUIC_FT_DATAGRAM) {
+					/*
+					 * RFC 9221: DATAGRAM frames are
+					 * never retransmitted.  The lost
+					 * bytes still count for cc, but the
+					 * frame itself is freed, the same
+					 * as the PTO sweep path.
+					 */
+					lws_free(f);
+				} else {
+					f->wire_len = 0;
+
+					if (pending_lvl == LWS_QUIC_LEVEL_APP)
+						lws_quic_dbg_1rtt_account(qn, f,
+							  curlvl == LWS_QUIC_LEVEL_EARLY ?
+								"loss-requeue-early"
+							      : "loss-requeue");
+					lws_dll2_add_tail(&f->list, &qn->pending_tx[pending_lvl]);
+				}
+			}
+		} lws_end_foreach_dll_safe(d, d1);
+	}
+
+        if (total_bytes_lost && qn->cc_ops && qn->cc_ops->on_loss) {
+                qn->cc_ops->on_loss(nwsi, total_bytes_lost);
+
+                if (newest_lost > oldest_lost) {
+                        lws_usec_t pto = qn->smoothed_rtt + (qn->rttvar * 4 > 1000 ? qn->rttvar * 4 : 1000) + 25000;
+                        lws_usec_t pc_period = pto * 3;
+                        if ((newest_lost - oldest_lost) >= pc_period) {
+                                if (qn->cc_ops->on_persistent_congestion)
+                                        qn->cc_ops->on_persistent_congestion(nwsi);
+                        }
+                }
+        }
+
+        if (total_bytes_lost)
+                lws_callback_on_writable(nwsi);
+}
+
+void
+lws_quic_handle_ack(struct lws *nwsi, int level, uint64_t acked_pn, int is_largest_ack, uint64_t ack_delay)
+{
+	struct lws_quic_netconn *qn = nwsi->quic.qn;
+	if (!qn) return;
+
+	/* PMTUD: Check if our active probe was acknowledged */
+	if (qn->pmtud_probe_pn != LWS_QUIC_PMTUD_PROBE_NONE &&
+	    acked_pn == qn->pmtud_probe_pn) {
+		lwsl_wsi_info(nwsi, "QUIC PMTUD: Probe %llu ACKed! MTU upgraded from %d to %d",
+			(unsigned long long)acked_pn, (int)qn->current_mtu, (int)qn->probed_mtu);
+		qn->current_mtu = qn->probed_mtu;
+		qn->pmtud_probe_pn = LWS_QUIC_PMTUD_PROBE_NONE;
+		qn->consecutive_mtu_losses = 0;
+		qn->probed_mtu += 100; /* Probe upward in 100-byte increments */
+		if (qn->probed_mtu > 1400) /* Cap at typical Ethernet MTU payload limit for this example */
+			qn->pmtud_state = 2; /* SEARCH_COMPLETE */
+	}
+
+	size_t bytes_acked = 0;
+	lws_usec_t rtt = 0;
+	lws_usec_t now = lws_now_usecs();
+
+	int check_levels[] = { level, level == LWS_QUIC_LEVEL_APP ? LWS_QUIC_LEVEL_EARLY : -1 };
+	for (int i = 0; i < 2; i++) {
+		int curlvl = check_levels[i];
+		if (curlvl == -1) continue;
+
+		lws_start_foreach_dll_safe(struct lws_dll2 *, d, d1, qn->in_flight[curlvl].head) {
+			struct lws_quic_tx_frame *f = lws_container_of(d, struct lws_quic_tx_frame, list);
+
+			if (f->sent_in_pn == acked_pn) {
+				uint64_t sid = f->stream_id;
+				bytes_acked += f->wire_len;
+				rtt = now > f->sent_time_us ? now - f->sent_time_us : 0;
+				/* Packet was received successfully, free the frame! */
+				lws_dll2_remove(&f->list);
+				lws_free(f);
+
+				struct lws *child = lws_quic_stream_find(nwsi, sid);
+				if (child && (lwsi_state(child) == LRS_FLUSHING_BEFORE_CLOSE
+#if defined(LWS_ROLE_H1) || defined(LWS_ROLE_H2) || defined(LWS_ROLE_H3)
+				    || child->http.deferred_transaction_completed
+#endif
+				)) {
+					lws_callback_on_writable(child);
+				}
+			}
+		} lws_end_foreach_dll_safe(d, d1);
+	}
+
+	if (bytes_acked) {
+		lws_callback_on_writable(nwsi);
+		qn->pto_count = 0;
+
+		/* Update RTT Estimator (RFC 9002 5.3) */
+		if (is_largest_ack && rtt > 0) {
+			lws_usec_t adjusted_rtt = rtt;
+			if (qn->min_rtt && rtt > qn->min_rtt + (lws_usec_t)ack_delay) {
+				adjusted_rtt = rtt - (lws_usec_t)ack_delay;
+			}
+			qn->latest_rtt = rtt;
+			if (!qn->smoothed_rtt) {
+				qn->smoothed_rtt = rtt;
+				qn->rttvar = rtt / 2;
+				qn->min_rtt = rtt;
+			} else {
+				if (rtt < qn->min_rtt) qn->min_rtt = rtt;
+				lws_usec_t rtt_diff = qn->smoothed_rtt > adjusted_rtt ? (qn->smoothed_rtt - adjusted_rtt) : (adjusted_rtt - qn->smoothed_rtt);
+				qn->rttvar = (3 * qn->rttvar + rtt_diff) / 4;
+				qn->smoothed_rtt = (7 * qn->smoothed_rtt + adjusted_rtt) / 8;
+			}
+		}
+
+		if (qn->cc_ops && qn->cc_ops->on_ack)
+			qn->cc_ops->on_ack(nwsi, bytes_acked, rtt);
+
+		/* If we have pending TX and CC might have unblocked, trigger POLLOUT */
+		int pending = 0;
+		for (int i = 0; i < LWS_QUIC_LEVEL_COUNT; i++) {
+			if (qn->pending_tx[i].count) {
+				pending = 1;
+				break;
+			}
+		}
+		if (pending)
+			lws_callback_on_writable(nwsi);
+
+		{
+			struct lws_quic_cc_newreno *_cc = qn->cc_ops ? (struct lws_quic_cc_newreno *)qn->cc_state : NULL;
+			(void)_cc;
+			lwsl_debug("QUIC TX: ACK processing: bytes_acked=%zu, cc_bif=%zu cc_cwnd=%zu cc_pacing=%zu, in_flight_app=%d, pending_tx=%d, blocked=%d\n",
+				    bytes_acked,
+				    _cc ? _cc->bytes_in_flight : 0,
+				    _cc ? _cc->cwnd : 0,
+				    _cc ? _cc->pacing_credit : 0,
+				    qn->in_flight[LWS_QUIC_LEVEL_APP].count,
+				    qn->pending_tx[LWS_QUIC_LEVEL_APP].count,
+				    (int)(qn->cc_ops && qn->cc_ops->can_send ? !qn->cc_ops->can_send(nwsi, 1000) : 0));
+		}
+
+
+		/*
+		 * ACKs opened the congestion window. Child streams may have
+		 * been stalled by the application-layer pacing throttle in
+		 * rops_tx_credit_quic() (64KB pending_tx cap). Wake them up
+		 * so they can generate more application data.
+		 */
+		{
+			lws_start_foreach_dll(struct lws_dll2 *, d,
+					      nwsi->mux.child_list_owner.head) {
+				struct lws *w = lws_container_of(d, struct lws,
+								 mux.sibling_list);
+				if (w->mux.requested_POLLOUT)
+					lws_callback_on_writable(w);
+			}
+			lws_end_foreach_dll(d);
+		}
+	}
+
+	/* If there are no more in-flight packets across all levels, we can cancel the PTO timer */
+	{
+		int any_in_flight2 = 0;
+		for (int i2 = 0; i2 < LWS_QUIC_LEVEL_COUNT; i2++) {
+			if (qn->in_flight[i2].count) {
+				any_in_flight2 = 1;
+				break;
+			}
+		}
+		if (!any_in_flight2) {
+			if (!qn->handshake_done) { /* was !qn->is_server && ... */
+				/* Keep PTO timer running to probe if peer gets blocked (RFC 9002 6.2.2.1) */
+				lwsl_info("lws_quic_handle_ack: Keeping PTO timer active (no in-flight, handshake incomplete)\n");
+			} else {
+				lws_sul_cancel(&qn->pto_sul);
+			}
+		} else if (bytes_acked) {
+			/*
+			 * RFC 9002 Section 6.2.1: When a packet is acknowledged, the
+			 * PTO timer must be updated.  Reset it using pto_count=0 (since
+			 * we just reset pto_count above) so the doubled timer from the
+			 * PTO callback is replaced by a fresh base-rate timer.
+			 */
+			lws_usec_t pto_base2 = lws_quic_pto_base_us(qn);
+			lws_sul_schedule(nwsi->a.context, 0, &qn->pto_sul,
+					 lws_quic_pto_cb, pto_base2);
+		}
+	}
+}
+
+void
+lws_quic_discard_keys(struct lws *nwsi, int level)
+{
+	struct lws_quic_netconn *qn = nwsi->quic.qn;
+	int discarded = 0;
+
+	if (!qn) return;
+
+	if (qn->keys[level]) {
+		lws_quic_keys_destroy(qn->keys[level]);
+		qn->keys[level] = NULL;
+		discarded = 1;
+	}
+
+	lws_start_foreach_dll_safe(struct lws_dll2 *, d, d1, qn->pending_tx[level].head) {
+		struct lws_quic_tx_frame *f = lws_container_of(d, struct lws_quic_tx_frame, list);
+		lws_dll2_remove(&f->list);
+		lws_free(f);
+	} lws_end_foreach_dll_safe(d, d1);
+
+	lws_start_foreach_dll_safe(struct lws_dll2 *, d, d1, qn->in_flight[level].head) {
+		struct lws_quic_tx_frame *f = lws_container_of(d, struct lws_quic_tx_frame, list);
+		lws_dll2_remove(&f->list);
+		lws_free(f);
+	} lws_end_foreach_dll_safe(d, d1);
+
+	lws_start_foreach_dll_safe(struct lws_dll2 *, d, d1, qn->rx_crypto_chunks[level].head) {
+		struct lws_quic_rx_chunk *c = lws_container_of(d, struct lws_quic_rx_chunk, list);
+		lws_dll2_remove(&c->list);
+		lws_free(c);
+	} lws_end_foreach_dll_safe(d, d1);
+
+	/*
+	 * RFC 9002 A.11 (OnPacketNumberSpaceDiscarded): discarding a packet
+	 * number space resets the PTO backoff.  In both directions, getting
+	 * far enough to drop a space proves the peer processed at least one
+	 * of our packets (eg, a client that receives a Handshake packet
+	 * knows the server got its Initial), so any exponential backoff
+	 * accumulated on a dead-looking path no longer applies.
+	 *
+	 * Without this, a handshake that survived a long corruption streak
+	 * (eg, the interop corrupt-rate scenario) inherits a fully backed-off
+	 * PTO timer after the Initial phase, and a single further loss can
+	 * then never be retransmitted inside the client handshake timeout.
+	 */
+	if (discarded) {
+		int any_in_flight = 0, lvl;
+
+		qn->pto_count = 0;
+
+		for (lvl = 0; lvl < LWS_QUIC_LEVEL_COUNT; lvl++)
+			if (qn->in_flight[lvl].count) {
+				any_in_flight = 1;
+				break;
+			}
+
+		if (any_in_flight || !qn->handshake_done) {
+			lws_usec_t pto_base = lws_quic_pto_base_us(qn);
+
+			/* reschedule the PTO at the fresh, unbacked-off delay */
+			lws_sul_schedule(nwsi->a.context, 0, &qn->pto_sul,
+					 lws_quic_pto_cb, pto_base);
+		}
+	}
+}
+
+struct lws *
+lws_get_quic_network_wsi(struct lws *wsi)
+{
+	if (!wsi) return NULL;
+	while (wsi) {
+		if (wsi->quic.qn)
+			return wsi;
+		wsi = wsi->mux.parent_wsi;
+	}
+	return NULL;
+}
+
+static lws_handling_result_t
+rops_handle_POLLIN_quic(struct lws_context_per_thread *pt, struct lws *wsi,
+			struct lws_pollfd *pollfd)
+{
+	int n;
+	uint8_t *p;
+	uint8_t scid_len = 0;
+	uint8_t dcid_len = 0;
+	struct lws_quic_cid dcid, scid;
+
+	if (!(pollfd->revents & LWS_POLLIN))
+		goto try_pollout;
+
+	lwsl_wsi_debug(wsi, "QUIC RX: POLLIN fired on socket!");
+
+	lws_sockaddr46 sa46;
+	socklen_t slen = sizeof(sa46);
+
+#if defined(WIN32) || defined(_WIN32)
+        n = recvfrom(wsi->desc.sockfd, (char *)pt->serv_buf, (int)wsi->a.context->pt_serv_buf_size, 0,
+                     sa46_sockaddr(&sa46), &slen);
+#else
+        struct iovec iov;
+        struct msghdr msg;
+        uint8_t cmsg_buf[256];
+        
+        iov.iov_base = (void *)pt->serv_buf;
+        iov.iov_len = wsi->a.context->pt_serv_buf_size;
+
+        memset(&msg, 0, sizeof(msg));
+        msg.msg_name = sa46_sockaddr(&sa46);
+        msg.msg_namelen = slen;
+        msg.msg_iov = &iov;
+        msg.msg_iovlen = 1;
+        msg.msg_control = cmsg_buf;
+        msg.msg_controllen = sizeof(cmsg_buf);
+
+        n = (int)recvmsg(wsi->desc.sockfd, &msg, 0);
+        slen = msg.msg_namelen;
+        
+        uint8_t ecn_tos = 0;
+        if (n > 0) {
+                struct cmsghdr *cmsg;
+                for (cmsg = CMSG_FIRSTHDR(&msg); cmsg != NULL; cmsg = CMSG_NXTHDR(&msg, cmsg)) {
+#if defined(IP_TOS)
+                        if (cmsg->cmsg_level == IPPROTO_IP && cmsg->cmsg_type == IP_TOS) {
+                                ecn_tos = *(uint8_t *)CMSG_DATA(cmsg);
+                        }
+#endif
+#if defined(LWS_WITH_IPV6)
+#if defined(IPV6_TCLASS)
+                        if (cmsg->cmsg_level == IPPROTO_IPV6 && cmsg->cmsg_type == IPV6_TCLASS) {
+                                ecn_tos = *(uint8_t *)CMSG_DATA(cmsg);
+                        }
+#endif
+#endif
+                }
+        }
+#endif
+
+	if (n <= 0) {
+		lwsl_wsi_info(wsi, "QUIC RX: recv returned %d (errno %d)", n, errno);
+		return LWS_HPI_RET_HANDLED;
+	}
+
+	int orig_n = n;
+
+#if 0
+	{
+		char buf_peer[64], buf_recv[64];
+#if defined(LWS_WITH_IPV6)
+		uint16_t port_recv = sa46.sa4.sin_family == AF_INET ? sa46.sa4.sin_port : sa46.sa6.sin6_port;
+		uint16_t port_peer = wsi->sa46_peer.sa4.sin_family == AF_INET ? wsi->sa46_peer.sa4.sin_port : wsi->sa46_peer.sa6.sin6_port;
+#else
+		uint16_t port_recv = sa46.sa4.sin_port;
+		uint16_t port_peer = wsi->sa46_peer.sa4.sin_port;
+#endif
+		lws_sa46_write_numeric_address(&wsi->sa46_peer, buf_peer, sizeof(buf_peer));
+		lws_sa46_write_numeric_address(&sa46, buf_recv, sizeof(buf_recv));
+		/* lwsl_notice("QUIC RX: recv %d bytes from %s:%u (wsi peer %s:%u)\n", n,
+			    buf_recv, (unsigned int)ntohs(port_recv),
+			    buf_peer, (unsigned int)ntohs(port_peer)); */
+	}
+#endif
+
+	lwsl_wsi_debug(wsi, "QUIC RX: read %d bytes from UDP", n);
+
+	if (n < 2)
+		return LWS_HPI_RET_HANDLED;
+
+	p = pt->serv_buf;
+
+	memset(&dcid, 0, sizeof(dcid));
+	memset(&scid, 0, sizeof(scid));
+
+	if (p[0] & 0x80) {
+		dcid_len = p[5];
+		if (dcid_len > LWS_QUIC_MAX_CID_LEN || n < 6 + dcid_len) {
+			lwsl_wsi_notice(wsi, "QUIC RX: Invalid DCID length");
+			return LWS_HPI_RET_HANDLED;
+		}
+
+		dcid.len = dcid_len;
+		memcpy(dcid.id, &p[6], dcid_len);
+
+		int scid_pos = 6 + dcid_len;
+		if (n < scid_pos + 1) {
+			lwsl_wsi_notice(wsi, "QUIC RX: Truncated before SCID");
+			return LWS_HPI_RET_HANDLED;
+		}
+
+		scid_len = p[scid_pos];
+		if (scid_len > LWS_QUIC_MAX_CID_LEN || n < scid_pos + 1 + scid_len) {
+			lwsl_wsi_notice(wsi, "QUIC RX: Invalid SCID length");
+			return LWS_HPI_RET_HANDLED;
+		}
+
+		scid.len = scid_len;
+		memcpy(scid.id, &p[scid_pos + 1], scid_len);
+	} else {
+		dcid_len = 8;
+		if (n < 1 + dcid_len) {
+			lwsl_wsi_notice(wsi, "QUIC RX: dropping, short header too short");
+			return LWS_HPI_RET_HANDLED;
+		}
+
+		dcid.len = dcid_len;
+		memcpy(dcid.id, &p[1], dcid_len);
+	}
+
+	struct lws *nwsi = NULL;
+	if (wsi->quic.qn && !wsi->quic.qn->is_server) {
+		/* Client connection: the wsi itself is the connection */
+		nwsi = wsi;
+
+		/* The client MUST update its remote CID to the server's SCID from the first response */
+		if ((p[0] & 0x80) && scid.len) {
+			uint8_t type = (uint8_t)((p[0] & 0x30) >> 4);
+			if (type != LWS_QUIC_PT_RETRY) {
+				if (nwsi->quic.qn->rem_cid.len != scid.len || memcmp(nwsi->quic.qn->rem_cid.id, scid.id, scid.len)) {
+					nwsi->quic.qn->rem_cid = scid;
+				}
+
+				/* Check if the server upgraded the version (Compatible Version Negotiation) */
+				uint32_t pkt_version = ((uint32_t)p[1] << 24) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 8) | p[4];
+				if (pkt_version != nwsi->quic.qn->version && pkt_version == LWS_QUIC_VERSION_2) {
+					nwsi->quic.qn->version = pkt_version;
+					lwsl_wsi_notice(wsi, "QUIC RX: Upgraded to QUIC v2 via Compatible Version Negotiation");
+				}
+			}
+		}
+	} else {
+		/* Server listener: search children */
+		nwsi = lws_quic_find_child_by_dcid(wsi, &dcid);
+#if defined(LWS_WITH_SERVER)
+		/*
+		 * Active migration can move the client onto a path served by
+		 * a different one of the vhost's QUIC listeners (eg, an IPv6
+		 * connection migrating to the server's IPv4 preferred
+		 * address).  If the receiving listener doesn't know the DCID,
+		 * search the sibling QUIC listeners before giving up.
+		 */
+		if (!nwsi && wsi->a.vhost) {
+			lws_start_foreach_dll_safe(struct lws_dll2 *, d, d1,
+					lws_dll2_get_head(&wsi->a.vhost->listen_wsi)) {
+				struct lws *lw = lws_container_of(d, struct lws,
+								listen_list);
+				if (lw == wsi || lw->role_ops != &role_ops_quic)
+					continue;
+				nwsi = lws_quic_find_child_by_dcid(lw, &dcid);
+				if (nwsi)
+					break;
+			} lws_end_foreach_dll_safe(d, d1);
+		}
+#endif
+	}
+
+
+#if defined(LWS_WITH_SERVER)
+	if (!nwsi) {
+		if (!(p[0] & 0x80) || ((p[0] & 0x30) >> 4) != 0) {
+			// lwsl_wsi_notice(wsi, "QUIC RX: Unknown DCID and not Initial, dropping");
+			return LWS_HPI_RET_HANDLED;
+		}
+
+		uint32_t pkt_version = ((uint32_t)p[1] << 24) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 8) | p[4];
+
+		if (pkt_version != LWS_QUIC_VERSION_1 && pkt_version != LWS_QUIC_VERSION_2) {
+			lwsl_wsi_notice(wsi, "QUIC RX: Unsupported version 0x%08X, sending VN packet", pkt_version);
+			uint8_t vn[128];
+			uint8_t *vp = vn;
+			*vp++ = 0x80; /* Long Header */
+			*vp++ = 0; *vp++ = 0; *vp++ = 0; *vp++ = 0; /* Version 0 */
+			*vp++ = scid.len;
+			if (scid.len) { memcpy(vp, scid.id, scid.len); vp += scid.len; }
+			*vp++ = dcid.len;
+			if (dcid.len) { memcpy(vp, dcid.id, dcid.len); vp += dcid.len; }
+			/* Add v1 */
+			*vp++ = (uint8_t)(LWS_QUIC_VERSION_1 >> 24); *vp++ = (uint8_t)(LWS_QUIC_VERSION_1 >> 16);
+			*vp++ = (uint8_t)(LWS_QUIC_VERSION_1 >> 8); *vp++ = (uint8_t)(LWS_QUIC_VERSION_1);
+			/* Add v2 */
+			*vp++ = (uint8_t)(LWS_QUIC_VERSION_2 >> 24); *vp++ = (uint8_t)(LWS_QUIC_VERSION_2 >> 16);
+			*vp++ = (uint8_t)(LWS_QUIC_VERSION_2 >> 8); *vp++ = (uint8_t)(LWS_QUIC_VERSION_2);
+
+#if defined(WIN32) || defined(_WIN32)
+			sendto(wsi->desc.sockfd, (char *)vn, (int)(vp - vn), 0, sa46_sockaddr(&sa46), slen);
+#else
+			sendto(wsi->desc.sockfd, (void *)vn, (size_t)(vp - vn), 0, sa46_sockaddr(&sa46), slen);
+#endif
+			return LWS_HPI_RET_HANDLED;
+		}
+
+		/* Enforce 1200-byte padding for client-to-server Initial packets (RFC 9000 Section 14.1) */
+		if (n < 1200) {
+			lwsl_wsi_notice(wsi, "QUIC RX: Dropping under-padded Initial packet (len %d)", n);
+			return LWS_HPI_RET_HANDLED;
+		}
+
+		struct lws_quic_cid valid_retry_scid;
+		memset(&valid_retry_scid, 0, sizeof(valid_retry_scid));
+		if (getenv("LWS_QUIC_FORCE_RETRY")) {
+			int scid_pos_tmp = 6 + dcid_len;
+			size_t t_off = (size_t)scid_pos_tmp + 1 + scid.len;
+			uint64_t t_len = 0;
+			size_t t_cons = lws_quic_parse_varint(&p[t_off], (size_t)n - t_off, &t_len);
+			if (!t_cons) return LWS_HPI_RET_HANDLED;
+
+			uint8_t peer_ip[16] = {0};
+			size_t peer_ip_len = 0;
+			if (sa46.sa4.sin_family == AF_INET) {
+				memcpy(peer_ip, &sa46.sa4.sin_addr, 4);
+				peer_ip_len = 4;
+			}
+#if defined(LWS_WITH_IPV6)
+			else {
+				memcpy(peer_ip, &sa46.sa6.sin6_addr, 16);
+				peer_ip_len = 16;
+			}
+#endif
+
+			if (t_len == 0) {
+				uint8_t retry_pkt[1200];
+				uint8_t *rp = retry_pkt;
+				*rp++ = 0xf0; /* Long Header, Retry */
+				memcpy(rp, &p[1], 4); rp += 4; /* Version */
+				*rp++ = scid.len;
+				if (scid.len) { memcpy(rp, scid.id, scid.len); rp += scid.len; }
+				struct lws_quic_cid retry_scid;
+				retry_scid.len = 8;
+				if (lws_get_random(wsi->a.context, retry_scid.id, 8) != 8) return LWS_HPI_RET_HANDLED;
+				*rp++ = retry_scid.len;
+				memcpy(rp, retry_scid.id, retry_scid.len); rp += retry_scid.len;
+				size_t tok_out_len = 0;
+				if (!lws_quic_create_retry_token(wsi, dcid.id, dcid.len, retry_scid.id, retry_scid.len, peer_ip, peer_ip_len, rp, &tok_out_len)) {
+					rp += tok_out_len;
+					uint8_t tag[16];
+					if (!lws_quic_create_retry_tag(dcid.id, dcid.len, retry_pkt, (size_t)(rp - retry_pkt), tag)) {
+						memcpy(rp, tag, 16); rp += 16;
+						lwsl_wsi_notice(wsi, "QUIC RX: Forcing Retry, sending Retry packet!");
+#if defined(WIN32) || defined(_WIN32)
+						sendto(wsi->desc.sockfd, (char *)retry_pkt, (int)(rp - retry_pkt), 0, sa46_sockaddr(&sa46), slen);
+#else
+						sendto(wsi->desc.sockfd, (void *)retry_pkt, (size_t)(rp - retry_pkt), 0, sa46_sockaddr(&sa46), slen);
+#endif
+					}
+				}
+				return LWS_HPI_RET_HANDLED;
+
+			} else {
+				if (lws_quic_validate_retry_token(wsi, &p[t_off + t_cons], (size_t)t_len, peer_ip, peer_ip_len, &dcid, &valid_retry_scid)) {
+					lwsl_wsi_notice(wsi, "QUIC RX: Invalid Retry Token, dropping Initial packet");
+					return LWS_HPI_RET_HANDLED;
+				}
+			}
+		}
+
+		/* 1.5 Instantiate new QUIC network connection */
+		nwsi = lws_create_new_server_wsi(wsi->a.vhost, wsi->tsi, 0, "quic child");
+		if (!nwsi) {
+			lwsl_wsi_notice(wsi, "QUIC RX: failed to create server wsi");
+			return LWS_HPI_RET_HANDLED;
+		}
+
+		lws_role_transition(nwsi, LWSIFR_SERVER, LRS_SSL_INIT, &role_ops_quic);
+
+		nwsi->quic.qn = lws_zalloc(sizeof(*nwsi->quic.qn), "quic_netconn");
+		if (!nwsi->quic.qn) {
+			lws_close_free_wsi(nwsi, LWS_CLOSE_STATUS_NOSTATUS, "oom");
+			return LWS_HPI_RET_HANDLED;
+		}
+
+		nwsi->quic.qn->nwsi = nwsi;
+		nwsi->quic.qn->is_server = 1;
+		nwsi->quic.qn->next_stream_id_bidi_local = 1;
+		nwsi->quic.qn->next_stream_id_unidi_local = 3;
+		nwsi->quic.qn->version = pkt_version;
+		nwsi->quic.qn->original_version = pkt_version;
+		nwsi->quic.qn->max_streams_bidi_local = 400;
+		nwsi->quic.qn->max_streams_unidi_local = 400;
+		nwsi->quic.qn->peer_ack_delay_exponent = 3;
+		/* RFC 9000 §13.2.1 default max_ack_delay cap for delayed ACKs */
+		nwsi->quic.qn->ack_delay_us = 25 * LWS_US_PER_MS;
+
+		nwsi->quic.qn->current_mtu = 1280;
+		nwsi->quic.qn->probed_mtu = 1380; /* first probe size */
+		nwsi->quic.qn->pmtud_probe_pn = LWS_QUIC_PMTUD_PROBE_NONE;
+		nwsi->quic.qn->pmtud_state = 1; /* SEARCHING */
+
+		if (nwsi->a.context->quic_cc_ops)
+			nwsi->quic.qn->cc_ops = nwsi->a.context->quic_cc_ops;
+		else
+			nwsi->quic.qn->cc_ops = &lws_cc_ops_newreno;
+
+		if (nwsi->quic.qn->cc_ops->init)
+			nwsi->quic.qn->cc_ops->init(nwsi);
+
+		/* Initialize RX Flow Control limits */
+		nwsi->quic.qn->rx_max_data = LWS_QUIC_DEFAULT_WINDOW;
+		nwsi->quic.qn->advertised_rx_max_data = LWS_QUIC_DEFAULT_WINDOW;
+		nwsi->quic.qn->rx_window_size = LWS_QUIC_DEFAULT_WINDOW;
+		nwsi->quic.qn->last_rx_update_us = lws_now_usecs();
+		nwsi->txc.peer_tx_cr_est = LWS_QUIC_DEFAULT_WINDOW; /* How much the peer can write to us */
+		/* tx_cr is strictly initialized when we parse the peer's initial_max_data parameter */
+
+#if defined(LWS_WITH_UDP)
+		nwsi->udp = lws_malloc(sizeof(*nwsi->udp), "quic udp");
+		memset(nwsi->udp, 0, sizeof(*nwsi->udp));
+		nwsi->udp->sa46 = sa46; /* Copy peer address */
+#endif
+
+#if defined(LWS_WITH_TLS)
+		nwsi->tls.use_ssl = (unsigned int)wsi->a.vhost->tls.use_ssl;
+		if (wsi->a.vhost->tls.ssl_ctx) {
+			if (lws_tls_server_new_nonblocking(nwsi, LWS_SOCK_INVALID)) {
+				lwsl_wsi_err(wsi, "QUIC RX: lws_tls_server_new_nonblocking failed");
+				lws_close_free_wsi(nwsi, LWS_CLOSE_STATUS_NOSTATUS, "ssl fail");
+				return LWS_HPI_RET_HANDLED;
+			}
+			/* Init the memory BIOs for QUIC crypto */
+			extern int lws_tls_quic_init(struct lws *wsi, lws_tls_quic_secret_cb cb);
+			if (lws_tls_quic_init(nwsi, quic_secret_cb)) {
+				lwsl_wsi_err(wsi, "QUIC RX: lws_tls_quic_init failed");
+				lws_close_free_wsi(nwsi, LWS_CLOSE_STATUS_NOSTATUS, "ssl fail");
+				return LWS_HPI_RET_HANDLED;
+			}
+		}
+#endif
+
+		/* The client's SCID becomes our Remote CID */
+		nwsi->quic.qn->rem_cid = scid;
+
+		/* Save the original DCID to route subsequent Initial packets */
+		nwsi->quic.qn->orig_dcid = dcid;
+
+		nwsi->quic.qn->retry_scid = valid_retry_scid;
+
+		/* Generate our own 8-byte Local CID */
+		nwsi->quic.qn->loc_cid.len = 8;
+		if (lws_get_random(wsi->a.context, nwsi->quic.qn->loc_cid.id, 8) != 8) {
+			lws_close_free_wsi(nwsi, LWS_CLOSE_STATUS_NOSTATUS, "random fail");
+			return LWS_HPI_RET_HANDLED;
+		}
+
+		{
+			uint8_t *local_tp_buf = lws_malloc(4096, "quic tp scratch");
+			if (!local_tp_buf) {
+				/*
+				 * Q-10: nwsi is fully allocated and linked by
+				 * here (qn, loc_cid, etc.).  Match the tp_overflow
+				 * cleanup so OOM doesn't leak the nwsi + qn + its
+				 * fd / TLS session.  local_tp_buf is NULL, so
+				 * there's nothing to free.
+				 */
+				lwsl_wsi_err(wsi, "OOM allocating tp scratch buffer");
+				lws_close_free_wsi(nwsi, LWS_CLOSE_STATUS_NOSTATUS,
+						   "tp scratch oom");
+				return LWS_HPI_RET_HANDLED;
+			}
+			uint8_t *tp = local_tp_buf;
+			uint8_t *tp_end = tp + 4096;
+
+#define LWS_QUIC_WRITE_TP_VARINT(_id, _val) \
+	do { \
+		int _vlen; \
+		if (lws_ptr_diff_size_t(tp_end, tp) < 2) goto tp_overflow; \
+		*tp++ = (_id); \
+		_vlen = (int)lws_quic_write_varint(tp + 1, lws_ptr_diff_size_t(tp_end, tp + 1), (_val)); \
+		if (!_vlen) goto tp_overflow; \
+		*tp++ = (uint8_t)_vlen; \
+		tp += _vlen; \
+	} while (0)
+
+#define LWS_QUIC_WRITE_TP_BUF(_id, _buf, _len) \
+	do { \
+		if (lws_ptr_diff_size_t(tp_end, tp) < (size_t)(2 + (_len))) goto tp_overflow; \
+		*tp++ = (_id); \
+		*tp++ = (uint8_t)(_len); \
+		memcpy(tp, (_buf), (_len)); \
+		tp += (_len); \
+	} while (0)
+
+			// lwsl_notice("QUIC CLIENT: Writing TP buffer! buf size %d", (int)(tp - local_tp_buf));
+			LWS_QUIC_WRITE_TP_VARINT(0x04, LWS_QUIC_DEFAULT_WINDOW);
+			LWS_QUIC_WRITE_TP_VARINT(0x05, LWS_QUIC_DEFAULT_WINDOW);
+			LWS_QUIC_WRITE_TP_VARINT(0x06, LWS_QUIC_DEFAULT_WINDOW);
+			LWS_QUIC_WRITE_TP_VARINT(0x07, LWS_QUIC_DEFAULT_WINDOW);
+			LWS_QUIC_WRITE_TP_VARINT(0x08, nwsi->quic.qn->max_streams_bidi_local);
+			LWS_QUIC_WRITE_TP_VARINT(0x09, nwsi->quic.qn->max_streams_unidi_local);
+			LWS_QUIC_WRITE_TP_VARINT(0x20, 65535);
+			LWS_QUIC_WRITE_TP_VARINT(0x01, 30000);
+
+			LWS_QUIC_WRITE_TP_BUF(0x0F, nwsi->quic.qn->loc_cid.id, nwsi->quic.qn->loc_cid.len);
+			LWS_QUIC_WRITE_TP_BUF(0x00, nwsi->quic.qn->orig_dcid.id, nwsi->quic.qn->orig_dcid.len);
+			if (nwsi->quic.qn->retry_scid.len) {
+				LWS_QUIC_WRITE_TP_BUF(0x10, nwsi->quic.qn->retry_scid.id, nwsi->quic.qn->retry_scid.len);
+			}
+                        if (wsi->a.context->options & LWS_SERVER_OPTION_QUIC_LATEST_VERSION) {
+                                uint8_t vi_buf[12];
+                                vi_buf[0] = (uint8_t)(nwsi->quic.qn->version >> 24);
+                                vi_buf[1] = (uint8_t)(nwsi->quic.qn->version >> 16);
+                                vi_buf[2] = (uint8_t)(nwsi->quic.qn->version >> 8);
+                                vi_buf[3] = (uint8_t)(nwsi->quic.qn->version);
+                                vi_buf[4] = (uint8_t)(LWS_QUIC_VERSION_1 >> 24);
+                                vi_buf[5] = (uint8_t)(LWS_QUIC_VERSION_1 >> 16);
+                                vi_buf[6] = (uint8_t)(LWS_QUIC_VERSION_1 >> 8);
+                                vi_buf[7] = (uint8_t)(LWS_QUIC_VERSION_1);
+                                vi_buf[8] = (uint8_t)(LWS_QUIC_VERSION_2 >> 24);
+                                vi_buf[9] = (uint8_t)(LWS_QUIC_VERSION_2 >> 16);
+                                vi_buf[10] = (uint8_t)(LWS_QUIC_VERSION_2 >> 8);
+                                vi_buf[11] = (uint8_t)(LWS_QUIC_VERSION_2);
+                                LWS_QUIC_WRITE_TP_BUF(0x11, vi_buf, 12);
+                        }
+
+			if (wsi->a.vhost->options & LWS_SERVER_OPTION_QUIC_PAD_CRYPTO) {
+				lwsl_notice("QUIC TX: Padding handshake crypto data to artificially hit anti-amplification limits\n");
+				/* Append a 3000-byte dummy transport parameter with reserved ID 0x31 */
+				if (lws_ptr_diff_size_t(tp_end, tp) < 3003) goto tp_overflow;
+				*tp++ = 0x31;
+				*tp++ = 0x4B; /* 2-byte varint for length 3000 (0x4BB8 = 0x4000 | 3000) */
+				*tp++ = 0xB8;
+				memset(tp, 0, 3000);
+				tp += 3000;
+			}
+
+                        if (wsi->a.vhost->quic_preferred_addresses) {
+                                lwsl_notice("QUIC TX: Processing preferred_address config: '%s'\n", wsi->a.vhost->quic_preferred_addresses);
+                                const char *p = wsi->a.vhost->quic_preferred_addresses;
+                                lws_sockaddr46 sa4, sa6;
+                                memset(&sa4, 0, sizeof(sa4));
+                                memset(&sa6, 0, sizeof(sa6));
+                                
+                                while (p && *p) {
+                                        char chunk[128];
+                                        const char *comma = strchr(p, ',');
+                                        size_t len = comma ? (size_t)(comma - p) : strlen(p);
+                                        if (len >= sizeof(chunk)) len = sizeof(chunk) - 1;
+                                        memcpy(chunk, p, len);
+                                        chunk[len] = '\0';
+                                        
+                                        char *colon = strrchr(chunk, ':');
+                                        int port = 443;
+                                        if (colon && colon > strchr(chunk, ']')) {
+                                                port = atoi(colon + 1);
+                                                *colon = '\0';
+                                        } else if (colon && !strchr(chunk, ']') &&
+                                                   strchr(chunk, ':') == colon) {
+                                                /*
+                                                 * No brackets: an "addr:port"
+                                                 * has exactly one colon.
+                                                 * More than one colon is a
+                                                 * bare IPv6 literal, which
+                                                 * takes the default port.
+                                                 */
+                                                port = atoi(colon + 1);
+                                                *colon = '\0';
+                                        }
+                                        
+                                        char *addr = chunk;
+                                        if (addr[0] == '[') {
+                                                addr++;
+                                                char *rb = strchr(addr, ']');
+                                                if (rb) *rb = '\0';
+                                        }
+                                        
+                                        lws_sockaddr46 sa;
+                                        memset(&sa, 0, sizeof(sa));
+                                        if (lws_sa46_parse_numeric_address(addr, &sa) == 0) {
+                                                if (sa.sa4.sin_family == AF_INET) {
+                                                        sa4 = sa;
+                                                        sa4.sa4.sin_port = htons((uint16_t)port);
+#if defined(LWS_WITH_IPV6)
+                                                } else {
+                                                        sa6 = sa;
+                                                        sa6.sa6.sin6_port = htons((uint16_t)port);
+#endif
+                                                }
+                                        }
+                                        p = comma ? comma + 1 : NULL;
+                                }
+
+                                /* We only send preferred_address if we have a valid address */
+#if defined(LWS_WITH_IPV6)
+                                if (sa4.sa4.sin_family == AF_INET || sa6.sa6.sin6_family == AF_INET6) {
+#else
+                                if (sa4.sa4.sin_family == AF_INET) {
+#endif
+                                        uint8_t pref_buf[128];
+                                        uint8_t *pb = pref_buf;
+                                        
+                                        /* IPv4 (4 bytes addr, 2 bytes port) */
+                                        if (sa4.sa4.sin_family == AF_INET) {
+                                                memcpy(pb, &sa4.sa4.sin_addr.s_addr, 4); pb += 4;
+                                                memcpy(pb, &sa4.sa4.sin_port, 2); pb += 2;
+                                        } else {
+                                                memset(pb, 0, 6); pb += 6;
+                                        }
+                                        
+                                        /* IPv6 (16 bytes addr, 2 bytes port) */
+#if defined(LWS_WITH_IPV6)
+                                        if (sa6.sa6.sin6_family == AF_INET6) {
+                                                memcpy(pb, sa6.sa6.sin6_addr.s6_addr, 16); pb += 16;
+                                                memcpy(pb, &sa6.sa6.sin6_port, 2); pb += 2;
+                                        } else {
+                                                memset(pb, 0, 18); pb += 18;
+                                        }
+#else
+                                        memset(pb, 0, 18); pb += 18;
+#endif
+                                        
+                                        /* CID Length (1 byte) */
+                                        *pb++ = 8; /* Generating an 8-byte CID */
+                                        /* CID Bytes */
+                                        if (lws_get_random(wsi->a.context, pb, 8) != 8) goto tp_overflow;
+                                        /* Store so server can route migrated client packets addressed to it */
+                                        if (nwsi->quic.qn) {
+                                                nwsi->quic.qn->prefaddr_rem_cid.len = 8;
+                                                memcpy(nwsi->quic.qn->prefaddr_rem_cid.id, pb, 8);
+                                        }
+                                        pb += 8;
+                                        /* Stateless Reset Token */
+                                        if (lws_get_random(wsi->a.context, pb, 16) != 16) goto tp_overflow;
+                                        pb += 16;
+                                        
+                                        LWS_QUIC_WRITE_TP_BUF(0x0D, pref_buf, (size_t)(pb - pref_buf));
+                                        lwsl_notice("QUIC TX: Sent preferred_address TP (0x0D)\n");
+                                }
+                        }
+
+			lws_tls_quic_set_transport_parameters(nwsi, local_tp_buf, (size_t)(tp - local_tp_buf));
+			lws_free(local_tp_buf);
+			goto tp_ok;
+tp_overflow:
+			lws_free(local_tp_buf);
+			lwsl_wsi_err(wsi, "QUIC TX: tp buffer overflow");
+			lws_close_free_wsi(nwsi, LWS_CLOSE_STATUS_NOSTATUS, "tp overflow");
+			return LWS_HPI_RET_HANDLED;
+tp_ok:
+			;
+#undef LWS_QUIC_WRITE_TP_VARINT
+#undef LWS_QUIC_WRITE_TP_BUF
+		}
+
+		/* Link it to the UDP listening socket */
+		lws_mux_mark_immortal(nwsi);
+		nwsi->mux_substream = 1;
+		lws_wsi_mux_insert(nwsi, wsi, nwsi->mux.my_sid);
+
+		/* Derive the Initial keys using the client's initial DCID */
+		if (lws_quic_derive_initial_keys(nwsi, &dcid)) {
+			lwsl_wsi_err(wsi, "QUIC RX: Initial key derivation failed");
+			lws_close_free_wsi(nwsi, LWS_CLOSE_STATUS_NOSTATUS, "keys failed");
+			return LWS_HPI_RET_HANDLED;
+		}
+
+		lwsl_wsi_info(wsi, "QUIC RX: Created new connection! (loc_cid len %d)", nwsi->quic.qn->loc_cid.len);
+	}
+#else
+	if (!nwsi) {
+		lwsl_wsi_notice(wsi, "QUIC RX: Unknown DCID and no server support, dropping");
+		return LWS_HPI_RET_HANDLED;
+	}
+#endif
+
+	int pending_migration = 0;
+	lws_sockaddr46 migration_sa46;
+
+	if (nwsi && nwsi->udp) {
+		int addr_changed = 0;
+		if (nwsi->udp->sa46.sa4.sin_family != sa46.sa4.sin_family) {
+			addr_changed = 1;
+		} else if (sa46.sa4.sin_family == AF_INET) {
+			if (nwsi->udp->sa46.sa4.sin_addr.s_addr != sa46.sa4.sin_addr.s_addr ||
+			    nwsi->udp->sa46.sa4.sin_port != sa46.sa4.sin_port)
+				addr_changed = 1;
+		}
+#if defined(LWS_WITH_IPV6)
+		else if (sa46.sa4.sin_family == AF_INET6) {
+			if (memcmp(&nwsi->udp->sa46.sa6.sin6_addr, &sa46.sa6.sin6_addr, sizeof(struct in6_addr)) ||
+			    nwsi->udp->sa46.sa6.sin6_port != sa46.sa6.sin6_port)
+				addr_changed = 1;
+		}
+#endif
+		if (addr_changed && nwsi->quic.qn) {
+			pending_migration = 1;
+			migration_sa46 = sa46;
+		} else {
+			nwsi->udp->sa46 = sa46;
+		}
+	}
+
+	int valid_datagram_bytes = 0;
+	
+	if (nwsi && nwsi->quic.qn) {
+		/* F-69: We no longer unconditionally increment bytes_received here */
+	}
+
+	while (n > 0) {
+		/* If ALPN negotiation migrated the connection in a previous packet, update nwsi */
+		if (nwsi && !nwsi->quic.qn) {
+			nwsi = lws_get_quic_network_wsi(nwsi);
+		}
+
+		if (!nwsi || !nwsi->quic.qn) {
+			lwsl_wsi_notice(wsi, "QUIC RX: network connection gone, dropping remaining packets");
+			break;
+		}
+
+		if (nwsi->quic.qn->is_closing) {
+			lwsl_wsi_notice(wsi, "QUIC RX: Connection is closing, dropping remaining packets");
+			break;
+		}
+
+		/* We have the connection! Grab the appropriate keys based on packet type */
+		int level = LWS_QUIC_LEVEL_APP;
+		if (p[0] == 0x00) {
+			lwsl_wsi_info(wsi, "QUIC RX: Next byte is 0x00, ignoring as padding");
+			p++;
+			n--;
+			continue;
+		}
+
+		/*
+		 * Fixed bit (RFC 9000 §17.2 & §17.3).  This is the one bit in
+		 * the first byte that is NOT covered by header protection (the
+		 * HP mask only touches the low nibble of a long header and the
+		 * low 5 bits of a short header), so we can check it here, before
+		 * trusting any field derived from this byte and before AEAD.
+		 *
+		 * A compliant sender always sets it.  A cleared Fixed bit means
+		 * the byte is corrupt or not a QUIC packet; since every field we
+		 * would parse next (form, type, version, CID lengths) is derived
+		 * from this byte, we cannot trust the length field to find the
+		 * next coalesced packet boundary either, so drop the rest of the
+		 * datagram rather than advance blindly.
+		 *
+		 * The reserved bits (0x0c long / 0x18 short) are header-protected
+		 * and so cannot be checked until after lws_quic_unmask_header();
+		 * the existing post-AEAD check still handles those.
+		 */
+		if (!(p[0] & 0x40)) {
+			lwsl_wsi_notice(wsi, "QUIC RX: Fixed bit not set (0x%02x), "
+					      "dropping corrupt datagram", p[0]);
+			break;
+		}
+		if (p[0] & 0x80) {
+			                        uint8_t type = (uint8_t)((p[0] & 0x30) >> 4);
+                        uint32_t parsed_pkt_version = (uint32_t)((p[1] << 24) | (p[2] << 16) | (p[3] << 8) | p[4]);
+                        int is_v2 = (parsed_pkt_version == LWS_QUIC_VERSION_2) || 
+                                    (nwsi && nwsi->quic.qn && nwsi->quic.qn->version == LWS_QUIC_VERSION_2);
+                        
+                        uint8_t v1_type = type;
+                        if (is_v2) {
+                                switch (type) {
+                                case 0: v1_type = LWS_QUIC_PT_RETRY; break;
+                                case 1: v1_type = LWS_QUIC_PT_INITIAL; break;
+                                case 2: v1_type = LWS_QUIC_PT_0RTT; break;
+                                case 3: v1_type = LWS_QUIC_PT_HANDSHAKE; break;
+                                }
+                        }
+
+                        if (v1_type == LWS_QUIC_PT_INITIAL) level = LWS_QUIC_LEVEL_INITIAL;
+                        else if (v1_type == LWS_QUIC_PT_HANDSHAKE) level = LWS_QUIC_LEVEL_HANDSHAKE;
+                        else if (v1_type == LWS_QUIC_PT_0RTT) level = LWS_QUIC_LEVEL_EARLY;
+                        else if (v1_type == LWS_QUIC_PT_RETRY) {
+				if (nwsi && nwsi->quic.qn && !nwsi->quic.qn->is_server) {
+					size_t tag_pos = (size_t)n - 16;
+					int client_scid_pos = 6 + dcid_len;
+					size_t tok_pos = (size_t)client_scid_pos + 1 + scid.len;
+					if (n >= 16 && tag_pos >= tok_pos) {
+						if (!lws_quic_validate_retry_tag(nwsi->quic.qn, nwsi->quic.qn->rem_cid.id, nwsi->quic.qn->rem_cid.len, p, tag_pos, &p[tag_pos])) {
+							nwsi->quic.qn->retry_scid = scid;
+							nwsi->quic.qn->rem_cid = scid;
+							nwsi->quic.qn->retry_token_len = tag_pos - tok_pos;
+							if (nwsi->quic.qn->retry_token_len > sizeof(nwsi->quic.qn->retry_token)) {
+								lwsl_wsi_notice(wsi, "QUIC RX: Retry token too large, dropping packet");
+								n = 0;
+								break;
+							}
+							memcpy(nwsi->quic.qn->retry_token, &p[tok_pos], nwsi->quic.qn->retry_token_len);
+							
+							/* RFC 9000 17.2.5.1: The client MUST NOT change the cryptographic keys it uses for Initial packets */
+							/* But it MUST reset its Initial packet number space */
+							if (nwsi->quic.qn->keys[LWS_QUIC_LEVEL_INITIAL]) {
+								nwsi->quic.qn->keys[LWS_QUIC_LEVEL_INITIAL]->pn_tx = 0;
+								nwsi->quic.qn->keys[LWS_QUIC_LEVEL_INITIAL]->pn_rx_largest = 0;
+							}
+							nwsi->quic.qn->highest_rx_pn[LWS_QUIC_LEVEL_INITIAL] = 0;
+							nwsi->quic.qn->rx_pn_bitmask[LWS_QUIC_LEVEL_INITIAL] = 0;
+							
+							/* Re-arm writable to send the new Initial packet */
+							lws_callback_on_writable(nwsi);
+							lwsl_wsi_notice(wsi, "QUIC RX: Accepted Retry packet, resending Initial!");
+							break; /* Drop remaining datagram */
+						} else {
+							lwsl_wsi_notice(wsi, "QUIC RX: Invalid Retry Integrity Tag, dropping packet");
+							break;
+						}
+					}
+				}
+				break;
+			}
+			else {
+				lwsl_wsi_notice(wsi, "QUIC RX: Unsupported long header type %d", type);
+				break;
+			}
+		}
+
+		if (nwsi && nwsi->quic.qn) {
+			if (level > nwsi->quic.qn->highest_rx_level)
+				nwsi->quic.qn->highest_rx_level = (uint8_t)level;
+		}
+
+		int pn_space = (level == LWS_QUIC_LEVEL_EARLY || level == LWS_QUIC_LEVEL_APP) ? LWS_QUIC_LEVEL_APP : level;
+
+		/*
+		 * Enforce 1200-byte padding for subsequent client-to-server Initial packets (RFC 9000 Section 14.1)
+		 * Note: RFC 9000 allows the client to stop padding Initial packets once it has received an
+		 * acknowledgment from the server or sent/received a packet other than Initial/VN. Therefore,
+		 * we MUST NOT discard subsequent unpadded Initial packets. The first Initial packet (which
+		 * instantiates the connection) is already checked and validated for 1200-byte padding earlier.
+		 */
+
+		size_t local_dcid_len = (nwsi && nwsi->quic.qn) ? nwsi->quic.qn->loc_cid.len : 8;
+		if (local_dcid_len == 0) local_dcid_len = 8;
+		size_t payload_len_stated = 0;
+		size_t pn_offset = lws_quic_get_pn_offset(p, (size_t)n, &payload_len_stated, local_dcid_len);
+		if (!pn_offset) {
+			lwsl_wsi_notice(wsi, "QUIC RX: Malformed or truncated packet");
+			break;
+		}
+
+		size_t packet_size = pn_offset + payload_len_stated;
+		if (packet_size > (size_t)n) {
+			lwsl_wsi_notice(wsi, "QUIC RX: Packet stated size %zu > remaining UDP %zu", packet_size, (size_t)n);
+			break;
+		}
+
+		/* F-57: Validate short header DCID */
+		if (!(p[0] & 0x80) && nwsi && nwsi->quic.qn && nwsi->quic.qn->loc_cid.len) {
+			if (local_dcid_len > (size_t)n - 1 ||
+			    (memcmp(&p[1], nwsi->quic.qn->loc_cid.id, local_dcid_len) &&
+			     memcmp(&p[1], nwsi->quic.qn->prefaddr_rem_cid.id, local_dcid_len))) {
+				lwsl_wsi_notice(wsi, "QUIC RX: Short header DCID mismatch");
+				/* Drop packet */
+				p += packet_size;
+				n -= (int)packet_size;
+				continue;
+			}
+		}
+
+		struct lws_quic_keys *k = nwsi->quic.qn->keys[level];
+
+		if (!k || !k->el_hp_rx.len) {
+			lwsl_wsi_info(wsi, "QUIC RX: No valid keys for this packet level %d, skipping %zu bytes", level, packet_size);
+			p += packet_size;
+			n -= (int)packet_size;
+			continue;
+		}
+		
+		lwsl_wsi_info(wsi, "QUIC RX: Parsing packet level %d, UDP remaining %d, stated packet_size %zu", level, n, packet_size);
+
+		/* 3. Unmasking: Reveal the true Packet Number */
+		int pn_len = lws_quic_unmask_header(k, p, packet_size, pn_offset);
+		if (pn_len < 0) {
+			lwsl_wsi_notice(wsi, "QUIC RX: Header unmask failed");
+			break;
+		}
+
+
+		/*
+		 * Reconstruct full 62-bit PN.
+		 */
+		uint64_t truncated_pn = 0;
+		for (int i = 0; i < pn_len; i++)
+			truncated_pn = (truncated_pn << 8) | p[pn_offset + (size_t)i];
+
+		uint64_t largest_pn = nwsi->quic.qn ? nwsi->quic.qn->highest_rx_pn[pn_space] : 0;
+		uint64_t full_pn = lws_quic_decode_packet_number(largest_pn, truncated_pn, pn_len * 8);
+		lwsl_wsi_info(wsi, "QUIC RX: Packet level %d, decoded full_pn = %llu", level, (unsigned long long)full_pn);
+
+		struct lws_quic_keys scratch_keys;
+		struct lws_quic_keys *decryption_keys = k;
+		int is_key_update = 0;
+
+		if (!(p[0] & 0x80)) { /* Short header */
+			uint8_t kp = (uint8_t)((p[0] & 0x04) >> 2);
+			if (nwsi->quic.qn && nwsi->quic.qn->handshake_done &&
+			    nwsi->quic.qn->rx_key_phase != kp &&
+			    nwsi->quic.qn->kp_probe_fail < LWS_QUIC_KP_PROBE_LIMIT) {
+				/*
+				 * Provisional key update.  The key-phase bit is
+				 * only 1 bit and is trivially flipped by wire
+				 * corruption, so this probe can fire on junk.
+				 * If it then fails AEAD we count it below and,
+				 * once kp_probe_fail saturates, we stop trusting
+				 * the bit entirely and treat mismatches as
+				 * corruption rather than a peer rotation.
+				 */
+				scratch_keys = *k;
+				scratch_keys.aead_rx = NULL;
+				scratch_keys.aead_tx = NULL;
+				if (lws_quic_update_keys(&scratch_keys, 1) == 0) {
+					decryption_keys = &scratch_keys;
+					is_key_update = 1;
+					lwsl_wsi_notice(wsi, "QUIC RX: Attempting provisional key update");
+				}
+			}
+		}
+
+		/* 4. Decryption: Authenticate and decrypt the payload in-place! */
+		int dec_len = lws_quic_decrypt_payload(decryption_keys, p, packet_size, pn_offset, (uint8_t)pn_len, full_pn);
+		if (dec_len < 0) {
+			lwsl_wsi_notice(wsi, "QUIC RX: AEAD Decryption failed (bad tag or truncated)");
+			if (is_key_update) {
+				/*
+				 * The key-phase bit mismatched and the rotated
+				 * keys still failed AEAD: that mismatch was
+				 * corruption, not a peer key update.  Account
+				 * it so we stop chasing key rotations on junk
+				 * once it becomes a pattern.
+				 */
+				lws_quic_keys_release_aead_rx(&scratch_keys);
+				lws_quic_keys_release_aead_tx(&scratch_keys);
+				if (nwsi->quic.qn)
+					nwsi->quic.qn->kp_probe_fail++;
+			}
+
+			/*
+			 * Corruption circuit-breaker.  A single undecryptable
+			 * packet is normal (loss, a stale PN, a probe for a key
+			 * phase we discarded).  A sustained run with no progress
+			 * is wire/path corruption that the loss machinery cannot
+			 * recover from at this rate: rather than spin key
+			 * derivation and stall until PTO exhaustion, close the
+			 * connection cleanly with NO_VIABLE_PATH so the peer and
+			 * any test harness see a decisive transport error.
+			 */
+			if (nwsi && nwsi->quic.qn) {
+				if (++nwsi->quic.qn->consec_decrypt_fail[pn_space] >=
+				    LWS_QUIC_DECRYPT_FAIL_LIMIT) {
+					lwsl_wsi_warn(wsi,
+						"QUIC RX: %u consecutive decrypt "
+						"failures in pn_space %d with no "
+						"progress; path is corrupted, "
+						"closing",
+						nwsi->quic.qn->consec_decrypt_fail[pn_space],
+						pn_space);
+					lws_quic_enter_closing_state(nwsi,
+						LWS_QUIC_ERR_NO_VIABLE_PATH, 0, 0);
+					return LWS_HPI_RET_PLEASE_CLOSE_ME;
+				}
+			}
+
+			/* F-130: Stateless Reset Token detection */
+			if (nwsi && nwsi->quic.qn && (size_t)n >= 21) {
+				static const uint8_t zero_token[16] = {0};
+				if (memcmp(nwsi->quic.qn->rem_stateless_reset_token, zero_token, 16) &&
+				    !memcmp(&p[n - 16], nwsi->quic.qn->rem_stateless_reset_token, 16)) {
+					lwsl_wsi_notice(wsi, "QUIC RX: Stateless reset token matched! Terminating connection silently.");
+					return LWS_HPI_RET_PLEASE_CLOSE_ME;
+				}
+			}
+			goto next_packet;
+		}
+
+		/* Check reserved bits AFTER successful AEAD decryption (RFC 9000 5.4.1 & 12.2) */
+		if (p[0] & 0x80) {
+			/* Long header: Bits 0x0c MUST be zero */
+			if (p[0] & 0x0c) {
+				lwsl_wsi_notice(wsi, "QUIC RX: Reserved bits non-zero in long header");
+				if (nwsi && nwsi != wsi) {
+					lws_quic_enter_closing_state(nwsi, LWS_QUIC_ERR_PROTOCOL_VIOLATION, 0, 0);
+					goto next_packet;
+				}
+				return LWS_HPI_RET_PLEASE_CLOSE_ME;
+			}
+		} else {
+			/* Short header: Bits 0x18 MUST be zero */
+			if (p[0] & 0x18) {
+				lwsl_wsi_notice(wsi, "QUIC RX: Reserved bits non-zero in short header");
+				if (nwsi && nwsi != wsi) {
+					lws_quic_enter_closing_state(nwsi, LWS_QUIC_ERR_PROTOCOL_VIOLATION, 0, 0);
+					goto next_packet;
+				}
+				return LWS_HPI_RET_PLEASE_CLOSE_ME;
+			}
+		}
+
+		/* Decryption succeeded! Commit key update if pending */
+		if (is_key_update) {
+			lws_quic_keys_release_aead_rx(k);
+			lws_quic_keys_release_aead_tx(k);
+			*k = scratch_keys;
+			nwsi->quic.qn->rx_key_phase ^= 1;
+			nwsi->quic.qn->rx_packets_since_update = 0;
+			if (!nwsi->quic.qn->key_update_pending) {
+				/* Peer initiated, so we echo by updating TX keys */
+				lws_quic_initiate_key_update(nwsi);
+				nwsi->quic.qn->key_update_pending = 0; /* Echoed */
+			} else {
+				/* We initiated, this is the peer echoing back */
+				nwsi->quic.qn->key_update_pending = 0;
+			}
+			lwsl_wsi_notice(wsi, "QUIC RX: Key Update completed successfully");
+		}
+		
+		        if (nwsi->quic.qn) {
+                nwsi->quic.qn->rx_packets_since_update++;
+
+#if !defined(WIN32) && !defined(_WIN32)
+                int ecn = ecn_tos & 0x03;
+                if (ecn == 1)      nwsi->quic.qn->ecn_rx_ect1++;
+                else if (ecn == 2) nwsi->quic.qn->ecn_rx_ect0++;
+                else if (ecn == 3) nwsi->quic.qn->ecn_rx_ce++;
+#endif
+        }
+
+		if (nwsi->quic.qn && level == LWS_QUIC_LEVEL_HANDSHAKE) {
+			nwsi->quic.qn->address_validated = 1;
+		}
+
+		if (level == LWS_QUIC_LEVEL_HANDSHAKE) {
+			lws_quic_discard_keys(nwsi, LWS_QUIC_LEVEL_INITIAL);
+		} else if (level == LWS_QUIC_LEVEL_APP) {
+			lws_quic_discard_keys(nwsi, LWS_QUIC_LEVEL_INITIAL);
+			if (nwsi->quic.qn && nwsi->quic.qn->is_server) {
+				lws_quic_discard_keys(nwsi, LWS_QUIC_LEVEL_HANDSHAKE);
+			}
+		}
+
+		lwsl_wsi_info(wsi, "QUIC RX: SUCCESS! Decrypted %d bytes of payload", dec_len);
+
+		/* F-69: Only count bytes_received for valid (decrypted) datagrams */
+		if (valid_datagram_bytes == 0 && nwsi->quic.qn) {
+			nwsi->quic.qn->bytes_received += (uint64_t)orig_n;
+			valid_datagram_bytes = 1;
+		}
+
+		/* Check for duplicate/replayed packet numbers (Security Fix) */
+		int is_out_of_order = 0;
+		if (nwsi->quic.qn) {
+			/*
+			 * Reaching here means the packet authenticated cleanly,
+			 * so any prior decrypt-failure run for this pn_space is
+			 * over: reset the corruption circuit-breaker and the
+			 * key-phase-probe accounting.
+			 */
+			nwsi->quic.qn->consec_decrypt_fail[pn_space] = 0;
+			nwsi->quic.qn->kp_probe_fail = 0;
+
+			uint64_t highest = nwsi->quic.qn->highest_rx_pn[pn_space];
+			if ((nwsi->quic.qn->rx_pn_bitmask[pn_space] != 0 || highest != 0) && full_pn <= highest) {
+				uint64_t diff = highest - full_pn;
+				if (diff >= 64 || (nwsi->quic.qn->rx_pn_bitmask[pn_space] & (1ULL << diff))) {
+					lwsl_wsi_notice(wsi, "QUIC RX: Dropping duplicated or very old packet %llu", (unsigned long long)full_pn);
+					goto next_packet;
+				}
+				nwsi->quic.qn->rx_pn_bitmask[pn_space] |= (1ULL << diff);
+				is_out_of_order = 1;
+			} else {
+				if (nwsi->quic.qn->rx_pn_bitmask[pn_space] != 0 || highest != 0) {
+					uint64_t diff = full_pn - highest;
+					/*
+					 * Forward-PN plausibility guard.  A
+					 * corrupted truncated PN decodes to an
+					 * arbitrary value, and a huge forward
+					 * jump would rescale the receive
+					 * bitmask and bump highest_rx_pn past
+					 * thousands of imaginary gaps,
+					 * poisoning ACK and loss accounting.
+					 * QUIC senders never gap PNs by this
+					 * much in practice, so drop the packet
+					 * rather than trust the decode.
+					 */
+					if (diff > LWS_QUIC_PN_FORWARD_JUMP_LIMIT) {
+						lwsl_wsi_notice(wsi,
+							"QUIC RX: decoded PN %llu "
+							"jumps %llu ahead of "
+							"highest %llu; treating "
+							"as corrupted truncated PN",
+							(unsigned long long)full_pn,
+							(unsigned long long)diff,
+							(unsigned long long)highest);
+						goto next_packet;
+					}
+					if (diff >= 64)
+						nwsi->quic.qn->rx_pn_bitmask[pn_space] = 0;
+					else
+						nwsi->quic.qn->rx_pn_bitmask[pn_space] <<= diff;
+				}
+				nwsi->quic.qn->rx_pn_bitmask[pn_space] |= 1ULL;
+				nwsi->quic.qn->highest_rx_pn[pn_space] = full_pn;
+			}
+			
+			/*
+			 * Connection Migration: Execute pending migration now that
+			 * the packet is cryptographically verified.  Skip if a probe
+			 * is already in flight for this address to avoid overwriting
+			 * the pending path_challenge (which would make the client's
+			 * PATH_RESPONSE not match).
+			 */
+			if (pending_migration) {
+				if (nwsi->quic.qn->probing_sa46_valid &&
+				    !lws_sa46_compare_ads(&migration_sa46,
+							  &nwsi->quic.qn->probing_sa46)) {
+					pending_migration = 0;
+				} else if (is_out_of_order) {
+					lwsl_notice("QUIC: Ignoring connection migration from out-of-order packet (PN %llu <= highest %llu)\n",
+						    (unsigned long long)full_pn, (unsigned long long)highest);
+					pending_migration = 0;
+				} else {
+				pending_migration = 0;
+#if (_LWS_ENABLED_LOGS & LLL_NOTICE)
+				char buf_old[64], buf_new[64];
+				uint16_t port_old, port_new;
+
+				lws_sa46_write_numeric_address(&nwsi->udp->sa46, buf_old, sizeof(buf_old));
+				lws_sa46_write_numeric_address(&migration_sa46, buf_new, sizeof(buf_new));
+				
+#if defined(LWS_WITH_IPV6)
+				port_old = nwsi->udp->sa46.sa4.sin_family == AF_INET ? nwsi->udp->sa46.sa4.sin_port : nwsi->udp->sa46.sa6.sin6_port;
+				port_new = migration_sa46.sa4.sin_family == AF_INET ? migration_sa46.sa4.sin_port : migration_sa46.sa6.sin6_port;
+#else
+				port_old = nwsi->udp->sa46.sa4.sin_port;
+				port_new = migration_sa46.sa4.sin_port;
+#endif
+#endif
+
+				if (nwsi->quic.qn->is_server) {
+#if (_LWS_ENABLED_LOGS & LLL_NOTICE)
+					lwsl_notice("QUIC Server: Connection Migration initiated! Peer address changed from %s:%u to %s:%u (pending validation)\n",
+						    buf_old, (unsigned int)ntohs(port_old),
+						    buf_new, (unsigned int)ntohs(port_new));
+#endif
+					/*
+					 * Commit the peer address immediately: the
+					 * client has moved to a new source port, the
+					 * old path is dead.  Discard any pending
+					 * Initial/Handshake TX (the handshake is done,
+					 * those ACKs are redundant) so they don't race
+					 * ahead of the PATH_CHALLENGE to the new path.
+					 * Queue PATH_CHALLENGE at HEAD of APP pending_tx.
+					 */
+					nwsi->udp->sa46 = migration_sa46;
+					nwsi->quic.qn->rx_has_non_probing = 0;
+					nwsi->quic.qn->probing_sa46 = migration_sa46;
+					nwsi->quic.qn->probing_sa46_valid = 1;
+
+					if (!nwsi->quic.qn->path_challenge_pending) {
+						struct lws_quic_tx_frame *f_pc =
+							lws_zalloc(sizeof(*f_pc) + 8,
+								   "quic path_chall");
+						if (f_pc) {
+							f_pc->type = LWS_QUIC_FT_PATH_CHALLENGE;
+							f_pc->len = 8;
+							f_pc->data = (uint8_t *)&f_pc[1];
+							if (lws_get_random(wsi->a.context,
+									   f_pc->data, 8) != 8) {
+								lws_free(f_pc);
+								return LWS_HPI_RET_HANDLED;
+							}
+							memcpy(nwsi->quic.qn->path_challenge,
+							       f_pc->data, 8);
+							nwsi->quic.qn->path_challenge_pending = 1;
+							lws_dll2_add_head(&f_pc->list,
+								&nwsi->quic.qn->pending_tx[LWS_QUIC_LEVEL_APP]);
+						}
+					}
+
+				} else {
+#if (_LWS_ENABLED_LOGS & LLL_NOTICE)
+					lwsl_notice("QUIC Client: Server address changed from %s:%u to %s:%u, re-connecting socket\n",
+						    buf_old, (unsigned int)ntohs(port_old),
+						    buf_new, (unsigned int)ntohs(port_new));
+#endif
+
+					/* Re-connect the socket to the new server address */
+					if (connect(nwsi->desc.sockfd, sa46_sockaddr(&migration_sa46), sa46_socklen(&migration_sa46)) < 0) {
+						lwsl_warn("QUIC: failed to re-connect client socket, errno=%d\n", errno);
+					}
+
+					nwsi->udp->sa46 = migration_sa46;
+
+					/* Reset Congestion Control State (RFC 9000 9.3.3) */
+					if (nwsi->quic.qn->cc_ops && nwsi->quic.qn->cc_ops->init)
+						nwsi->quic.qn->cc_ops->init(nwsi);
+
+					/* Reset RTT estimator */
+					nwsi->quic.qn->smoothed_rtt = 0;
+					nwsi->quic.qn->rttvar = 0;
+					nwsi->quic.qn->latest_rtt = 0;
+
+					/* Reset PMTUD */
+					nwsi->quic.qn->current_mtu = 1280;
+					nwsi->quic.qn->probed_mtu = 1380;
+					nwsi->quic.qn->pmtud_probe_pn = LWS_QUIC_PMTUD_PROBE_NONE;
+					nwsi->quic.qn->pmtud_state = 1;
+
+					/* Set path to unvalidated */
+					nwsi->quic.qn->address_validated = 0;
+
+					/* Reset Path Bytes for Anti-Amplification tracking */
+					nwsi->quic.qn->bytes_received = (uint64_t)orig_n;
+					nwsi->quic.qn->bytes_sent = 0;
+				}
+
+				/*
+				 * Client path: queue PATH_CHALLENGE for the
+				 * server-address-change case (server already did
+				 * its own above).
+				 */
+				if (!nwsi->quic.qn->is_server &&
+				    !nwsi->quic.qn->path_challenge_pending) {
+					struct lws_quic_tx_frame *f_pc =
+						lws_zalloc(sizeof(*f_pc) + 8, "quic path_chall");
+					if (f_pc) {
+						f_pc->type = LWS_QUIC_FT_PATH_CHALLENGE;
+						f_pc->len = 8;
+						f_pc->data = (uint8_t *)&f_pc[1];
+						if (lws_get_random(wsi->a.context, f_pc->data, 8) != 8) {
+							lws_free(f_pc);
+							return LWS_HPI_RET_HANDLED;
+						}
+						memcpy(nwsi->quic.qn->path_challenge, f_pc->data, 8);
+						nwsi->quic.qn->path_challenge_pending = 1;
+						lws_dll2_add_head(&f_pc->list,
+							&nwsi->quic.qn->pending_tx[LWS_QUIC_LEVEL_APP]);
+					}
+				}
+				lws_callback_on_writable(nwsi);
+				}
+			}
+
+			/* 5. Parse and handle all frames in the payload */
+			if (dec_len == 0) {
+				lwsl_wsi_notice(wsi, "QUIC RX: Packet payload is empty (no frames)");
+				if (nwsi && nwsi != wsi) {
+					lws_quic_enter_closing_state(nwsi, LWS_QUIC_ERR_PROTOCOL_VIOLATION, 0, 0);
+					goto next_packet;
+				}
+				return LWS_HPI_RET_PLEASE_CLOSE_ME;
+			}
+
+			int parse_res = lws_quic_parse_frames(nwsi, pn_space, &p[pn_offset + (size_t)pn_len], (size_t)dec_len, &sa46);
+
+			/* ALPN negotiation might have migrated the network WSI! */
+			if (nwsi && !nwsi->quic.qn) {
+				nwsi = lws_get_quic_network_wsi(nwsi);
+			}
+
+			/*
+			 * After frame parsing may have generated Handshake-level
+			 * ACKs, discard any pending Initial/Handshake TX so those
+			 * ACKs don't race ahead of PATH_CHALLENGE to the new path.
+			 * The handshake is done; only APP-level frames (including
+			 * PATH_CHALLENGE) should reach the new client port.
+			 */
+			if (nwsi && nwsi->quic.qn && nwsi->quic.qn->probing_sa46_valid &&
+			    nwsi->quic.qn->handshake_done) {
+				int _li;
+				/* Discard Initial/Handshake TX */
+				for (_li = 0; _li <= LWS_QUIC_LEVEL_HANDSHAKE; _li++) {
+					lws_start_foreach_dll_safe(struct lws_dll2 *, _d, _d1,
+							nwsi->quic.qn->pending_tx[_li].head) {
+						struct lws_quic_tx_frame *_f = lws_container_of(_d,
+								struct lws_quic_tx_frame, list);
+						lws_dll2_remove(&_f->list);
+						lws_free(_f);
+					} lws_end_foreach_dll_safe(_d, _d1);
+				}
+				/*
+				 * Ensure PATH_CHALLENGE is the first APP frame sent
+				 * to the new path.  A PATH_RESPONSE generated by
+				 * parse_frames (in response to the client's
+				 * PATH_CHALLENGE) may have been add_head'd on top
+				 * of our PATH_CHALLENGE; move our CHALLENGE back
+				 * to the front.
+				 */
+				if (nwsi->quic.qn->path_challenge_pending) {
+					lws_start_foreach_dll_safe(struct lws_dll2 *, _d, _d1,
+							nwsi->quic.qn->pending_tx[LWS_QUIC_LEVEL_APP].head) {
+						struct lws_quic_tx_frame *_f = lws_container_of(_d,
+								struct lws_quic_tx_frame, list);
+						if (_f->type == LWS_QUIC_FT_PATH_CHALLENGE) {
+							lws_dll2_remove(&_f->list);
+							lws_dll2_add_head(&_f->list,
+								&nwsi->quic.qn->pending_tx[LWS_QUIC_LEVEL_APP]);
+						}
+					} lws_end_foreach_dll_safe(_d, _d1);
+				}
+			}
+
+			/*
+			 * The server commits the new path ONLY on PATH_RESPONSE
+			 * validation (handled in parse-quic.c).  Do NOT commit
+			 * here on non-probing packets.
+			 */
+
+			/*
+			 * The user RECEIVE callback that ran during parse_frames
+			 * above may have synchronously closed (and freed) an
+			 * arbitrary sibling stream via lws_wsi_close(..,
+			 * LWS_TO_KILL_SYNC).  The dll2 _safe iterator caches the
+			 * next node before the body, and lws_close_free_wsi()
+			 * detaches the child via lws_wsi_mux_sibling_disconnect()
+			 * (-> lws_dll2_remove), so the cached next stays valid.
+			 */
+			if (nwsi) {
+				lws_start_foreach_dll_safe(struct lws_dll2 *, d, d1,
+						nwsi->mux.child_list_owner.head) {
+					struct lws *w = lws_container_of(d,
+							struct lws, mux.sibling_list);
+
+					if (w->quic.qs && w->quic.qs->close_after_rx) {
+						lwsl_wsi_notice(w, "QUIC RX Post-Processing: Closing stream WSI");
+						lws_close_free_wsi(w,
+							LWS_CLOSE_STATUS_NOSTATUS,
+							"quic post rx stream close");
+					}
+				} lws_end_foreach_dll_safe(d, d1);
+			}
+
+			if (parse_res < 0) {
+				lwsl_wsi_notice(wsi, "QUIC RX: Frame parsing aborted");
+			if (parse_res == -3) {
+				/* Peer closed the connection via CONNECTION_CLOSE. Drop silently without replying. */
+				lwsl_wsi_notice(nwsi ? nwsi : wsi, "QUIC RX: Peer closed connection. Dropping silently.");
+				if (nwsi && nwsi != wsi) {
+					lws_close_free_wsi(nwsi, LWS_CLOSE_STATUS_NORMAL, "quic peer closed");
+					goto next_packet;
+				}
+				return LWS_HPI_RET_PLEASE_CLOSE_ME;
+			}
+			/* We found an error and queued a CONNECTION_CLOSE frame */
+			if (nwsi) {
+				lws_quic_enter_closing_state(nwsi, parse_res == -2 ? LWS_QUIC_ERR_PROTOCOL_VIOLATION : LWS_QUIC_ERR_FRAME_ENCODING_ERROR, 0, 0);
+				lws_callback_on_writable(nwsi);
+			}
+			goto next_packet;
+			} else if (parse_res > 0) {
+				/*
+				 * The packet contained at least one ack-eliciting
+				 * frame, so we must ACK it.  For Initial/Handshake
+				 * pn-spaces, and before the handshake completes, we
+				 * send the ACK immediately (RFC 9000 §13.2.1 rule 3
+				 * keeps handshake / loss-detection timely).  For
+				 * Application (1-RTT) pn-space we coalesce: send
+				 * immediately on every 2nd ack-eliciting packet
+				 * (§13.2.1 rule 4) and otherwise arm the delayed-ACK
+				 * timer, so a burst of N packets yields ~N/2 ACKs
+				 * instead of N.
+				 */
+				if (nwsi && nwsi->quic.qn) {
+					struct lws_quic_netconn *qn = nwsi->quic.qn;
+
+					qn->needs_ack[pn_space] = 1;
+
+					if (pn_space != LWS_QUIC_LEVEL_APP ||
+					    !qn->handshake_done) {
+						lws_callback_on_writable(nwsi);
+						goto next_packet;
+					}
+
+					/*
+					 * App-space ACK: apply the 2nd-packet rule,
+					 * else defer to the delayed-ACK timer.
+					 */
+					if (++qn->rx_ack_eliciting_count >= 2 ||
+					    !qn->smoothed_rtt) {
+						lws_sul_cancel(&qn->ack_delay_sul);
+						qn->ack_delay_armed = 0;
+						lws_callback_on_writable(nwsi);
+						goto next_packet;
+					}
+
+					if (!qn->ack_delay_armed) {
+						/*
+						 * RTT/8 capped at the configured
+						 * max_ack_delay (ours or the peer's
+						 * advertised TP 0x0b, whichever is
+						 * smaller).  The TX path stamps the
+						 * real dwell time into the ACK
+						 * Delay field when it emits it.
+						 */
+						lws_usec_t delay = qn->smoothed_rtt / 8;
+						lws_usec_t cap = qn->ack_delay_us;
+
+						if (qn->peer_max_ack_delay_us &&
+						    qn->peer_max_ack_delay_us < cap)
+							cap = qn->peer_max_ack_delay_us;
+						if (delay > cap || !delay)
+							delay = cap;
+
+						qn->rx_ack_eliciting_since_us =
+							lws_now_usecs();
+						qn->ack_delay_armed = 1;
+						lws_sul_schedule(nwsi->a.context,
+								 0, &qn->ack_delay_sul,
+								 lws_quic_ack_delay_cb,
+								 delay);
+					}
+				}
+			}
+		}
+
+next_packet:
+		n -= (int)packet_size;
+		p += packet_size;
+	}
+
+try_pollout:
+	if (pollfd->revents & LWS_POLLOUT) {
+		int hr = lws_handle_POLLOUT_event(wsi, pollfd);
+
+		if (hr < 0) {
+			/* connect racing already closed and freed the wsi */
+			return LWS_HPI_RET_WSI_ALREADY_DIED;
+		}
+		if (hr) {
+			lwsl_debug("POLLOUT event closed it\n");
+			return LWS_HPI_RET_PLEASE_CLOSE_ME;
+		}
+	}
+
+	return LWS_HPI_RET_HANDLED;
+}
+
+int
+lws_tls_quic_tx_crypto_cb(struct lws *wsi, int level, const uint8_t *buf, size_t len)
+{
+	struct lws_quic_netconn *qn = wsi->quic.qn;
+	struct lws_quic_tx_frame *f;
+
+	if (!qn)
+		return -1;
+
+	// lwsl_notice("QUIC TLS TX: %s generated %d bytes of crypto data for level %d\n", lws_wsi_tag(wsi), (int)len, level);
+
+	/* Allocate frame struct + payload buffer natively */
+	f = lws_zalloc(sizeof(*f) + len, "quic tx frame");
+	if (!f)
+		return -1;
+
+	f->type = LWS_QUIC_FT_CRYPTO;
+	f->data = (uint8_t *)&f[1];
+	f->len = len;
+
+	/* Copy the TLS library's output into the frame */
+	memcpy(f->data, buf, len);
+
+	/*
+	 * Set proper offset tracking for CRYPTO streams.
+	 */
+	f->offset = qn->crypto_tx_offset[level];
+	qn->crypto_tx_offset[level] += len;
+
+	/* Add to the pending TX queue for this encryption level! */
+	lws_dll2_add_tail(&f->list, &qn->pending_tx[level]);
+
+	/* Wake up the event loop to instantly trigger POLLOUT and send the packet */
+	lws_callback_on_writable(wsi);
+
+	return 0;
+}
+
+static int
+quic_secret_cb(struct lws *wsi, enum lws_tls_quic_secret_type type,
+	       const uint8_t *secret, size_t secret_len)
+{
+	lwsl_info("QUIC TLS: Extracted secret type %d (len %d)\n", type, (int)secret_len);
+	if (lws_quic_set_keys(wsi, type, secret, secret_len)) {
+		lwsl_wsi_err(wsi, "Failed to set QUIC keys for type %d", type);
+		return -1;
+	}
+	return 0;
+}
+
+void
+lws_quic_enter_closing_state(struct lws *wsi, uint64_t err_code, uint64_t frame_type, int is_app_error)
+{
+	struct lws_quic_netconn *qn;
+	struct lws *nwsi = lws_get_quic_network_wsi(wsi);
+	struct lws_quic_tx_frame *f;
+	int level, target_level = LWS_QUIC_LEVEL_INITIAL;
+
+	if (!nwsi || !nwsi->quic.qn) {
+		lwsl_notice("lws_quic_enter_closing_state: nwsi %s, qn %p (wsi %s parent %s)\n", 
+			lws_wsi_tag(nwsi), nwsi ? nwsi->quic.qn : NULL, lws_wsi_tag(wsi), lws_wsi_tag(wsi ? wsi->mux.parent_wsi : NULL));
+		return;
+	}
+
+	qn = nwsi->quic.qn;
+
+	if (qn->is_closing) {
+		lwsl_notice("lws_quic_enter_closing_state: qn->is_closing is already 1\n");
+		return; /* Already closing */
+	}
+
+	qn->is_closing = 1;
+	qn->conn_close_err = err_code;
+
+
+	lwsl_wsi_warn(nwsi, "QUIC: Entering Closing State (err 0x%llx)", (unsigned long long)err_code);
+
+	/* Determine highest available encryption level to send CONNECTION_CLOSE */
+	int start_level = qn->highest_rx_level;
+	for (level = start_level; level >= LWS_QUIC_LEVEL_INITIAL; level--) {
+		if (qn->keys[level] && qn->keys[level]->el_hp_tx.len) {
+			target_level = level;
+			break;
+		}
+	}
+
+	/* Clear pending queues, we are closing, but keep CRYPTO frames so peer can derive keys! */
+	for (level = 0; level < LWS_QUIC_LEVEL_COUNT; level++) {
+		lws_start_foreach_dll_safe(struct lws_dll2 *, d, d1, qn->pending_tx[level].head) {
+			struct lws_quic_tx_frame *tf = lws_container_of(d, struct lws_quic_tx_frame, list);
+			if (tf->type != LWS_QUIC_FT_CRYPTO && tf->type != LWS_QUIC_FT_HANDSHAKE_DONE) {
+				lws_dll2_remove(&tf->list);
+				lws_free(tf);
+			}
+		} lws_end_foreach_dll_safe(d, d1);
+	}
+
+	/* Enqueue a single CONNECTION_CLOSE frame */
+	f = lws_zalloc(sizeof(*f) + 16, "quic tx cc");
+	if (f) {
+		uint8_t *p = (uint8_t *)&f[1];
+		f->type = is_app_error ? LWS_QUIC_FT_CONNECTION_CLOSE_APP : LWS_QUIC_FT_CONNECTION_CLOSE;
+		
+		lwsl_wsi_warn(nwsi, "QUIC TX: Enqueueing CONNECTION_CLOSE (type 0x%x, err 0x%llx) at level %d",
+			f->type, (unsigned long long)err_code, target_level);
+
+		/* Encode the error code (varint) */
+		p += lws_quic_write_varint(p, 8, err_code);
+
+		/* Frame type (varint) - only for Transport Errors (0x1c) */
+		if (!is_app_error) {
+			p += lws_quic_write_varint(p, 8, frame_type);
+		}
+
+		/* Reason phrase length (0) */
+		p += lws_quic_write_varint(p, 8, 0);
+
+		f->data = (uint8_t *)&f[1];
+		f->len = (size_t)(p - f->data);
+
+		lwsl_wsi_warn(nwsi, "QUIC TX: Enqueueing CONNECTION_CLOSE (type 0x%x, err 0x%llx) at level %d",
+			f->type, (unsigned long long)err_code, target_level);
+		lwsl_hexdump_warn(f->data, f->len);
+
+		if (target_level == LWS_QUIC_LEVEL_APP)
+			lws_quic_dbg_1rtt_account(qn, f, "connection-close");
+		lws_dll2_add_tail(&f->list, &qn->pending_tx[target_level]);
+	}
+
+	/* Wait 3 seconds, then drop the socket */
+	lws_set_timeout(nwsi, PENDING_TIMEOUT_KILLED_BY_SSL_INFO, 3);
+	lws_callback_on_writable(nwsi);
+}
+
+static lws_handling_result_t
+rops_handle_POLLOUT_quic(struct lws *wsi)
+{
+	struct lws_quic_netconn *qn = wsi->quic.qn;
+	int level, n;
+	int blocked = 0;
+	int eagain_blocked = 0;
+	uint8_t pkt[2048]; memset(pkt, 0, sizeof(pkt));
+
+	if (!qn) {
+		lws_handling_result_t hr_ret = LWS_HP_RET_DROP_POLLOUT;
+		lws_start_foreach_dll_safe(struct lws_dll2 *, d, d1,
+				wsi->mux.child_list_owner.head) {
+			struct lws *w = lws_container_of(d, struct lws,
+							 mux.sibling_list);
+			if (w->mux.requested_POLLOUT) {
+				w->mux.requested_POLLOUT = 0;
+				lws_handling_result_t hr_child = rops_handle_POLLOUT_quic(w);
+				if (hr_child == LWS_HP_RET_BAIL_DIE)
+					return LWS_HP_RET_BAIL_DIE;
+				if (hr_child == LWS_HP_RET_BAIL_OK)
+					hr_ret = LWS_HP_RET_BAIL_OK;
+			}
+		} lws_end_foreach_dll_safe(d, d1);
+		return hr_ret;
+	}
+
+	wsi->mux.requested_POLLOUT = 0;
+
+	lws_usec_t pto_delay = lws_quic_pto_delay_us(qn, qn->pto_count);
+
+        if (!wsi->quic.initialized && !qn->is_server) {
+                wsi->quic.initialized = 1;
+
+#if defined(LWS_WITH_TLS) && defined(LWS_WITH_CLIENT)
+		if (wsi->tls.use_ssl & LCCSCF_USE_SSL) {
+			if (!wsi->tls.ssl) {
+				const char *cce = NULL;
+				if (lws_client_create_tls(wsi, &cce, 0) == CCTLS_RETURN_ERROR) {
+					lwsl_wsi_err(wsi, "Failed to create TLS BIO: %s", cce ? cce : "unknown");
+					return LWS_HP_RET_BAIL_DIE;
+				}
+			}
+			/* The BIO was already created, just init QUIC TLS */
+			if (lws_tls_quic_init(wsi, quic_secret_cb)) {
+				lwsl_wsi_err(wsi, "Failed to init QUIC TLS");
+				return LWS_HP_RET_BAIL_DIE;
+			}
+			/* Kick off the handshake */
+			// lwsl_wsi_notice(wsi, "Kicking off QUIC TLS handshake");
+			lws_tls_quic_rx_crypto(wsi, LWS_QUIC_LEVEL_INITIAL, NULL, 0);
+
+			{
+				struct lws *nwsi = lws_get_quic_network_wsi(wsi);
+				if (nwsi) {
+					wsi = nwsi;
+					qn = wsi->quic.qn;
+				}
+			}
+		}
+#endif
+        }
+
+	if (qn->is_closing) {
+		/* We are in the Closing State. Only process the CONNECTION_CLOSE frame. */
+		/* The frame is queued in pending_tx by lws_quic_enter_closing_state. */
+		/* Skip PTO sweep and just let the normal frame generation send it. */
+		goto send_frames;
+	}
+
+	/*
+	 * PTO Sweep: Check for dropped/unacknowledged packets
+	 */
+	lws_usec_t now = lws_now_usecs();
+	size_t total_bytes_lost = 0;
+	uint64_t last_lost_pn = (uint64_t)-1;
+	for (level = 0; level < LWS_QUIC_LEVEL_COUNT; level++) {
+		if (!qn->in_flight[level].count)
+			continue;
+
+		lws_start_foreach_dll_safe(struct lws_dll2 *, d, d1, qn->in_flight[level].head) {
+			struct lws_quic_tx_frame *f = lws_container_of(d, struct lws_quic_tx_frame, list);
+
+			lwsl_debug("PTO Sweep: checking packet %llu: now=%llu, sent=%llu, diff=%lld\n",
+				(unsigned long long)f->sent_in_pn, (unsigned long long)now, (unsigned long long)f->sent_time_us,
+				(long long)(now - f->sent_time_us));
+
+			/* Use the PTO delay that triggered this sweep, not the newly doubled one */
+			lws_usec_t sweep_pto_delay = lws_quic_pto_delay_us(qn,
+				qn->pto_count > 0 ? qn->pto_count - 1 : 0);
+
+			/* Allow a 5ms epsilon for timer jitter */
+			if (now + 5000 >= f->sent_time_us + sweep_pto_delay) {
+				// lwsl_notice("PTO Sweep: Packet %llu (type 0x%02x) lost! Retransmitting!\n", (unsigned long long)f->sent_in_pn, f->type);
+
+				/* PMTUD Black Hole Detection */
+				if (f->sent_in_pn != last_lost_pn) {
+					last_lost_pn = f->sent_in_pn;
+					if (qn->pmtud_probe_pn != LWS_QUIC_PMTUD_PROBE_NONE &&
+					    f->sent_in_pn == qn->pmtud_probe_pn) {
+						/* Active probe was lost */
+						qn->pmtud_probe_pn = LWS_QUIC_PMTUD_PROBE_NONE;
+						qn->pmtud_state = 2; /* SEARCH_COMPLETE, stop probing */
+					} else if (f->packet_size >= qn->current_mtu - 16) {
+						qn->consecutive_mtu_losses++;
+						if (qn->consecutive_mtu_losses >= 3) {
+							lwsl_wsi_warn(wsi, "QUIC PMTUD: Black Hole detected! Reverting MTU to 1280.");
+							qn->current_mtu = 1280;
+							qn->pmtud_state = 0;
+							qn->consecutive_mtu_losses = 0;
+						}
+					}
+				}
+
+				/* Packet lost! */
+				lws_dll2_remove(&f->list);
+				total_bytes_lost += f->wire_len;
+				if ((f->type & 0xfe) == LWS_QUIC_FT_DATAGRAM) {
+					lws_free(f);
+				} else {
+					lws_dll2_add_head(&f->list, &qn->pending_tx[level]);
+					f->wire_len = 0;
+				}
+			}
+		} lws_end_foreach_dll_safe(d, d1);
+	}
+	/*
+	 * RFC 9002 Section 6.2.4: A PTO timer expiry does not indicate packet
+	 * loss and MUST NOT cause the congestion window to be reduced (no on_loss).
+	 * However, bytes_in_flight must be decremented for frames moved back to
+	 * pending_tx, otherwise the CC state diverges from reality.  Use on_discard
+	 * which adjusts bytes_in_flight without touching cwnd or ssthresh.
+	 */
+	if (total_bytes_lost && qn->cc_ops && qn->cc_ops->on_discard)
+		qn->cc_ops->on_discard(wsi, total_bytes_lost);
+
+send_frames:
+	/*
+	 * Iterate through the encryption levels in priority order.
+	 * Initial > Handshake > Application Data.
+	 */
+	for (level = 0; level < LWS_QUIC_LEVEL_COUNT; level++) {
+		if (!qn->keys[level]) {
+			continue;
+		}
+
+		if (!qn->keys[level]->el_hp_tx.len) {
+			continue;
+		}
+
+		/* Server MUST NOT send 0-RTT (EARLY) packets */
+		if (level == LWS_QUIC_LEVEL_EARLY && qn->is_server) {
+			continue;
+		}
+
+		int pn_space = (level == LWS_QUIC_LEVEL_EARLY || level == LWS_QUIC_LEVEL_APP) ? LWS_QUIC_LEVEL_APP : level;
+		int is_ack_allowed = (level != LWS_QUIC_LEVEL_EARLY);
+
+		if (!qn->pending_tx[level].count && !(qn->needs_ack[pn_space] && is_ack_allowed)) {
+			continue;
+		}
+
+		lwsl_debug("QUIC TX: Processing level %d. pending=%d, needs_ack=%d, pto_needed=%d", level, qn->pending_tx[level].count, qn->needs_ack[pn_space], qn->pto_probe_needed);
+
+		/* Determine if we're allowed to send */
+		int is_congestion_limited = 0;
+		(void)is_congestion_limited;
+		uint32_t mtu = qn->current_mtu ? qn->current_mtu : 1280;
+
+		/* Enforce RFC 9000 Anti-Amplification Limit (Section 8.1) for servers */
+		if (qn->is_server && !qn->address_validated) {
+			uint64_t allowance = 3 * qn->bytes_received;
+			if (qn->bytes_sent >= allowance) {
+				lwsl_notice("QUIC TX: Anti-Amplification limit reached! Sent: %llu, Recv: %llu. Blocking send.\n",
+					    (unsigned long long)qn->bytes_sent, (unsigned long long)qn->bytes_received);
+				blocked = 1;
+				break; /* Block sending further datagrams */
+			}
+			uint64_t remaining = allowance - qn->bytes_sent;
+			if (mtu > remaining)
+				mtu = (uint32_t)remaining;
+
+			if (mtu < 48) { /* Too small to send anything useful */
+				lwsl_notice("QUIC TX: Anti-Amplification remaining (%llu) too small. Blocking send.\n", (unsigned long long)remaining);
+				blocked = 1;
+				break;
+			}
+		}
+
+		/* Check congestion window - bypass for PTO probes and ACKs */
+		if (!qn->pto_probe_needed && !(qn->needs_ack[pn_space] && is_ack_allowed) && qn->cc_ops && qn->cc_ops->can_send && !qn->cc_ops->can_send(wsi, mtu)) {
+			is_congestion_limited = 1;
+			blocked = 1;
+			break; /* Stop processing sending loops */
+		}
+
+		/* Check pacing - bypass for PTO probes, exactly as we bypass CC */
+		if (!qn->pto_probe_needed && !(qn->needs_ack[pn_space] && is_ack_allowed) && qn->cc_ops && qn->cc_ops->get_pacing_delay) {
+			lws_usec_t delay = qn->cc_ops->get_pacing_delay(wsi, mtu);
+			if (delay > 0) {
+				lws_sul_schedule(wsi->a.context, 0, &qn->pacer_sul, lws_quic_pacer_cb, delay);
+				blocked = 1;
+				break; /* Stop processing sending loops */
+			}
+		}
+
+		/* AEAD Confidentiality Limits Check (RFC 9001 Section 6.6) */
+		uint64_t update_limit = (1ULL << 20);
+		if (wsi->a.vhost && (wsi->a.vhost->options & LWS_SERVER_OPTION_QUIC_EARLY_KEY_UPDATE)) {
+			update_limit = 10; /* Trigger early for interop testing */
+		}
+		if (level == LWS_QUIC_LEVEL_APP && qn->tx_packets_since_update > update_limit) {
+			lws_quic_initiate_key_update(wsi);
+		}
+
+		/* We have frames to send at this encryption level! */
+		uint8_t *p = pkt;
+		uint64_t my_pn = qn->keys[level]->pn_tx++;
+		lws_sockaddr46 packet_dest_sa46;
+		int has_packet_dest = 0;
+
+		/* 1. Serialize Header */
+		size_t pn_offset = 0;
+		size_t header_len = 0;
+
+		if (level == LWS_QUIC_LEVEL_INITIAL || level == LWS_QUIC_LEVEL_HANDSHAKE || level == LWS_QUIC_LEVEL_EARLY) {
+			if (level == LWS_QUIC_LEVEL_INITIAL) {
+                                if (qn->version == LWS_QUIC_VERSION_2)
+                                        *p++ = 0xc0 | 0x10 | 0x01; /* v2 Initial */
+                                else
+                                        *p++ = 0xc0 | 0x00 | 0x01; /* v1 Initial */
+                        } else if (level == LWS_QUIC_LEVEL_EARLY) {
+                                if (qn->version == LWS_QUIC_VERSION_2)
+                                        *p++ = 0xc0 | 0x20 | 0x01; /* v2 0-RTT */
+                                else
+                                        *p++ = 0xc0 | 0x10 | 0x01; /* v1 0-RTT */
+                        } else {
+                                if (qn->version == LWS_QUIC_VERSION_2)
+                                        *p++ = 0xc0 | 0x30 | 0x01; /* v2 Handshake */
+                                else
+                                        *p++ = 0xc0 | 0x20 | 0x01; /* v1 Handshake */
+                        }
+
+			/* Version */
+			*p++ = (uint8_t)(qn->version >> 24);
+			*p++ = (uint8_t)(qn->version >> 16);
+			*p++ = (uint8_t)(qn->version >> 8);
+			*p++ = (uint8_t)(qn->version);
+			/* DCID */
+			*p++ = qn->rem_cid.len;
+			if (qn->rem_cid.len) { memcpy(p, qn->rem_cid.id, qn->rem_cid.len); p += qn->rem_cid.len; }
+			/* SCID */
+			*p++ = qn->loc_cid.len;
+			if (qn->loc_cid.len) { memcpy(p, qn->loc_cid.id, qn->loc_cid.len); p += qn->loc_cid.len; }
+
+			if (level == LWS_QUIC_LEVEL_INITIAL) {
+				/* Token Length */
+				if (!qn->is_server && qn->retry_token_len > 0) {
+					p += lws_quic_write_varint(p, sizeof(pkt) - (size_t)(p - pkt), qn->retry_token_len);
+					memcpy(p, qn->retry_token, qn->retry_token_len);
+					p += qn->retry_token_len;
+				} else {
+					*p++ = 0x00;
+				}
+			}
+			/* Length (2-byte varint, will fill in later) */
+			*p++ = 0x40; *p++ = 0x00;
+
+			pn_offset = (size_t)(p - pkt);
+			header_len = pn_offset + 2; /* 2-byte PN */
+			p += 2; /* Skip PN bytes */
+		} else {
+			uint8_t sh = 0x40 | 0x01; /* Short Header, Fixed bit, 2-byte PN */
+			if (qn->tx_key_phase)
+				sh |= 0x04; /* Key Phase bit */
+			*p++ = sh;
+			/* DCID */
+			if (qn->rem_cid.len) { memcpy(p, qn->rem_cid.id, qn->rem_cid.len); p += qn->rem_cid.len; }
+
+			pn_offset = (size_t)(p - pkt);
+			header_len = pn_offset + 2;
+			p += 2;
+		}
+
+		/* 1.5 Generate ACK frame if needed */
+		int has_ack = 0;
+		int skip_ack_for_dest = 0;
+		if (qn->pending_tx[level].head) {
+			struct lws_quic_tx_frame *first_f = lws_container_of(qn->pending_tx[level].head, struct lws_quic_tx_frame, list);
+			if (first_f->has_dest) {
+				/* Skip ACK for now, this packet will be dedicated to first_f's destination */
+				skip_ack_for_dest = 1;
+			}
+		}
+		if (qn->needs_ack[pn_space] && is_ack_allowed && !skip_ack_for_dest) {
+			/*
+			 * ACK Delay (RFC 9000 §19.3): encoded in microseconds
+			 * scaled by 2 ^ ack_delay_exponent.  We leave our
+			 * exponent implicitly defaulted to 3 (we don't emit TP
+			 * 0x0a), so divide by 8.  For App-space ACKs we report
+			 * how long we actually held the ACK (so the peer can
+			 * subtract it for RTT); Initial/Handshake ACKs are sent
+			 * immediately so their delay is genuinely 0.
+			 */
+			uint8_t * const _ack_start = p;
+			uint64_t ack_delay_enc = 0;
+
+			if (pn_space == LWS_QUIC_LEVEL_APP &&
+			    qn->rx_ack_eliciting_since_us) {
+				lws_usec_t held = lws_now_usecs() -
+					qn->rx_ack_eliciting_since_us;
+				if (held > 0)
+					ack_delay_enc = (uint64_t)(held >> 3);
+			}
+
+                        if (qn->ecn_rx_ect0 || qn->ecn_rx_ect1 || qn->ecn_rx_ce) {
+                                *p++ = 0x03; /* ACK_ECN */
+                        } else {
+                                *p++ = LWS_QUIC_FT_ACK; /* ACK (0x02) */
+                        }
+                        p += lws_quic_write_varint(p, sizeof(pkt) - (size_t)(p - pkt), qn->highest_rx_pn[pn_space]); /* Largest Acknowledged */
+                        p += lws_quic_write_varint(p, sizeof(pkt) - (size_t)(p - pkt), ack_delay_enc); /* ACK Delay */
+                        p += lws_quic_write_varint(p, sizeof(pkt) - (size_t)(p - pkt), 0); /* ACK Range Count */
+                        uint64_t first_ack_range = 0;
+                        uint64_t bm = qn->rx_pn_bitmask[pn_space] >> 1;
+                        while (bm & 1) {
+                                first_ack_range++;
+                                bm >>= 1;
+                        }
+                        p += lws_quic_write_varint(p, sizeof(pkt) - (size_t)(p - pkt), first_ack_range); /* First ACK Range */
+
+                        if (qn->ecn_rx_ect0 || qn->ecn_rx_ect1 || qn->ecn_rx_ce) {
+                                p += lws_quic_write_varint(p, sizeof(pkt) - (size_t)(p - pkt), qn->ecn_rx_ect0);
+                                p += lws_quic_write_varint(p, sizeof(pkt) - (size_t)(p - pkt), qn->ecn_rx_ect1);
+                                p += lws_quic_write_varint(p, sizeof(pkt) - (size_t)(p - pkt), qn->ecn_rx_ce);
+                        }
+
+                        qn->needs_ack[pn_space] = 0;
+			/*
+			 * Reset the delayed-ACK coalescing state for App-space:
+			 * the timer (if armed) is no longer needed and the
+			 * 2nd-packet counter restarts from the next eliciting
+			 * packet we receive.
+			 */
+			if (pn_space == LWS_QUIC_LEVEL_APP) {
+				lws_sul_cancel(&qn->ack_delay_sul);
+				qn->ack_delay_armed = 0;
+				qn->rx_ack_eliciting_count = 0;
+				qn->rx_ack_eliciting_since_us = 0;
+			}
+                        has_ack = 1;
+			if (pn_space == LWS_QUIC_LEVEL_APP) {
+				struct lws_quic_tx_frame _ackfake;
+				memset(&_ackfake, 0, sizeof(_ackfake));
+				_ackfake.type = (qn->ecn_rx_ect0 || qn->ecn_rx_ect1 ||
+						 qn->ecn_rx_ce) ? LWS_QUIC_FT_ACK_ECN
+								: LWS_QUIC_FT_ACK;
+				_ackfake.len = (uint64_t)(p - _ack_start);
+				lws_quic_dbg_1rtt_account(qn, &_ackfake, "ack-emit");
+			}
+		}
+
+		/*
+		 * If a path probe is pending, promote PATH_CHALLENGE to the
+		 * very front of pending_tx so it is the first APP frame sent
+		 * to the new address (QIR requires this for connectionmigration
+		 * and rebind-addr tests).
+		 */
+		if (level == LWS_QUIC_LEVEL_APP &&
+		    qn->probing_sa46_valid && qn->path_challenge_pending) {
+			lws_start_foreach_dll_safe(struct lws_dll2 *, d, d1,
+					qn->pending_tx[level].head) {
+				struct lws_quic_tx_frame *f =
+					lws_container_of(d, struct lws_quic_tx_frame, list);
+				if (f->type == LWS_QUIC_FT_PATH_CHALLENGE) {
+					lws_dll2_remove(&f->list);
+					lws_dll2_add_head(&f->list,
+						&qn->pending_tx[level]);
+					break;
+				}
+			} lws_end_foreach_dll_safe(d, d1);
+		}
+
+		/* 2. Bundle frames from pending_tx until MTU is reached */
+		lws_start_foreach_dll_safe(struct lws_dll2 *, d, d1, qn->pending_tx[level].head) {
+			struct lws_quic_tx_frame *f = lws_container_of(d, struct lws_quic_tx_frame, list);
+
+			if (has_packet_dest) {
+				if (!f->has_dest) {
+					d = d1;
+					continue;
+				}
+				/* Compare f->dest_sa46 with packet_dest_sa46 */
+				int match = 0;
+				if (packet_dest_sa46.sa4.sin_family == f->dest_sa46.sa4.sin_family) {
+					if (packet_dest_sa46.sa4.sin_family == AF_INET) {
+						if (packet_dest_sa46.sa4.sin_addr.s_addr == f->dest_sa46.sa4.sin_addr.s_addr &&
+						    packet_dest_sa46.sa4.sin_port == f->dest_sa46.sa4.sin_port)
+							match = 1;
+					}
+#if defined(LWS_WITH_IPV6)
+					else if (packet_dest_sa46.sa6.sin6_family == AF_INET6) {
+						if (!memcmp(&packet_dest_sa46.sa6.sin6_addr, &f->dest_sa46.sa6.sin6_addr, sizeof(struct in6_addr)) &&
+						    packet_dest_sa46.sa6.sin6_port == f->dest_sa46.sa6.sin6_port)
+							match = 1;
+					}
+#endif
+				}
+				if (!match) {
+					d = d1;
+					continue;
+				}
+			} else if (f->has_dest) {
+				packet_dest_sa46 = f->dest_sa46;
+				has_packet_dest = 1;
+			}
+
+			/* Check if frame fits in remaining MTU (leaving room for headers and 16-byte AEAD tag) */
+			size_t frame_header_max_len = 1 + 8 + 8;
+			size_t max_udp_payload = mtu > 48 ? mtu - 48 : 1200;
+			if (max_udp_payload > 1200 && !qn->handshake_done) max_udp_payload = 1200; /* RFC 9000 Section 14.1 */
+			if (max_udp_payload > sizeof(pkt)) max_udp_payload = sizeof(pkt);
+
+			if ((size_t)(p - pkt) + frame_header_max_len + 32 >= max_udp_payload)
+				break;
+
+			size_t send_len = f->len;
+
+			if ((size_t)(p - pkt) + frame_header_max_len + send_len + 32 > max_udp_payload) {
+				if ((f->type & 0xf8) == LWS_QUIC_FT_STREAM || f->type == LWS_QUIC_FT_CRYPTO) {
+					send_len = max_udp_payload - (size_t)(p - pkt) - frame_header_max_len - 32;
+				} else {
+					break; /* Non-fragmentable frame doesn't fit */
+				}
+			}
+			if (send_len == 0 && f->len > 0)
+				break;
+
+			/* Serialize the frame type */
+			uint8_t type = f->type;
+			if (send_len < f->len && (type & 0xf8) == LWS_QUIC_FT_STREAM) {
+				type &= 0xfe; /* Clear FIN bit for intermediate fragment */
+			}
+			*p++ = type;
+
+			/* Serialize frame-specific headers */
+			if (type == LWS_QUIC_FT_PING) {
+				/* PING has no payload or additional headers */
+			} else if (type == LWS_QUIC_FT_CRYPTO) {
+				p += lws_quic_write_varint(p, sizeof(pkt) - (size_t)(p - pkt), f->offset);
+				p += lws_quic_write_varint(p, sizeof(pkt) - (size_t)(p - pkt), send_len);
+			} else if ((type & 0xf8) == LWS_QUIC_FT_STREAM) {
+				/* Stream ID */
+                                p += lws_quic_write_varint(p, sizeof(pkt) - (size_t)(p - pkt), f->stream_id);
+				if (type & 0x04) /* OFF */
+					p += lws_quic_write_varint(p, sizeof(pkt) - (size_t)(p - pkt), f->offset);
+				if (type & 0x02) /* LEN */
+					p += lws_quic_write_varint(p, sizeof(pkt) - (size_t)(p - pkt), send_len);
+			} else if ((type & 0xfe) == LWS_QUIC_FT_DATAGRAM) {
+				if (type & 0x01) /* LEN */
+					p += lws_quic_write_varint(p, sizeof(pkt) - (size_t)(p - pkt), send_len);
+			} else if (type == LWS_QUIC_FT_MAX_DATA || type == LWS_QUIC_FT_DATA_BLOCKED) {
+				p += lws_quic_write_varint(p, sizeof(pkt) - (size_t)(p - pkt), f->limit);
+			} else if (type == LWS_QUIC_FT_MAX_STREAM_DATA || type == LWS_QUIC_FT_STREAM_DATA_BLOCKED) {
+                                p += lws_quic_write_varint(p, sizeof(pkt) - (size_t)(p - pkt), f->stream_id);
+				p += lws_quic_write_varint(p, sizeof(pkt) - (size_t)(p - pkt), f->limit);
+			} else if (type == LWS_QUIC_FT_RESET_STREAM) {
+                                p += lws_quic_write_varint(p, sizeof(pkt) - (size_t)(p - pkt), f->stream_id);
+				p += lws_quic_write_varint(p, sizeof(pkt) - (size_t)(p - pkt), f->offset); /* app_err_code */
+				p += lws_quic_write_varint(p, sizeof(pkt) - (size_t)(p - pkt), f->limit); /* final_size */
+			} else if (type == LWS_QUIC_FT_STOP_SENDING) {
+                                p += lws_quic_write_varint(p, sizeof(pkt) - (size_t)(p - pkt), f->stream_id);
+				p += lws_quic_write_varint(p, sizeof(pkt) - (size_t)(p - pkt), f->offset); /* app_err_code */
+			} else if (type == LWS_QUIC_FT_MAX_STREAMS_BIDI || type == LWS_QUIC_FT_MAX_STREAMS_UNIDI ||
+				   type == LWS_QUIC_FT_STREAMS_BLOCKED_BIDI || type == LWS_QUIC_FT_STREAMS_BLOCKED_UNIDI) {
+				p += lws_quic_write_varint(p, sizeof(pkt) - (size_t)(p - pkt), f->limit);
+			} else if (type == LWS_QUIC_FT_NEW_CONNECTION_ID) {
+                                p += lws_quic_write_varint(p, sizeof(pkt) - (size_t)(p - pkt), f->stream_id); /* seq */
+				p += lws_quic_write_varint(p, sizeof(pkt) - (size_t)(p - pkt), f->offset); /* retire_prior_to */
+				/* cid + token in data */
+			} else if (type == LWS_QUIC_FT_RETIRE_CONNECTION_ID) {
+                                p += lws_quic_write_varint(p, sizeof(pkt) - (size_t)(p - pkt), f->stream_id); /* seq */
+			}
+
+			if (send_len) {
+				memcpy(p, f->data, send_len);
+				p += send_len;
+			}
+
+			if (send_len < f->len) {
+				/* Fragmentation! Duplicate into in_flight */
+				struct lws_quic_tx_frame *f_sent = lws_malloc(sizeof(*f_sent) + send_len, "quic tx frag");
+				if (!f_sent) return LWS_HPI_RET_HANDLED;
+				*f_sent = *f;
+				lws_dll2_clear(&f_sent->list);
+				f_sent->len = send_len;
+				f_sent->data = (uint8_t *)&f_sent[1];
+				memcpy(f_sent->data, f->data, send_len);
+
+				f_sent->sent_in_pn = my_pn;
+				f_sent->sent_time_us = lws_now_usecs();
+				f_sent->wire_len = 0;
+
+				/* Clear the FIN bit from intermediate fragment */
+				if ((f_sent->type & 0xf8) == LWS_QUIC_FT_STREAM)
+					f_sent->type &= 0xfe;
+
+				lws_dll2_add_tail(&f_sent->list, &qn->in_flight[level]);
+
+
+				/* Update original f in pending_tx */
+				f->offset += send_len;
+				f->len -= send_len;
+				f->data += send_len;
+
+				/* Schedule PTO timer since we have data in-flight */
+				lws_sul_schedule(wsi->a.context, 0, &qn->pto_sul, lws_quic_pto_cb, pto_delay);
+
+				break; /* We filled the MTU */
+			} else {
+				/* Sent entirely */
+				lws_dll2_remove(&f->list);
+				f->sent_in_pn = my_pn;
+				f->sent_time_us = lws_now_usecs();
+				f->wire_len = 0;
+				lws_dll2_add_tail(&f->list, &qn->in_flight[level]);
+
+				/* Schedule PTO timer since we have data in-flight */
+				lws_sul_schedule(wsi->a.context, 0, &qn->pto_sul, lws_quic_pto_cb, pto_delay);
+			}
+
+		} lws_end_foreach_dll_safe(d, d1);
+
+		size_t payload_len = (size_t)(p - (pkt + header_len));
+		if (payload_len == 0 && !has_ack)
+			continue;
+
+		/* Ensure payload is at least 4 bytes for header protection sampling (RFC 9000 Section 5.4.2) */
+		if (payload_len < 4) {
+			memset(p, LWS_QUIC_FT_PADDING, 4 - payload_len);
+			p += (4 - payload_len);
+			payload_len = 4;
+		}
+
+		/* pad out to 1200 minimum total tx length for client initial */
+		if (level == LWS_QUIC_LEVEL_INITIAL && !qn->is_server) {
+			size_t target_payload_len = 1200 - header_len - 16;
+			if (payload_len < target_payload_len) {
+				memset(p, LWS_QUIC_FT_PADDING, target_payload_len - payload_len);
+				p += (target_payload_len - payload_len);
+				payload_len = target_payload_len;
+			}
+		}
+
+		/* PMTUD: Send a probe if we are searching and don't currently have a probe in flight */
+		if (level == LWS_QUIC_LEVEL_APP && qn->pmtud_state == 1 &&
+		    qn->pmtud_probe_pn == LWS_QUIC_PMTUD_PROBE_NONE &&
+		    !(qn->is_server && !qn->address_validated)) {
+			size_t target_payload_len = qn->probed_mtu - header_len - 16;
+			if (payload_len < target_payload_len) {
+				memset(p, LWS_QUIC_FT_PADDING, target_payload_len - payload_len);
+				p += (target_payload_len - payload_len);
+				payload_len = target_payload_len;
+				qn->pmtud_probe_pn = my_pn;
+			}
+		}
+
+		/* Fill in Length for Initial/Handshake/0-RTT packets */
+		if (level == LWS_QUIC_LEVEL_INITIAL || level == LWS_QUIC_LEVEL_HANDSHAKE || level == LWS_QUIC_LEVEL_EARLY) {
+			uint16_t quic_len = (uint16_t)(payload_len + 2 + 16); /* PN (2) + AEAD Tag (16) */
+			uint8_t *len_ptr = pkt + pn_offset - 2;
+			len_ptr[0] = (uint8_t)(0x40 | ((quic_len >> 8) & 0x3F));
+			len_ptr[1] = (uint8_t)(quic_len & 0xFF);
+		}
+
+		/* Fill in Packet Number */
+		pkt[pn_offset]     = (uint8_t)((my_pn >> 8) & 0xFF);
+		pkt[pn_offset + 1] = (uint8_t)(my_pn & 0xFF);
+
+		/* 3. Encrypt payload and mask header */
+		n = lws_quic_encrypt_payload(qn->keys[level], pkt, (size_t)(p - pkt), pn_offset, 2, my_pn);
+		if (n < 0) {
+			lwsl_wsi_warn(wsi, "QUIC TX: Payload encryption failed");
+			return LWS_HP_RET_BAIL_OK;
+		}
+
+		if (level == LWS_QUIC_LEVEL_APP)
+			qn->tx_packets_since_update++;
+
+		/* 4. Transmit UDP Datagram */
+
+		lws_sockfd_type fd = wsi->mux_substream ? wsi->mux.parent_wsi->desc.sockfd : wsi->desc.sockfd;
+		size_t send_len = (size_t)(p - pkt) + 16;
+
+		/* PMTUD: tag in-flight frames with this packet's wire length so we can track MTU losses */
+		struct lws_dll2 *d = qn->in_flight[level].tail;
+		while (d) {
+			struct lws_quic_tx_frame *f = lws_container_of(d, struct lws_quic_tx_frame, list);
+			if (f->sent_in_pn == my_pn)
+				f->packet_size = (uint16_t)send_len;
+			else
+				break;
+			d = d->prev;
+		}
+
+		/* Fault Injection for dropping UDP packets (simulating packet loss) */
+		if (lws_fi(&wsi->fic, "quic_tx_drop")) {
+			lwsl_wsi_debug(wsi, "QUIC TX: Dropping packet via lws_fi fault injection!");
+			n = (int)send_len; /* Pretend it succeeded */
+		} else {
+			const lws_sockaddr46 *dest_sa46 = NULL;
+			struct lws *nwsi_quic = lws_get_quic_network_wsi(wsi);
+			int is_client = nwsi_quic ? lwsi_role_client(nwsi_quic) : lwsi_role_client(wsi);
+
+			if (!is_client) {
+				if (has_packet_dest)
+					dest_sa46 = &packet_dest_sa46;
+				else if (wsi->udp)
+					dest_sa46 = &wsi->udp->sa46;
+				else if (wsi->mux_substream && wsi->mux.parent_wsi && wsi->mux.parent_wsi->udp)
+					dest_sa46 = &wsi->mux.parent_wsi->udp->sa46;
+			}
+
+#if defined(LWS_WITH_SERVER)
+			if (!is_client && dest_sa46) {
+				/*
+				 * Family-aware egress: if the peer migrated to
+				 * the other address family, the listener that
+				 * accepted the connection can't reach the new
+				 * path.  Send via the vhost's QUIC listener
+				 * bound to the destination's family.
+				 */
+				struct lws *lw = wsi->mux_substream ?
+							wsi->mux.parent_wsi : wsi;
+
+				if (lw && lw->udp &&
+				    lw->udp->sa46.sa4.sin_family !=
+					    dest_sa46->sa4.sin_family)
+					fd = lws_quic_server_egress_fd(
+							wsi->a.vhost,
+							dest_sa46->sa4.sin_family,
+							fd);
+			}
+#endif
+
+#if defined(WIN32) || defined(_WIN32)
+			if (dest_sa46)
+				n = sendto(fd, (const char *)pkt, (int)send_len, 0,
+					   sa46_sockaddr(dest_sa46), sa46_socklen(dest_sa46));
+			else
+				n = send(fd, (const char *)pkt, (int)send_len, 0);
+#else
+			if (dest_sa46)
+				n = (int)sendto(fd, (const void *)pkt, send_len, 0,
+						sa46_sockaddr(dest_sa46), sa46_socklen(dest_sa46));
+			else
+				n = (int)send(fd, (const void *)pkt, send_len, 0);
+#endif
+			if (n < 0) {
+				lwsl_warn("QUIC TX: sendto/send failed: returned %d, errno=%d\n", n, LWS_ERRNO);
+			}
+		}
+		if (n < 0) {
+			int e = LWS_ERRNO;
+			if (e == LWS_EAGAIN || e == LWS_EWOULDBLOCK || e == LWS_EINTR
+#if defined(EPIPE)
+			    || e == EPIPE
+#endif
+#if defined(EHOSTUNREACH)
+			    || e == EHOSTUNREACH
+#endif
+#if defined(ENETDOWN)
+			    || e == ENETDOWN
+#endif
+#if defined(ENETUNREACH)
+			    || e == ENETUNREACH
+#endif
+#if defined(EADDRNOTAVAIL)
+			    || e == EADDRNOTAVAIL
+#endif
+#if defined(EDESTADDRREQ)
+			    || e == EDESTADDRREQ
+#endif
+#if defined(ENOBUFS)
+			    || e == ENOBUFS
+#endif
+			) {
+				lwsl_wsi_info(wsi, "QUIC TX: UDP socket EAGAIN/transient error, errno=%d. Pausing send.", e);
+				
+				/* 
+				 * The OS UDP socket buffer is full. We cannot send this packet.
+				 * We MUST NOT pretend it was sent, because it would move to in_flight
+				 * and wait for a PTO timer to retransmit, causing massive stalls.
+				 * Instead, we keep the frames in pending_tx, and stop sending.
+				 * The OS will wake us up with POLLOUT when the socket drains.
+				 */
+				struct lws_dll2 *d = qn->in_flight[level].tail;
+				while (d) {
+					struct lws_quic_tx_frame *f = lws_container_of(d, struct lws_quic_tx_frame, list);
+					if (f->sent_in_pn == my_pn) {
+						struct lws_dll2 *prev = d->prev;
+						lws_dll2_remove(d);
+						f->sent_in_pn = 0;
+						f->sent_time_us = 0;
+						f->wire_len = 0;
+						/* Push to head so it is sent first next time */
+						lws_dll2_add_head(&f->list, &qn->pending_tx[level]);
+						d = prev;
+					} else {
+						break;
+					}
+				}
+				
+				/* Revert PN */
+				qn->keys[level]->pn_tx--;
+				
+				/* Since we are stopping the send loop, we should keep POLLOUT enabled! */
+				blocked = 1;
+				eagain_blocked = 1;
+				break;
+			} else {
+				lwsl_wsi_err(wsi, "QUIC TX: Write failed, errno=%d", e);
+				return LWS_HP_RET_BAIL_OK;
+			}
+		}
+
+		qn->bytes_sent += (uint64_t)n;
+
+		/* Find the first frame we sent in this packet to attach wire_len to */
+		int ack_eliciting = 0;
+		if (qn->in_flight[level].tail) {
+			/* Start from the end, which is the most recently added frame */
+			lws_start_foreach_dll(struct lws_dll2 *, d, qn->in_flight[level].tail) {
+				struct lws_quic_tx_frame *f = lws_container_of(d, struct lws_quic_tx_frame, list);
+				if (f->sent_in_pn == my_pn) {
+					f->wire_len = send_len;
+					ack_eliciting = 1;
+					break;
+				}
+				/* If we find a different PN, we didn't add any frames for this packet */
+				if (f->sent_in_pn != my_pn)
+					break;
+			} lws_end_foreach_dll(d);
+		}
+
+		if (ack_eliciting) {
+			if (qn->pto_probe_needed > 0)
+				qn->pto_probe_needed--;
+			if (qn->cc_ops && qn->cc_ops->on_sent)
+				qn->cc_ops->on_sent(wsi, send_len);
+		}
+
+		/*
+		 * If we still have pending frames we couldn't fit, request another POLLOUT
+		 */
+		if (qn->pending_tx[level].count) {
+			lws_callback_on_writable(wsi);
+		}
+            
+		/*
+		 * If we successfully sent application-level data, the pending_tx buffer
+		 * has shrunk. We MUST wake up the child streams because they may have
+		 * been stalled by the application-layer pacing throttle in tx_credit!
+		 */
+		if (level == LWS_QUIC_LEVEL_APP) {
+			lws_start_foreach_dll(struct lws_dll2 *, d,
+					wsi->mux.child_list_owner.head) {
+				struct lws *w = lws_container_of(d, struct lws,
+								 mux.sibling_list);
+				if (w->mux.requested_POLLOUT)
+					lws_callback_on_writable(w);
+			}
+			lws_end_foreach_dll(d);
+		}
+	}
+
+	/* If we handled all pending crypto/internal frames, give the user a chance to write */
+	struct lws *nwsi = lws_get_quic_network_wsi(wsi);
+	/* Process stream queues for Application (1-RTT) and Early (0-RTT) data */
+	if (qn && (qn->handshake_done || qn->early_data_status == LWS_0RTT_STATUS_ATTEMPTED || qn->early_data_status == LWS_0RTT_STATUS_ACCEPTED)) {
+		if (lws_wsi_txc_check_skint(&wsi->txc, (int32_t)wsi->txc.tx_cr))
+			goto end_children;
+		if (nwsi && lws_wsi_txc_check_skint(&nwsi->txc, (int32_t)nwsi->txc.tx_cr))
+			goto end_children;
+
+		/*
+		 * Fair-share POLLOUT service, forward walk.  We visit each child
+		 * once per pass; the lws_start_foreach_dll_safe iterator caches
+		 * next before the body, so moving the current node to the tail
+		 * (fair-share rotation) or removing it (close) is safe and the
+		 * walk still terminates after every node present at pass start
+		 * has been seen.  Nodes a callback adds or re-arms are behind
+		 * the cursor and get picked up on a future pass.
+		 *
+		 * The connection-level credit guard is post-tested (first
+		 * iteration skips it) so we always service at least one child
+		 * per POLLOUT; per-stream throttling below (usable_credit and
+		 * lws_wsi_txc_check_skint) still breaks/re-arms correctly.
+		 */
+		int first_iteration = 1;
+		lws_start_foreach_dll_safe(struct lws_dll2 *, d, d1,
+				wsi->mux.child_list_owner.head) {
+			struct lws *w = lws_container_of(d, struct lws,
+							 mux.sibling_list);
+
+			if (!first_iteration &&
+			    (wsi->txc.tx_cr <= 0 ||
+			     (nwsi && nwsi->txc.tx_cr <= 0)))
+				break;
+			first_iteration = 0;
+
+			if (!w->mux.requested_POLLOUT)
+				continue;	/* not interested; leave in place */
+
+			/* fair-share: move this child to the tail before servicing.
+			 * The cached d1 (next) stays valid across the relocate. */
+			lws_dll2_remove(&w->mux.sibling_list);
+			lws_dll2_add_tail(&w->mux.sibling_list,
+					  &wsi->mux.child_list_owner);
+
+			int is_peer_initiated = (w->mux.my_sid & 1) != (qn->is_server ? 1 : 0);
+			int is_unidiri = (w->mux.my_sid & 2);
+			if (is_peer_initiated && is_unidiri) {
+				w->mux.requested_POLLOUT = 0;
+				continue;
+			}
+
+			int32_t usable_credit = w->txc.tx_cr;
+			if (lws_rops_fidx(w->role_ops, LWS_ROPS_tx_credit)) {
+				usable_credit = lws_rops_func_fidx(w->role_ops, LWS_ROPS_tx_credit).
+							tx_credit(w, LWSTXCR_US_TO_PEER, 0);
+			}
+
+			/* Check for actual flow control exhaustion */
+			if (lws_wsi_txc_check_skint(&w->txc, w->txc.tx_cr)) {
+				if (!w->quic.tx_blocked_sent) {
+					struct lws_quic_tx_frame *f_sdb = lws_zalloc(sizeof(*f_sdb), "quic sdb");
+					if (f_sdb) {
+						f_sdb->type = LWS_QUIC_FT_STREAM_DATA_BLOCKED;
+						f_sdb->stream_id = w->mux.my_sid;
+						f_sdb->limit = w->quic.qs ? w->quic.qs->tx_offset : 0;
+						lws_quic_dbg_1rtt_account(qn, f_sdb, "stream-data-blocked-fairshare");
+						lws_dll2_add_head(&f_sdb->list, &qn->pending_tx[LWS_QUIC_LEVEL_APP]);
+					}
+					w->quic.tx_blocked_sent = 1;
+					lws_callback_on_writable(wsi);
+				}
+				if (lwsi_state(w) != LRS_FLUSHING_BEFORE_CLOSE) {
+					w->mux.requested_POLLOUT = 0;
+					continue;
+				}
+			}
+
+			/* Check for local throttling (e.g., pending_tx queue full) */
+			if (usable_credit <= 0 && lwsi_state(w) != LRS_FLUSHING_BEFORE_CLOSE) {
+				w->mux.requested_POLLOUT = 1;
+				break;
+			}
+
+			w->mux.requested_POLLOUT = 0;
+
+			if (lws_rops_fidx(w->role_ops, LWS_ROPS_perform_user_POLLOUT)) {
+				if (lws_rops_func_fidx(w->role_ops, LWS_ROPS_perform_user_POLLOUT).
+								perform_user_POLLOUT(w) == -1) {
+					/* if the cb didn't already close w, close it */
+					if (!lws_dll2_is_detached(&w->mux.sibling_list))
+						lws_close_free_wsi(w, LWS_CLOSE_STATUS_NOSTATUS, "quic child write close");
+				}
+			} else {
+				if (lws_callback_as_writeable(w)) {
+					if (!lws_dll2_is_detached(&w->mux.sibling_list))
+						lws_close_free_wsi(w, LWS_CLOSE_STATUS_NOSTATUS, "quic child write close");
+				}
+			}
+		} lws_end_foreach_dll_safe(d, d1);
+
+end_children:
+		;
+		/* Give children output credits based on fair sharing */
+		int can_process_children = ((qn->handshake_done || qn->early_data_status == LWS_0RTT_STATUS_ATTEMPTED || qn->early_data_status == LWS_0RTT_STATUS_ACCEPTED) && wsi->txc.tx_cr > 0 && (!nwsi || nwsi->txc.tx_cr > 0));
+		int have_pending_tx = 0;
+		for (level = 0; level < LWS_QUIC_LEVEL_COUNT; level++) {
+			if (qn->pending_tx[level].count && qn->keys[level] && qn->keys[level]->el_hp_tx.len) {
+				have_pending_tx = 1;
+				break;
+			}
+		}
+
+		if (!blocked && can_process_children) {
+			if (lws_wsi_mux_action_pending_writeable_reqs(wsi))
+				return LWS_HP_RET_BAIL_DIE;
+
+			for (level = 0; level < LWS_QUIC_LEVEL_COUNT; level++) {
+				if (qn->pending_tx[level].count && qn->keys[level] && qn->keys[level]->el_hp_tx.len) {
+					have_pending_tx = 1;
+					break;
+				}
+			}
+		}
+
+		int children_need_POLLOUT = 0;
+		{
+			lws_start_foreach_dll(struct lws_dll2 *, d,
+					wsi->mux.child_list_owner.head) {
+				struct lws *w_child = lws_container_of(d,
+						struct lws, mux.sibling_list);
+				if (w_child->mux.requested_POLLOUT) {
+					children_need_POLLOUT = 1;
+					break;
+				}
+			}
+			lws_end_foreach_dll(d);
+		}
+
+		if (((blocked && !eagain_blocked) || !have_pending_tx) && !children_need_POLLOUT) {
+			/* We are blocked by QUIC limits, or have nothing to send right now.
+			 * Stop asking the OS for POLLOUT. We will re-enable it if children
+			 * need to write. */
+			if (lws_change_pollfd(wsi, LWS_POLLOUT, 0))
+				return LWS_HP_RET_BAIL_DIE;
+		}
+                
+		{
+			/*
+			 * Same reentrancy-safe situation as the post-RX loop
+			 * above; the dll2 _safe iterator keeps the cached next
+			 * valid across the close (which detaches via
+			 * lws_dll2_remove).
+			 */
+			lws_start_foreach_dll_safe(struct lws_dll2 *, d, d1,
+					wsi->mux.child_list_owner.head) {
+				struct lws *w = lws_container_of(d,
+						struct lws, mux.sibling_list);
+
+				if (w->quic.qs && w->quic.qs->close_after_rx)
+					lws_close_free_wsi(w,
+						LWS_CLOSE_STATUS_NOSTATUS,
+						"quic post tx stream close");
+			} lws_end_foreach_dll_safe(d, d1);
+		}
+
+		if (have_pending_tx)
+			return LWS_HP_RET_BAIL_OK;
+
+		/*
+		 * Check if any child still needs writeable service.
+		 * lws_wsi_mux_action_pending_writeable_reqs() may have
+		 * re-enabled POLLOUT on the fd, but the caller in service.c
+		 * will drop it again if we return LWS_HP_RET_DROP_POLLOUT.
+		 * This happens when children transition to LRS_ISSUING_FILE
+		 * and call lws_callback_on_writable() — they need another
+		 * POLLOUT cycle to call lws_serve_http_file_fragment().
+		 */
+		{
+			lws_start_foreach_dll(struct lws_dll2 *, d,
+					wsi->mux.child_list_owner.head) {
+				struct lws *w = lws_container_of(d, struct lws,
+								 mux.sibling_list);
+				if (w->mux.requested_POLLOUT)
+					return LWS_HP_RET_BAIL_OK;
+			}
+			lws_end_foreach_dll(d);
+		}
+	}
+
+	return LWS_HP_RET_DROP_POLLOUT;
+	}
+
+static int
+rops_write_role_protocol_quic(struct lws *wsi, unsigned char *buf, size_t len,
+                              enum lws_write_protocol *wp)
+{
+	struct lws *nwsi = lws_get_quic_network_wsi(wsi);
+	struct lws_quic_netconn *qn = nwsi ? nwsi->quic.qn : wsi->quic.qn;
+	struct lws_quic_tx_frame *f;
+
+	if (!qn)
+		return -1;
+
+	if (len == 0 && !((*wp) & LWS_WRITE_H2_STREAM_END)) {
+		return 0;
+	}
+
+	/* Enforce stream and connection flow control limits */
+	if (len > 0) {
+		int did_enqueue = 0;
+		if (wsi->txc.tx_cr <= 0 && !wsi->quic.tx_blocked_sent) {
+			/* Generate STREAM_DATA_BLOCKED */
+			struct lws_quic_tx_frame *f_sdb = lws_zalloc(sizeof(*f_sdb), "quic sdb");
+			if (f_sdb) {
+				f_sdb->type = LWS_QUIC_FT_STREAM_DATA_BLOCKED;
+				f_sdb->stream_id = wsi->mux.my_sid;
+				f_sdb->limit = wsi->quic.qs ? wsi->quic.qs->tx_offset : 0;
+				lws_quic_dbg_1rtt_account(qn, f_sdb, "stream-data-blocked");
+				lws_dll2_add_head(&f_sdb->list, &qn->pending_tx[LWS_QUIC_LEVEL_APP]);
+			}
+			wsi->quic.tx_blocked_sent = 1;
+			did_enqueue = 1;
+		}
+
+		if (nwsi && nwsi != wsi && nwsi->txc.tx_cr <= 0 && !nwsi->quic.tx_blocked_sent) {
+			/* Generate DATA_BLOCKED */
+			struct lws_quic_tx_frame *f_db = lws_zalloc(sizeof(*f_db), "quic db");
+			if (f_db) {
+				f_db->type = LWS_QUIC_FT_DATA_BLOCKED;
+				f_db->limit = qn->tx_conn_offset;
+				lws_quic_dbg_1rtt_account(qn, f_db, "data-blocked");
+				lws_dll2_add_head(&f_db->list, &qn->pending_tx[LWS_QUIC_LEVEL_APP]);
+			}
+			nwsi->quic.tx_blocked_sent = 1;
+			did_enqueue = 1;
+		}
+
+		/* Kick output to send these control frames */
+		if (did_enqueue)
+			lws_callback_on_writable(nwsi ? nwsi : wsi);
+	}
+
+	f = lws_zalloc(sizeof(*f) + len, "quic tx frame");
+	if (!f)
+		return -1;
+
+	f->data = (uint8_t *)&f[1];
+	f->len = len;
+	memcpy(f->data, buf, len);
+
+	if (((*wp) & 0x1f) == LWS_WRITE_QUIC_DATAGRAM) {
+		/* It's a DATAGRAM frame */
+		f->type = LWS_QUIC_FT_DATAGRAM + 1; /* with LEN */
+		f->stream_id = 0; /* Datagrams aren't attached to a stream ID */
+		f->offset = 0;
+	} else {
+		f->type = LWS_QUIC_FT_STREAM | 0x02 | 0x04; /* STREAM | OFF | LEN */
+		if (((*wp) & LWS_WRITE_H2_STREAM_END) ||
+		    ((*wp) & 0x1f) == LWS_WRITE_HTTP_FINAL) {
+			f->type |= 0x01; /* FIN */
+			if (wsi->quic.qs) {
+				wsi->quic.qs->sent_fin = 1;
+				if (wsi->quic.qs->is_unidirectional || wsi->quic.qs->fin_received) {
+					wsi->quic.qs->close_after_rx = 1;
+				}
+			}
+		}
+
+		if (!wsi->quic.qs) {
+			lwsl_wsi_err(wsi, "QUIC: Cannot send stream data without a quic stream structure!");
+			lws_free(f);
+			return -1;
+		}
+		f->stream_id = wsi->quic.qs->stream_id;
+		f->offset = wsi->quic.qs->tx_offset;
+		wsi->quic.qs->tx_offset += len;
+
+		/* Deduct credit here so current_max calculations work correctly */
+		wsi->txc.tx_cr -= (int)len;
+		if (nwsi) {
+			nwsi->txc.tx_cr -= (int)len;
+			qn->tx_conn_offset += len;
+		}
+	}
+
+	wsi->quic.tx_blocked_sent = 0;
+	if (nwsi && nwsi != wsi)
+		nwsi->quic.tx_blocked_sent = 0;
+
+	/* Stream frames usually go in Application level, but check for 0-RTT */
+	int tx_level = LWS_QUIC_LEVEL_APP;
+	if (!qn->is_server && !qn->handshake_done &&
+	    qn->early_data_status == LWS_0RTT_STATUS_ATTEMPTED &&
+	    wsi->quic.qs && wsi->quic.qs->opted_into_early_data) {
+		tx_level = LWS_QUIC_LEVEL_EARLY;
+	}
+
+	if (tx_level == LWS_QUIC_LEVEL_APP)
+		lws_quic_dbg_1rtt_account(qn, f, "stream-write");
+	lws_dll2_add_tail(&f->list, &qn->pending_tx[tx_level]);
+
+	/* Wake up the event loop to send the packet */
+	lws_callback_on_writable(wsi);
+
+	return (int)len;
+}
+
+#if defined(LWS_WITH_CLIENT)
+static int
+rops_client_bind_quic(struct lws *wsi, const struct lws_client_connect_info *i)
+{
+	if (!i) {
+		/* finalize */
+		if (!wsi->user_space && wsi->stash && wsi->stash->cis[CIS_METHOD])
+			if (lws_ensure_user_space(wsi))
+				return 0;
+		return 0;
+	}
+
+	if ((i->method && !strcmp(i->method, "QUIC")) ||
+	    (i->alpn && !strcmp(i->alpn, "h3"))) {
+		struct lws_quic_cid dcid;
+
+		if (!wsi->udp) {
+			wsi->udp = lws_malloc(sizeof(*wsi->udp), "udp struct");
+			if (!wsi->udp)
+				return 1;
+			memset(wsi->udp, 0, sizeof(*wsi->udp));
+		}
+
+		/* Allocate QUIC netconn for client! */
+                if (!wsi->quic.qn) {
+                        wsi->quic.qn = lws_zalloc(sizeof(*wsi->quic.qn), "quic_netconn");
+			if (!wsi->quic.qn)
+				return 1;
+		}
+
+		wsi->quic.qn->nwsi = wsi;
+		wsi->quic.qn->is_server = 0;
+		wsi->quic.qn->next_stream_id_bidi_local = 0;
+		wsi->quic.qn->next_stream_id_unidi_local = 2;
+		wsi->quic.qn->version = LWS_QUIC_VERSION_1;
+		wsi->quic.qn->original_version = LWS_QUIC_VERSION_1;
+		wsi->quic.qn->max_streams_bidi_local = 1000;
+		wsi->quic.qn->max_streams_unidi_local = 1000;
+		wsi->quic.qn->peer_ack_delay_exponent = 3;
+		/* RFC 9000 §13.2.1 default max_ack_delay cap for delayed ACKs */
+		wsi->quic.qn->ack_delay_us = 25 * LWS_US_PER_MS;
+
+		wsi->quic.qn->current_mtu = 1280;
+		wsi->quic.qn->probed_mtu = 1380; /* first probe size */
+		wsi->quic.qn->pmtud_probe_pn = LWS_QUIC_PMTUD_PROBE_NONE;
+		wsi->quic.qn->pmtud_state = 1; /* SEARCHING */
+
+		if (wsi->a.context->quic_cc_ops)
+			wsi->quic.qn->cc_ops = wsi->a.context->quic_cc_ops;
+		else
+			wsi->quic.qn->cc_ops = &lws_cc_ops_newreno;
+
+		if (wsi->quic.qn->cc_ops->init)
+			wsi->quic.qn->cc_ops->init(wsi);
+
+		/* Initialize Flow Control Credits */
+		int32_t init_cr = i->manual_initial_tx_credit;
+		if (!init_cr)
+			init_cr = 65535;
+		wsi->txc.peer_tx_cr_est = init_cr;
+		wsi->txc.tx_cr = init_cr;
+		
+		wsi->quic.qn->rx_max_data = LWS_QUIC_DEFAULT_WINDOW;
+		wsi->quic.qn->advertised_rx_max_data = LWS_QUIC_DEFAULT_WINDOW;
+		wsi->quic.qn->rx_window_size = LWS_QUIC_DEFAULT_WINDOW;
+		wsi->quic.qn->last_rx_update_us = lws_now_usecs();
+
+		/* Generate random CIDs */
+		dcid.len = 8;
+		if (lws_get_random(wsi->a.context, dcid.id, 8) != 8) return 1;
+		wsi->quic.qn->rem_cid = dcid;
+
+		wsi->quic.qn->loc_cid.len = 8;
+		if (lws_get_random(wsi->a.context, wsi->quic.qn->loc_cid.id, 8) != 8) return 1;
+
+		/* Derive Initial Keys */
+		if (lws_quic_derive_initial_keys(wsi, &dcid)) {
+			lwsl_wsi_err(wsi, "Failed to derive initial keys");
+			return 1;
+		}
+
+		{
+			uint8_t *local_tp_buf = lws_malloc(4096, "quic tp scratch");
+			if (!local_tp_buf) {
+				lwsl_wsi_err(wsi, "OOM allocating tp scratch buffer");
+				return 1;
+			}
+			uint8_t *tp = local_tp_buf;
+			uint8_t *tp_end = tp + 4096;
+
+#define LWS_QUIC_WRITE_TP_VARINT(_id, _val) \
+	do { \
+		int _vlen; \
+		if (lws_ptr_diff_size_t(tp_end, tp) < 2) goto tp_overflow2; \
+		*tp++ = (_id); \
+		_vlen = (int)lws_quic_write_varint(tp + 1, lws_ptr_diff_size_t(tp_end, tp + 1), (_val)); \
+		if (!_vlen) goto tp_overflow2; \
+		*tp++ = (uint8_t)_vlen; \
+		tp += _vlen; \
+	} while (0)
+
+#define LWS_QUIC_WRITE_TP_BUF(_id, _buf, _len) \
+	do { \
+		if (lws_ptr_diff_size_t(tp_end, tp) < (size_t)(2 + (_len))) goto tp_overflow2; \
+		*tp++ = (_id); \
+		*tp++ = (uint8_t)(_len); \
+		memcpy(tp, (_buf), (_len)); \
+		tp += (_len); \
+	} while (0)
+
+			LWS_QUIC_WRITE_TP_VARINT(0x04, 1048576);
+			LWS_QUIC_WRITE_TP_VARINT(0x05, 1048576);
+			LWS_QUIC_WRITE_TP_VARINT(0x06, 1048576);
+			LWS_QUIC_WRITE_TP_VARINT(0x07, 1048576);
+			LWS_QUIC_WRITE_TP_VARINT(0x08, wsi->quic.qn->max_streams_bidi_local);
+			LWS_QUIC_WRITE_TP_VARINT(0x09, wsi->quic.qn->max_streams_unidi_local);
+			LWS_QUIC_WRITE_TP_VARINT(0x20, 65535);
+			LWS_QUIC_WRITE_TP_VARINT(0x01, 30000);
+
+			LWS_QUIC_WRITE_TP_BUF(0x0F, wsi->quic.qn->loc_cid.id, wsi->quic.qn->loc_cid.len);
+                        if (wsi->a.context->options & LWS_SERVER_OPTION_QUIC_LATEST_VERSION) {
+                                uint8_t vi_buf[12];
+                                vi_buf[0] = (uint8_t)(LWS_QUIC_VERSION_1 >> 24);
+                                vi_buf[1] = (uint8_t)(LWS_QUIC_VERSION_1 >> 16);
+                                vi_buf[2] = (uint8_t)(LWS_QUIC_VERSION_1 >> 8);
+                                vi_buf[3] = (uint8_t)(LWS_QUIC_VERSION_1);
+                                vi_buf[4] = (uint8_t)(LWS_QUIC_VERSION_1 >> 24);
+                                vi_buf[5] = (uint8_t)(LWS_QUIC_VERSION_1 >> 16);
+                                vi_buf[6] = (uint8_t)(LWS_QUIC_VERSION_1 >> 8);
+                                vi_buf[7] = (uint8_t)(LWS_QUIC_VERSION_1);
+                                vi_buf[8] = (uint8_t)(LWS_QUIC_VERSION_2 >> 24);
+                                vi_buf[9] = (uint8_t)(LWS_QUIC_VERSION_2 >> 16);
+                                vi_buf[10] = (uint8_t)(LWS_QUIC_VERSION_2 >> 8);
+                                vi_buf[11] = (uint8_t)(LWS_QUIC_VERSION_2);
+                                LWS_QUIC_WRITE_TP_BUF(0x11, vi_buf, 12);
+                        }
+
+			lws_tls_quic_set_transport_parameters(wsi, local_tp_buf, (size_t)(tp - local_tp_buf));
+			lws_free(local_tp_buf);
+			goto tp_ok2;
+tp_overflow2:
+			lws_free(local_tp_buf);
+			lwsl_wsi_err(wsi, "QUIC TX: tp buffer overflow");
+			return 1;
+tp_ok2:
+			;
+#undef LWS_QUIC_WRITE_TP_VARINT
+#undef LWS_QUIC_WRITE_TP_BUF
+		}
+
+		lws_role_transition(wsi, LWSIFR_CLIENT, LRS_UNCONNECTED, &role_ops_quic);
+		lws_callback_on_writable(wsi);
+		return 1;
+	}
+	return 0;
+}
+#endif
+
+static int
+rops_adoption_bind_quic(struct lws *wsi, int type, const char *vh_prot_name)
+{
+	if (!(type & LWS_ADOPT_FLAG_UDP))
+		return 0;
+
+	if ((wsi->a.vhost && wsi->a.vhost->listen_accept_role &&
+	     !strcmp(wsi->a.vhost->listen_accept_role, "quic")) ||
+	    (vh_prot_name && !strcmp(vh_prot_name, "quic")) ||
+	    (wsi->role_ops == &role_ops_quic)) {
+#if defined(LWS_WITH_UDP)
+		if (!wsi->udp) {
+			wsi->udp = lws_malloc(sizeof(*wsi->udp), "udp struct");
+			if (!wsi->udp)
+				return 0;
+			memset(wsi->udp, 0, sizeof(*wsi->udp));
+		}
+#endif
+
+		/* Configure socket for ECN (Explicit Congestion Notification) */
+#if !defined(WIN32) && !defined(_WIN32)
+                int opt = 1;
+                (void)opt;
+#if defined(IP_RECVTOS)
+                if (setsockopt(wsi->desc.sockfd, IPPROTO_IP, IP_RECVTOS, &opt, sizeof(opt)))
+                    lwsl_wsi_info(wsi, "setsockopt IP_RECVTOS failed\n");
+#endif
+#if defined(LWS_WITH_IPV6)
+#if defined(IPV6_RECVTCLASS)
+                if (setsockopt(wsi->desc.sockfd, IPPROTO_IPV6, IPV6_RECVTCLASS, &opt, sizeof(opt)))
+                    lwsl_wsi_info(wsi, "setsockopt IPV6_RECVTCLASS failed\n");
+#endif
+#endif
+                /* Send ECT(0) (0x02) on outgoing QUIC packets */
+                int tos = 0x02;
+                (void)tos;
+#if defined(IP_TOS)
+                if (setsockopt(wsi->desc.sockfd, IPPROTO_IP, IP_TOS, &tos, sizeof(tos)))
+                    lwsl_wsi_info(wsi, "setsockopt IP_TOS failed\n");
+#endif
+#if defined(LWS_WITH_IPV6)
+#if defined(IPV6_TCLASS)
+                if (setsockopt(wsi->desc.sockfd, IPPROTO_IPV6, IPV6_TCLASS, &tos, sizeof(tos)))
+                    lwsl_wsi_info(wsi, "setsockopt IPV6_TCLASS failed\n");
+#endif
+#endif
+#endif
+
+		/* Initialize Flow Control Credits */
+		int32_t init_cr = wsi->txc.manual_initial_tx_credit;
+		if (!init_cr)
+			init_cr = 65535;
+		wsi->txc.peer_tx_cr_est = init_cr;
+		wsi->txc.tx_cr = init_cr;
+
+		lws_role_transition(wsi, LWSIFR_SERVER, LRS_ESTABLISHED, &role_ops_quic);
+		lws_bind_protocol(wsi, wsi->a.protocol, __func__);
+
+		if ((type & _LWS_ADOPT_FINISH) && wsi->do_bind) {
+			wsi->listener = 1;
+#if defined(LWS_WITH_SERVER)
+			if (!wsi->listen_list.owner)
+				lws_dll2_add_tail(&wsi->listen_list, &wsi->a.vhost->listen_wsi);
+#endif
+		}
+
+		return 1;
+	}
+	return 0;
+}
+
+static int
+rops_callback_on_writable_quic(struct lws *wsi)
+{
+	struct lws *nwsi = lws_get_quic_network_wsi(wsi);
+
+	if (!nwsi) return 0;
+
+	/* Mark the entire parent chain as needing POLLOUT */
+	lws_wsi_mux_mark_parents_needing_writeable(wsi);
+
+	return 0; /* not handled, let core enable socket POLLOUT */
+}
+
+void
+lws_quic_stream_cleanup(struct lws *wsi)
+{
+	struct lws *nwsi = wsi;
+	while (nwsi && !nwsi->quic.qn) {
+		nwsi = nwsi->mux.parent_wsi;
+	}
+	struct lws_quic_netconn *qn = nwsi ? nwsi->quic.qn : NULL;
+	int i;
+
+	if (!wsi->quic.qs)
+		return;
+
+	/* 1. Free RX chunks */
+	lws_start_foreach_dll_safe(struct lws_dll2 *, d, d1, wsi->quic.qs->rx_chunks.head) {
+		struct lws_quic_rx_chunk *c = lws_container_of(d, struct lws_quic_rx_chunk, list);
+		lws_dll2_remove(&c->list);
+		lws_free(c);
+	} lws_end_foreach_dll_safe(d, d1);
+
+	/* 2. Purge pending and in-flight TX frames for this stream from parent network connection */
+	if (qn) {
+		uint64_t sid = wsi->quic.qs->stream_id;
+
+		/*
+		 * Work out which stream directions are still incomplete at
+		 * close, so we can do the right thing per direction:
+		 *
+		 *  tx_reset:  our own sending side never completed.  We must
+		 *             abandon it with RESET_STREAM, and drop anything
+		 *             of ours still queued or in flight for it.
+		 *  stop_peer: the peer's sending side never completed, and we
+		 *             are closing the stream anyway, so ask them to
+		 *             stop sending the rest.
+		 *
+		 * These are independent: a server that answers a POST without
+		 * draining the request body completes its own response side
+		 * cleanly (no RESET_STREAM, response frames must still go out)
+		 * while the peer is still mid-body (STOP_SENDING applies).
+		 */
+		int is_unidirectional = (sid & 2) != 0;
+		int is_remote_initiated = (qn->is_server && (sid & 1) == 0) || (!qn->is_server && (sid & 1) == 1);
+		int we_are_sender = (qn->is_server == is_remote_initiated) ? 1 : 0;
+		int tx_reset, stop_peer;
+
+		if (is_unidirectional) {
+			/* only one side is the sender on a unidi stream */
+			we_are_sender = is_remote_initiated ? 0 : 1;
+			tx_reset  = we_are_sender && !wsi->quic.qs->sent_fin;
+			stop_peer = !we_are_sender && !wsi->quic.qs->fin_received;
+		} else {
+			tx_reset  = !wsi->quic.qs->sent_fin;
+			stop_peer = !wsi->quic.qs->fin_received;
+		}
+
+		/* If we're abandoning our own sending side, notify the peer */
+		if (tx_reset) {
+			/*
+			 * If we started sending a response (HEADERS went out)
+			 * but never sent our FIN (== h3 END_STREAM), and this
+			 * isn't an immortal SSE / long-poll stream, the response
+			 * was incomplete -- usually a headers-only response
+			 * written without LWS_WRITE_H2_STREAM_END.  Warn so the
+			 * user-code bug is visible even when the peer (or the
+			 * network) beat the PENDING_TIMEOUT_HTTP_RESPONSE
+			 * watchdog to closing the stream.
+			 */
+			if (wsi->http.sent_response_headers &&
+			    !wsi->quic.qs->sent_fin && !wsi->mux_stream_immortal &&
+			    /*
+			     * Only the server response side can be "user code
+			     * left the response incomplete": client streams also
+			     * get sent_response_headers set when they write
+			     * their request HEADERS, and a client need not have
+			     * sent FIN when the transaction completes cleanly
+			     */
+			    lwsi_role_server(wsi))
+				lwsl_wsi_warn(wsi, "h3 stream closed with response "
+					      "headers sent but no END_STREAM "
+					      "(incomplete response; user code "
+					      "likely wrote a headers-only response "
+					      "without LWS_WRITE_H2_STREAM_END), "
+					      "protocol=%s, uri=\"%s\"",
+					      wsi->a.protocol ?
+						      wsi->a.protocol->name :
+						      "none",
+					      lws_wsi_request_uri(wsi) ?
+						      lws_wsi_request_uri(wsi) : "");
+
+			/* Send RESET_STREAM to notify the peer that we're abandoning the stream */
+			struct lws_quic_tx_frame *f_reset = lws_zalloc(sizeof(*f_reset), "quic reset");
+			if (f_reset) {
+				f_reset->type = LWS_QUIC_FT_RESET_STREAM;
+				f_reset->stream_id = sid;
+				f_reset->offset = 0; /* app error code */
+				f_reset->limit = wsi->quic.qs->tx_offset; /* final size */
+				lws_quic_dbg_1rtt_account(qn, f_reset, "reset-stream");
+				lws_dll2_add_head(&f_reset->list, &qn->pending_tx[LWS_QUIC_LEVEL_APP]);
+			}
+		}
+
+		/*
+		 * Send STOP_SENDING to tell the peer to stop sending data to
+		 * us.  This has to be queued at the TAIL: any frames for this
+		 * stream that are still queued ahead of it belong to our own,
+		 * cleanly-completed response and must reach the peer first.
+		 * If STOP_SENDING jumped ahead of them (as RESET_STREAM may,
+		 * above), the peer would tear the stream down on receipt and
+		 * discard the transaction we just finished delivering.
+		 */
+		if (stop_peer) {
+			struct lws_quic_tx_frame *f_stop = lws_zalloc(sizeof(*f_stop), "quic stop_sending");
+			if (f_stop) {
+				f_stop->type = LWS_QUIC_FT_STOP_SENDING;
+				f_stop->stream_id = sid;
+				f_stop->offset = 0; /* app error code */
+				lws_quic_dbg_1rtt_account(qn, f_stop, "stop-sending");
+				lws_dll2_add_tail(&f_stop->list, &qn->pending_tx[LWS_QUIC_LEVEL_APP]);
+			}
+		}
+
+		if ((tx_reset || stop_peer) && nwsi)
+			lws_callback_on_writable(nwsi);
+
+		/* If this was a remote-initiated stream, increase our limit and notify peer.
+		 *
+		 * Coalesce: scan the pending_tx queue for an existing MAX_STREAMS frame
+		 * of the same type and update its limit in place, rather than allocating
+		 * a new frame per closed stream.  With many concurrent streams (e.g. the
+		 * multiplexing QIR test with 1999 streams), the O(N) frame flood would
+		 * fill the TX queue and trigger PTO/congestion-window collapse.
+		 */
+		if (is_remote_initiated) {
+			uint8_t want_type = is_unidirectional ?
+				LWS_QUIC_FT_MAX_STREAMS_UNIDI : LWS_QUIC_FT_MAX_STREAMS_BIDI;
+			struct lws_quic_tx_frame *f_exist = NULL;
+
+			/* Increment our local limit first */
+			if (!is_unidirectional)
+				qn->max_streams_bidi_local++;
+			else
+				qn->max_streams_unidi_local++;
+
+			/* Look for an already-queued MAX_STREAMS frame to coalesce into */
+			lws_start_foreach_dll(struct lws_dll2 *, d,
+				lws_dll2_get_head(&qn->pending_tx[LWS_QUIC_LEVEL_APP])) {
+				struct lws_quic_tx_frame *f = lws_container_of(d,
+					struct lws_quic_tx_frame, list);
+				if (f->type == want_type) {
+					f_exist = f;
+					break;
+				}
+			} lws_end_foreach_dll(d);
+
+			if (f_exist) {
+				/* Update limit in the existing frame — no new allocation */
+				f_exist->limit = is_unidirectional ?
+					qn->max_streams_unidi_local :
+					qn->max_streams_bidi_local;
+			} else {
+				struct lws_quic_tx_frame *f_max =
+					lws_zalloc(sizeof(*f_max), "quic max strm");
+				if (f_max) {
+					f_max->stream_id = ~0ULL;
+					f_max->type = want_type;
+					f_max->limit = is_unidirectional ?
+						qn->max_streams_unidi_local :
+						qn->max_streams_bidi_local;
+					lws_dll2_add_tail(&f_max->list,
+						&qn->pending_tx[LWS_QUIC_LEVEL_APP]);
+				}
+			}
+			if (nwsi) lws_callback_on_writable(nwsi);
+		}
+
+		/*
+		 * Only drop our queued / in-flight frames for the stream if we
+		 * actually abandoned our own sending side with RESET_STREAM.
+		 * When only the peer's side is incomplete (eg, we answered a
+		 * POST without draining the body), our completed response
+		 * frames must still be delivered.
+		 */
+		if (tx_reset) {
+			for (i = 0; i < LWS_QUIC_LEVEL_COUNT; i++) {
+				/* Purge pending_tx */
+				lws_start_foreach_dll_safe(struct lws_dll2 *, d, d1, qn->pending_tx[i].head) {
+					struct lws_quic_tx_frame *f = lws_container_of(d, struct lws_quic_tx_frame, list);
+					int is_stream_frame = ((f->type & 0xf8) == LWS_QUIC_FT_STREAM) ||
+							      (f->type == LWS_QUIC_FT_MAX_STREAM_DATA) ||
+							      (f->type == LWS_QUIC_FT_STREAM_DATA_BLOCKED);
+					if (is_stream_frame && f->stream_id == sid) {
+						lws_dll2_remove(&f->list);
+						lws_free(f);
+					}
+				} lws_end_foreach_dll_safe(d, d1);
+
+				/* Purge in_flight */
+				lws_start_foreach_dll_safe(struct lws_dll2 *, d, d1, qn->in_flight[i].head) {
+					struct lws_quic_tx_frame *f = lws_container_of(d, struct lws_quic_tx_frame, list);
+					int is_stream_frame = ((f->type & 0xf8) == LWS_QUIC_FT_STREAM) ||
+							      (f->type == LWS_QUIC_FT_MAX_STREAM_DATA) ||
+							      (f->type == LWS_QUIC_FT_STREAM_DATA_BLOCKED);
+					if (is_stream_frame && f->stream_id == sid) {
+						if (qn->cc_ops && qn->cc_ops->on_discard)
+							qn->cc_ops->on_discard(nwsi, f->wire_len);
+						lws_dll2_remove(&f->list);
+						lws_free(f);
+					}
+				} lws_end_foreach_dll_safe(d, d1);
+			}
+		}
+	}
+
+	lws_free_set_NULL(wsi->quic.qs);
+}
+
+static int
+rops_close_kill_connection_quic(struct lws *wsi, enum lws_close_status reason)
+{
+	struct lws_quic_netconn *qn = wsi->quic.qn;
+	int i;
+
+	if (wsi->mux.child_list_owner.head)
+		lws_wsi_mux_close_children(wsi, (int)reason);
+
+	if (wsi->mux.parent_wsi) {
+		struct lws *nwsi = wsi->mux.parent_wsi;
+		lws_wsi_mux_sibling_disconnect(wsi);
+		if (lws_wsi_mux_child_count(nwsi) == 0 && nwsi->quic.qn)
+			lws_set_timeout(nwsi, PENDING_TIMEOUT_HTTP_KEEPALIVE_IDLE,
+					nwsi->a.vhost->keepalive_timeout ?
+					nwsi->a.vhost->keepalive_timeout : 5);
+	}
+
+	lws_quic_stream_cleanup(wsi);
+
+	if (!qn) {
+#if defined(LWS_WITH_UDP)
+		if (wsi->udp)
+			lws_free_set_NULL(wsi->udp);
+#endif
+		return 0;
+	}
+
+	/* If we are the network wsi, free the qn and all resources */
+	if (qn->nwsi == wsi) {
+		lws_sul_cancel(&qn->prefaddr_sul);
+		lws_sul_cancel(&qn->pto_sul);
+		lws_sul_cancel(&qn->pacer_sul);
+		lws_sul_cancel(&qn->ack_delay_sul);
+
+#if defined(LWS_ROLE_H3)
+		if (wsi->h3.h3n)
+			lws_free_set_NULL(wsi->h3.h3n);
+#endif
+
+		for (i = 0; i < LWS_QUIC_LEVEL_COUNT; i++) {
+			/* Free keys */
+			if (qn->keys[i]) {
+				lws_quic_keys_destroy(qn->keys[i]);
+				qn->keys[i] = NULL;
+			}
+
+			/* Free pending tx */
+			lws_start_foreach_dll_safe(struct lws_dll2 *, d, d1, qn->pending_tx[i].head) {
+				struct lws_quic_tx_frame *f = lws_container_of(d, struct lws_quic_tx_frame, list);
+				lws_dll2_remove(&f->list);
+				lws_free(f);
+			} lws_end_foreach_dll_safe(d, d1);
+
+			/* Free in flight */
+			lws_start_foreach_dll_safe(struct lws_dll2 *, d, d1, qn->in_flight[i].head) {
+				struct lws_quic_tx_frame *f = lws_container_of(d, struct lws_quic_tx_frame, list);
+				lws_dll2_remove(&f->list);
+				lws_free(f);
+			} lws_end_foreach_dll_safe(d, d1);
+
+			/* Free RX Crypto chunks */
+			lws_start_foreach_dll_safe(struct lws_dll2 *, d, d1, qn->rx_crypto_chunks[i].head) {
+				struct lws_quic_rx_chunk *c = lws_container_of(d, struct lws_quic_rx_chunk, list);
+				lws_dll2_remove(&c->list);
+				lws_free(c);
+			} lws_end_foreach_dll_safe(d, d1);
+		}
+
+		if (qn->cc_state)
+			lws_free_set_NULL(qn->cc_state);
+
+		for (int _i = 0; _i < 4; _i++) {
+			if (qn->crypto_rx_buf[_i]) {
+				lws_free(qn->crypto_rx_buf[_i]);
+				qn->crypto_rx_buf[_i] = NULL;
+			}
+		}
+
+		lws_free_set_NULL(wsi->quic.qn);
+	}
+
+#if defined(LWS_WITH_UDP)
+	if (wsi->udp)
+		lws_free_set_NULL(wsi->udp);
+#endif
+
+	return 0;
+}
+
+int
+rops_tx_credit_quic(struct lws *wsi, char peer_to_us, int add)
+{
+	struct lws *nwsi = lws_get_quic_network_wsi(wsi);
+	struct lws_quic_netconn *qn = nwsi ? nwsi->quic.qn : NULL;
+	int n;
+
+	if (!qn) {
+		return 0;
+	}
+
+	if (add) {
+		if (peer_to_us == LWSTXCR_PEER_TO_US) {
+			/* We want to tell the peer they can write an additional "add" bytes to us */
+			wsi->txc.peer_tx_cr_est += add;
+			nwsi->txc.peer_tx_cr_est += add;
+
+			lws_usec_t now = lws_now_usecs();
+
+			if (wsi->quic.qs) {
+				wsi->quic.qs->rx_max_data += (uint64_t)(add > 0 ? add : 0);
+				uint64_t ungranted = 0;
+				if (wsi->quic.qs->advertised_rx_max_data > wsi->quic.qs->highest_rx_offset)
+					ungranted = wsi->quic.qs->advertised_rx_max_data - wsi->quic.qs->highest_rx_offset;
+				
+				if (nwsi->a.context->quic_tx_credit_cb) {
+					uint64_t new_win = nwsi->a.context->quic_tx_credit_cb(
+						wsi, wsi->quic.qs->rx_window_size, (uint64_t)(add > 0 ? add : 0), 
+						(uint64_t)(now - wsi->quic.qs->last_rx_update_us));
+					if (new_win > wsi->quic.qs->rx_window_size && new_win <= LWS_QUIC_MAX_WINDOW) {
+						wsi->quic.qs->rx_max_data += (new_win - wsi->quic.qs->rx_window_size);
+						wsi->quic.qs->rx_window_size = new_win;
+						ungranted = 0;
+						if (wsi->quic.qs->advertised_rx_max_data > wsi->quic.qs->highest_rx_offset)
+							ungranted = wsi->quic.qs->advertised_rx_max_data - wsi->quic.qs->highest_rx_offset;
+					}
+				}
+
+				if (ungranted < wsi->quic.qs->rx_window_size / 2) {
+					wsi->quic.qs->last_rx_update_us = now;
+					struct lws_quic_tx_frame *f_msd = lws_zalloc(sizeof(*f_msd), "quic msd");
+					if (f_msd) {
+						f_msd->type = LWS_QUIC_FT_MAX_STREAM_DATA;
+						f_msd->stream_id = wsi->mux.my_sid;
+						f_msd->limit = wsi->quic.qs->rx_max_data;
+						wsi->quic.qs->advertised_rx_max_data = wsi->quic.qs->rx_max_data;
+						lws_quic_dbg_1rtt_account(qn, f_msd, "max-stream-data");
+						lws_dll2_add_tail(&f_msd->list, &qn->pending_tx[LWS_QUIC_LEVEL_APP]);
+					}
+					lws_callback_on_writable(nwsi);
+				}
+			}
+
+			qn->rx_max_data += (uint64_t)(add > 0 ? add : 0);
+			uint64_t ungranted = 0;
+			if (qn->advertised_rx_max_data > qn->highest_rx_offset)
+				ungranted = qn->advertised_rx_max_data - qn->highest_rx_offset;
+
+			if (nwsi->a.context->quic_tx_credit_cb) {
+				uint64_t new_win = nwsi->a.context->quic_tx_credit_cb(
+					nwsi, qn->rx_window_size, (uint64_t)(add > 0 ? add : 0), 
+					(uint64_t)(now - qn->last_rx_update_us));
+				if (new_win > qn->rx_window_size && new_win <= LWS_QUIC_MAX_WINDOW) {
+					qn->rx_max_data += (new_win - qn->rx_window_size);
+					qn->rx_window_size = new_win;
+					ungranted = 0;
+					if (qn->advertised_rx_max_data > qn->highest_rx_offset)
+						ungranted = qn->advertised_rx_max_data - qn->highest_rx_offset;
+				}
+			}
+
+			if (ungranted < qn->rx_window_size / 2) {
+				qn->last_rx_update_us = now;
+				struct lws_quic_tx_frame *f_md = lws_zalloc(sizeof(*f_md), "quic md");
+				if (f_md) {
+					f_md->type = LWS_QUIC_FT_MAX_DATA;
+					f_md->limit = qn->rx_max_data;
+					qn->advertised_rx_max_data = qn->rx_max_data;
+					lws_quic_dbg_1rtt_account(qn, f_md, "max-data");
+					lws_dll2_add_tail(&f_md->list, &qn->pending_tx[LWS_QUIC_LEVEL_APP]);
+				}
+				lws_callback_on_writable(nwsi);
+			}
+
+			lws_callback_on_writable(nwsi);
+			return 0;
+		}
+
+		/* We're being told we can write an additional "add" bytes to the peer */
+		wsi->txc.tx_cr += add;
+		if (add > 0)
+			wsi->quic.tx_blocked_sent = 0;
+
+		/* Unblock if blocked */
+		if (wsi->txc.tx_cr > 0) {
+			lws_callback_on_writable(wsi);
+
+			lws_start_foreach_dll(struct lws_dll2 *, d,
+					wsi->mux.child_list_owner.head) {
+				struct lws *w = lws_container_of(d, struct lws,
+								 mux.sibling_list);
+				lws_callback_on_writable(w);
+			}
+			lws_end_foreach_dll(d);
+		}
+		return 0;
+	}
+
+	if (peer_to_us == LWSTXCR_US_TO_PEER) {
+		/*
+		 * How much can we write to the peer?
+		 * Min of stream's local tx credit and the nwsi's global tx credit.
+		 */
+		int cr = wsi->txc.tx_cr;
+		if (nwsi->txc.tx_cr < cr)
+			cr = nwsi->txc.tx_cr;
+
+		size_t queued_bytes = 0;
+		if (nwsi->quic.qn) {
+			uint32_t mtu = nwsi->quic.qn->current_mtu ?
+				nwsi->quic.qn->current_mtu : 1280;
+
+			lws_start_foreach_dll(struct lws_dll2 *, d,
+				    lws_dll2_get_head(&nwsi->quic.qn->pending_tx[LWS_QUIC_LEVEL_APP])) {
+				struct lws_quic_tx_frame *f = lws_container_of(d,
+					struct lws_quic_tx_frame, list);
+				queued_bytes += f->len;
+			} lws_end_foreach_dll(d);
+
+			/*
+			 * Throttle based on available cwnd headroom: cap new writes
+			 * to cwnd - bytes_in_flight - queued_bytes.  bytes_in_flight
+			 * only counts serialized frames; queued_bytes (pending_tx) is
+			 * already committed but not yet on the wire.  Together they
+			 * represent our total debt against the cwnd.
+			 *
+			 * Floor: always allow at least 1 MTU so the stream
+			 * makes progress even when the window is exactly full.
+			 */
+			if (nwsi->quic.qn->cc_state) {
+				struct lws_quic_cc_newreno *cc =
+					(struct lws_quic_cc_newreno *)nwsi->quic.qn->cc_state;
+				size_t debt = cc->bytes_in_flight + queued_bytes;
+				size_t headroom = (cc->cwnd > debt) ? cc->cwnd - debt : 0;
+				if (headroom < mtu)
+					headroom = mtu; /* always allow 1 packet */
+				if (cr > (int)headroom)
+					cr = (int)headroom;
+			}
+		}
+
+		/*
+		 * Accounts for H3 framing overhead (DATA/HEADERS frame type + length: max 9 bytes).
+		 * If we don't subtract this, the caller reads `cr` bytes of payload, and then
+		 * H3 frames it (adding overhead), resulting in a write request of `cr + overhead` bytes,
+		 * which exceeds the flow control window and blocks, causing issues on non-seekable streams.
+		 */
+		if (cr >= 3) {
+			if (cr > 9)
+				cr -= 9;
+			else
+				cr -= 2;
+		} else {
+			cr = 0;
+		}
+
+		if (!cr && !add)
+			lwsl_debug("rops_tx_credit_quic: US_TO_PEER returning 0: "
+				    "wsi_tx_cr=%d, nwsi_tx_cr=%d, queued=%zu, "
+				    "wsi=%s, nwsi=%s\n",
+				    (int)wsi->txc.tx_cr, (int)nwsi->txc.tx_cr,
+				    queued_bytes, lws_wsi_tag(wsi),
+				    lws_wsi_tag(nwsi));
+
+		lwsl_debug("rops_tx_credit_quic: LWSTXCR_US_TO_PEER returning %d (wsi->txc.tx_cr=%d, nwsi->txc.tx_cr=%d)\n",
+			  cr, (int)wsi->txc.tx_cr, (int)nwsi->txc.tx_cr);
+		return cr; /* how much we can write to peer */
+	}
+
+	n = wsi->txc.peer_tx_cr_est; /* how much peer can write to us */
+	if (n > nwsi->txc.peer_tx_cr_est)
+		n = nwsi->txc.peer_tx_cr_est;
+
+	lwsl_debug("rops_tx_credit_quic: returning %d\n", n);
+	return n;
+}
+
+static int
+rops_alpn_negotiated_quic(struct lws *wsi, const char *alpn)
+{
+	struct lws *nwsi;
+	const struct lws_role_ops *role;
+
+#if defined(LWS_WITH_CLIENT)
+	if (lwsi_role_client(wsi)) {
+		lws_sul_cancel(&wsi->sul_h3_grace);
+		/*
+		 * The happy eyeballs retry sul may still be armed from the
+		 * DNS-result staggering; after migration this wsi is an h3
+		 * mux child stream with no business opening TCP racers.
+		 */
+		lws_sul_cancel(&wsi->sul_happy_eyeballs);
+	}
+#endif
+
+	if (strcmp(alpn, "h3") && strcmp(alpn, "lws-quic"))
+		return 0;
+
+	lwsl_info("ENTER rops_alpn_negotiated_quic: wsi=%p\n", wsi);
+
+	lwsl_wsi_info(wsi, "QUIC negotiated %s, migrating network connection to new wsi", alpn);
+
+	role = lws_role_by_name(alpn);
+	if (!role) {
+		role = &role_ops_quic;
+	}
+
+	/* If it's already migrated or it's a stream, don't migrate again! */
+	if (!wsi->quic.qn || wsi->quic.qn->alpn_migrated)
+		return 0;
+
+	/* Create the new network WSI */
+	nwsi = lws_create_new_server_wsi(wsi->a.vhost, wsi->tsi, 0, "quic_nwsi");
+	if (!nwsi)
+		return 1;
+
+#if defined(LWS_WITH_CLIENT)
+	if (wsi->cli_hostname_copy)
+		nwsi->cli_hostname_copy = lws_strdup(wsi->cli_hostname_copy);
+	nwsi->c_port = wsi->c_port;
+#endif
+
+	/* Transfer the socket fd and fds table entry if valid */
+	nwsi->desc = wsi->desc;
+	if (lws_socket_is_valid(wsi->desc.sockfd)) {
+		struct lws_context_per_thread *pt = &wsi->a.context->pt[(int)wsi->tsi];
+
+		lws_pt_lock(pt, __func__);
+		if (__remove_wsi_socket_from_fds(wsi)) {
+			lws_pt_unlock(pt);
+			lws_close_free_wsi(nwsi, LWS_CLOSE_STATUS_NOSTATUS, "fd table fail");
+			return 1;
+		}
+		wsi->desc.sockfd = LWS_SOCK_INVALID;
+#if defined(LWS_WITH_EVENT_LIBS)
+		if (wsi->a.context->event_loop_ops->evlib_size_wsi) {
+			memcpy(nwsi->evlib_wsi, wsi->evlib_wsi, wsi->a.context->event_loop_ops->evlib_size_wsi);
+			memset(wsi->evlib_wsi, 0, wsi->a.context->event_loop_ops->evlib_size_wsi);
+
+			if (!strcmp(wsi->a.context->event_loop_ops->name, "libuv")) {
+				void **ppwatcher = (void **)nwsi->evlib_wsi;
+				if (ppwatcher && *ppwatcher) {
+					*(void **)(*ppwatcher) = nwsi;
+				}
+			}
+		}
+#endif
+		if (__insert_wsi_socket_into_fds(wsi->a.context, nwsi)) {
+			lws_pt_unlock(pt);
+			lws_close_free_wsi(nwsi, LWS_CLOSE_STATUS_NOSTATUS, "fd table fail");
+			return 1;
+		}
+		lws_pt_unlock(pt);
+	}
+
+	/* Transfer the udp and quic contexts */
+#if defined(LWS_WITH_UDP)
+	nwsi->udp = wsi->udp;
+	wsi->udp = NULL;
+#endif
+	nwsi->quic = wsi->quic;
+	nwsi->txc = wsi->txc;
+	nwsi->tls = wsi->tls;
+	nwsi->sa46_peer = wsi->sa46_peer;
+	memset(&wsi->quic, 0, sizeof(wsi->quic));
+	memset(&wsi->tls, 0, sizeof(wsi->tls));
+	lws_tls_quic_migrate_wsi(wsi, nwsi);
+	if (!wsi->quic.qs) {
+		wsi->quic.qs = lws_zalloc(sizeof(*wsi->quic.qs), "quic stream");
+		if (wsi->quic.qs) {
+			wsi->quic.qs->rx_max_data = LWS_QUIC_DEFAULT_WINDOW;
+			wsi->quic.qs->advertised_rx_max_data = LWS_QUIC_DEFAULT_WINDOW;
+			wsi->quic.qs->rx_window_size = LWS_QUIC_DEFAULT_WINDOW;
+			wsi->quic.qs->last_rx_update_us = lws_now_usecs();
+		} else {
+			/*
+			 * Q-15: wsi has been hollowed out above (tls.ssl and
+			 * quic.qs both NULL, its state migrated into nwsi).
+			 * Closing only nwsi leaves wsi behind to be touched
+			 * with NULL tls.ssl/quic.qs.  Close wsi too so the
+			 * whole failed migration is torn down consistently.
+			 */
+			lws_close_free_wsi(nwsi, LWS_CLOSE_STATUS_NOSTATUS,
+					   "quic stream oom");
+			lws_close_free_wsi(wsi, LWS_CLOSE_STATUS_NOSTATUS,
+					   "quic migration oom");
+			return 1;
+		}
+	}
+
+	/* Initialize flow control credits for the new child stream */
+	int32_t init_cr = nwsi->txc.manual_initial_tx_credit;
+	if (!init_cr) {
+		int is_bidi = (wsi->quic.qs && wsi->quic.qs->is_unidirectional == 0);
+		int is_remote_initiated = (wsi->quic.qs && wsi->quic.qs->is_server_initiated == nwsi->quic.qn->is_server ? 0 : 1);
+		uint64_t val = 0;
+		if (nwsi->quic.qn) {
+			if (is_bidi) {
+				if (is_remote_initiated)
+					val = nwsi->quic.qn->peer_initial_max_stream_data_bidi_local;
+				else
+					val = nwsi->quic.qn->peer_initial_max_stream_data_bidi_remote;
+			} else {
+				val = nwsi->quic.qn->peer_initial_max_stream_data_uni;
+			}
+		}
+		if (val)
+			init_cr = (val > (uint64_t)INT32_MAX) ? INT32_MAX : (int32_t)val;
+		else
+			init_cr = 65535;
+	}
+	wsi->txc.peer_tx_cr_est = init_cr;
+	wsi->txc.tx_cr = init_cr;
+
+#if defined(LWS_WITH_CLIENT)
+        /* Transfer active connection and pipeline queue from child to network WSI */ 
+        if (!lws_dll2_is_detached(&wsi->dll_cli_active_conns)) { 
+                lws_dll2_remove(&wsi->dll_cli_active_conns); 
+                lws_dll2_add_tail(&nwsi->dll_cli_active_conns, &wsi->a.vhost->dll_cli_active_conns_owner); 
+        } 
+        lws_start_foreach_dll_safe(struct lws_dll2 *, d, d1, 
+                        wsi->dll2_cli_txn_queue_owner.head) { 
+                struct lws *ww = lws_container_of(d, struct lws, dll2_cli_txn_queue); 
+                lws_dll2_remove(&ww->dll2_cli_txn_queue); 
+                lws_dll2_add_tail(&ww->dll2_cli_txn_queue, &nwsi->dll2_cli_txn_queue_owner); 
+        } lws_end_foreach_dll_safe(d, d1); 
+#endif
+
+	lwsl_info("rops_alpn_negotiated_quic: old_wsi=%p\n", wsi);
+	lwsl_info("rops_alpn_negotiated_quic: new_nwsi=%p\n", nwsi);
+	lwsl_info("rops_alpn_negotiated_quic: qn=%p\n", nwsi->quic.qn);
+
+	/* Important: the network WSI must point back to itself */
+	if (nwsi->quic.qn)
+		nwsi->quic.qn->nwsi = nwsi;
+
+	/* Setup role and state for nwsi */
+	lws_role_transition(nwsi, lwsi_role_client(wsi) ? LWSIFR_CLIENT : LWSIFR_SERVER, LRS_ESTABLISHED, &role_ops_quic);
+	if (!strcmp(alpn, "h3")) {
+		nwsi->upgraded_to_http2 = 1;
+	}
+
+	/* Transition wsi to HTTP/3 and link as a child of nwsi */
+	lws_role_transition(wsi, lwsi_role_client(wsi) ? LWSIFR_CLIENT : LWSIFR_SERVER, (!strcmp(alpn, "h3") && lwsi_role_client(wsi)) ? LRS_H2_WAITING_TO_SEND_HEADERS : LRS_ESTABLISHED, role);
+#if defined(LWS_ROLE_H3)
+	if (!strcmp(alpn, "h3")) {
+		memset(&wsi->h3, 0, sizeof(wsi->h3));
+	}
+#endif
+#if defined(LWS_WITH_CLIENT)
+        if (!strcmp(alpn, "h3") && lwsi_role_client(wsi)) {
+                wsi->client_h2_alpn = 1;
+                wsi->client_mux_migrated = 1;
+                wsi->hdr_parsing_completed = 0;
+                nwsi->client_h2_alpn = 1;
+                nwsi->client_mux_migrated = 1;
+        }
+#endif
+
+	wsi->mux_substream = 1;
+#if defined(LWS_WITH_CLIENT)
+        if (lwsi_role_client(wsi))
+                wsi->client_mux_substream = 1;
+        else
+                wsi->client_mux_substream = 0;
+#endif
+	nwsi->quic.qn->alpn_migrated = 1;
+
+#if defined(LWS_WITH_CLIENT)
+	/* 
+	 * QUIC succeeded! Resolve the race by killing parallel TCP connections. 
+	 */
+	if (lwsi_role_client(wsi)) {
+		
+		for (int i = 0; i < wsi->parallel_count; i++) {
+			if (wsi->parallel_conns[i].is_valid) {
+				lws_remove_parallel_fd_safely(wsi, i);
+			}
+		}
+		wsi->parallel_count = 0;
+
+		if (wsi->a.context->h3_cap_cache && wsi->stash && wsi->stash->cis[CIS_HOST]) {
+			lws_h3_cap_info_t cap;
+			cap.state = LWS_H3_STATE_KNOWN_GOOD;
+			cap.latency_us = (uint32_t)(lws_now_usecs() - nwsi->quic.quic_race_start_us);
+
+			lws_cache_write_through(wsi->a.context->h3_cap_cache, wsi->stash->cis[CIS_HOST],
+						(const uint8_t *)&cap, sizeof(cap),
+						lws_now_usecs() + (3600ll * LWS_US_PER_SEC), NULL);
+		}
+	}
+#endif
+
+	/* 
+	 * The quic child stream is migrating to be a child of nwsi. 
+	 * So we disconnect it from the listener socket first. 
+	 */
+	/* 
+	 * Important: The new network connection nwsi must be in the listener's 
+	 * child list so it can receive incoming UDP packets! 
+	 * We must get the listener socket BEFORE we disconnect the wsi.
+	 */
+	struct lws *listener = wsi->mux.parent_wsi;
+
+	if (wsi->mux.parent_wsi)
+                lws_wsi_mux_sibling_disconnect(wsi);
+
+        /*
+         * Transfer all of wsi's mux children to nwsi.  Under dll2 this is a
+         * per-child remove+add_head; owner.count and the parent_wsi back-link
+         * are kept consistent as we go.
+         */
+        lws_start_foreach_dll_safe(struct lws_dll2 *, d, d1,
+				   wsi->mux.child_list_owner.head) {
+		struct lws *c = lws_container_of(d, struct lws, mux.sibling_list);
+
+		lws_dll2_remove(&c->mux.sibling_list);
+		c->mux.parent_wsi = nwsi;
+		lws_dll2_add_head(&c->mux.sibling_list,
+				  &nwsi->mux.child_list_owner);
+	} lws_end_foreach_dll_safe(d, d1);
+
+        lws_wsi_mux_insert(wsi, nwsi, 0); /* client first request is stream ID 0 */
+        if (nwsi->quic.qn->next_stream_id_bidi_local == 0)
+                nwsi->quic.qn->next_stream_id_bidi_local = 4;
+        lws_set_timeout(nwsi, NO_PENDING_TIMEOUT, 0);
+
+	if (listener) {
+		nwsi->mux_substream = 1;
+		lws_wsi_mux_insert(nwsi, listener, nwsi->mux.my_sid);
+	}
+
+	/* Inform the H3 role that it negotiated ALPN */
+	if (role && role != &role_ops_quic &&
+	    lws_rops_fidx(role, LWS_ROPS_alpn_negotiated)) {
+		(lws_rops_func_fidx(role, LWS_ROPS_alpn_negotiated)).
+			alpn_negotiated(wsi, alpn);
+	}
+
+	/* We are ready to send headers! */
+	lws_callback_on_writable(wsi);
+
+#if defined(LWS_WITH_CLIENT)
+        if (!strcmp(alpn, "h3") && lwsi_role_client(wsi)) {
+                lws_wsi_mux_apply_queue(nwsi);
+        }
+#endif
+
+	return 0;
+}
+
+static int
+rops_destroy_role_quic(struct lws *wsi)
+{
+	return rops_close_kill_connection_quic(wsi, LWS_CLOSE_STATUS_NOSTATUS);
+}
+
+static const lws_rops_t rops_table_quic[] = {
+	/*  1 */ { .handle_POLLIN	  = rops_handle_POLLIN_quic },
+	/*  2 */ { .handle_POLLOUT	  = rops_handle_POLLOUT_quic },
+	/*  3 */ { .callback_on_writable  = rops_callback_on_writable_quic },
+	/*  4 */ { .tx_credit		  = rops_tx_credit_quic },
+	/*  5 */ { .write_role_protocol	  = rops_write_role_protocol_quic },
+	/*  6 */ { .alpn_negotiated	  = rops_alpn_negotiated_quic },
+	/*  7 */ { .close_kill_connection = rops_close_kill_connection_quic },
+	/*  8 */ { .destroy_role          = rops_destroy_role_quic },
+	/*  9 */ { .adoption_bind	  = rops_adoption_bind_quic },
+#if defined(LWS_WITH_CLIENT)
+	/* 10 */ { .client_bind		  = rops_client_bind_quic },
+#endif
+};
+
+const struct lws_role_ops role_ops_quic = {
+	/* role name */			"quic",
+	/* alpn id */			"h3",
+
+	/* rops_table */		rops_table_quic,
+	/* rops_idx */			{
+	  /* LWS_ROPS_check_upgrades */
+	  /* LWS_ROPS_pt_init_destroy */		0x00,
+	  /* LWS_ROPS_init_vhost */
+	  /* LWS_ROPS_destroy_vhost */			0x00,
+	  /* LWS_ROPS_service_flag_pending */
+	  /* LWS_ROPS_handle_POLLIN */			0x01,
+	  /* LWS_ROPS_handle_POLLOUT */
+	  /* LWS_ROPS_perform_user_POLLOUT */		0x20,
+	  /* LWS_ROPS_callback_on_writable */
+	  /* LWS_ROPS_tx_credit */			0x34,
+	  /* LWS_ROPS_write_role_protocol */
+	  /* LWS_ROPS_encapsulation_parent */		0x50,
+	  /* LWS_ROPS_alpn_negotiated */
+	  /* LWS_ROPS_close_via_role_protocol */	0x60,
+	  /* LWS_ROPS_close_role */
+	  /* LWS_ROPS_close_kill_connection */		0x07,
+	  /* LWS_ROPS_destroy_role */
+	  /* LWS_ROPS_adoption_bind */			0x89,
+#if defined(LWS_WITH_CLIENT)
+	  /* LWS_ROPS_client_bind */                    0xA0,
+	  /* LWS_ROPS_issue_keepalive */
+#else
+	  /* LWS_ROPS_client_bind */                    0x00,
+	  /* LWS_ROPS_issue_keepalive */
+#endif
+					},
+
+	/* adoption_cb clnt, srv */	{ LWS_CALLBACK_CLIENT_ESTABLISHED,
+					  LWS_CALLBACK_SERVER_NEW_CLIENT_INSTANTIATED },
+	/* rx_cb clnt, srv */		{ LWS_CALLBACK_QT_CLIENT_RECEIVE,
+					  LWS_CALLBACK_QT_SERVER_RECEIVE },
+	/* writeable cb clnt, srv */	{ LWS_CALLBACK_CLIENT_WRITEABLE,
+					  LWS_CALLBACK_SERVER_WRITEABLE },
+	/* close cb clnt, srv */	{ LWS_CALLBACK_CLOSED_CLIENT_HTTP,
+					  LWS_CALLBACK_CLOSED },
+	/* protocol_bind_cb c,s */	{ LWS_CALLBACK_CLIENT_HTTP_BIND_PROTOCOL,
+					  LWS_CALLBACK_HTTP_BIND_PROTOCOL },
+	/* protocol_unbind_cb c,s */	{ LWS_CALLBACK_CLIENT_HTTP_DROP_PROTOCOL,
+					  LWS_CALLBACK_HTTP_DROP_PROTOCOL },
+	/* file_handle */		0,
+};

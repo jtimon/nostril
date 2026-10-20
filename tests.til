@@ -6,6 +6,18 @@ crypto := import("std/crypto")
 _nostril_test_nng := import("lib/modes/nostril_nng")
 import("lib/modes/nostril_live")
 
+test_websocket_dependency := test() {
+    for path : Str in array(Str, "gen/websocket/nostril-websocket-smoke",
+            "gen/websocket/nostril-websocket-shared-smoke") {
+        probe := Cmd.new(path)
+        probe.capture()
+        assert(probe.run() == 0)
+        output := probe.out()
+        assert(output.contains("libwebsockets 5.0.0-a842936f881921b6462b3328cce8e700b7a7ecd2"))
+        assert(output.contains("client TLS context OK"))
+    }
+}
+
 live_wait := proc(socket: nng_socket, context: Str = "live frame") returns Str {
     mut message := ""
     mut attempts : I64 = 0

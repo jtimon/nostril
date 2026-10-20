@@ -1,0 +1,18 @@
+These are buildable test apps that run in CI to confirm correct api operation.
+
+|name|tests|
+---|---
+api-test-lwsac|LWS Allocated Chunks api
+api-test-lws_struct-json|Selftests for lws_struct JSON serialization and deserialization
+api-test-lws_tokenize|Generic secure string tokenizer api
+api-test-fts|LWS Full-text Search api
+api-test-gencrypto|LWS Generic Crypto apis
+api-test-jose|LWS JOSE apis
+api-test-smtp_client|SMTP client for sending emails
+api-test-xip|xip clipboard plugin clip chunking, parsing and reassembly
+api-test-dht-msg-parse|DHT RPC wire message parser, incl. hash token charset and NOTIFY domain-name gates
+api-test-auth-dns-dnsbl|auth-dns plugin DNSBL pending-query lifetimes (F-054): late resolver replies and client disconnects vs the 5s dnsbl timeout
+api-test-auth-dns-zonedir|auth-dns plugin local zone-dir trust policy (F-055): missing pvo / world-writable / symlinked dirs and foreign-uid or wrong-shape zone files refused
+api-test-sshd-userauth|sshd plugin USERAUTH pubkey/sig blob walks (F-056): malformed blobs must be rejected bounded, genuine signatures still authenticate
+api-test-sspc-streamtype|serialized client streamtype length cap (F-057): over-long streamtypes refused at sspc create, boundary-length still accepted
+api-test-mqtt-unsub|mqtt subscribe/unsubscribe topic count cap (F-058): over-wide or zero topic lists loudly refused at the established-state tx paths, boundary-width unsubscribe still works end-to-end

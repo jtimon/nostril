@@ -58,7 +58,8 @@ the library with =./make.til library=, run the smoke and local transport tests
 with =./make.til test=, or remove generated output with =./make.til clean=.
 
 See [[file:doc/build.org][building Nostril]], [[file:doc/architecture.org][the initial architecture]], and
-[[file:doc/transports.org][the transport design]].
+[[file:doc/transports.org][the transport design]]. The [[file:doc/websocket.org][WebSocket dependency decision]] records
+the selected libwebsockets profile and the alternatives considered.
 
 ** Transport direction
 
@@ -88,5 +89,7 @@ copies. The GUI account is suitable for this prototype, not for valuable keys.
 ** Dependencies
 
 - [[https://github.com/jtimon/til][Til]]
-- CMake 3.15 or newer and a C compiler
+- CMake 3.24 or newer and a C compiler
+- OpenSSL development headers/libraries and system CA certificates
 - [[https://github.com/nanomsg/nng][NNG]] 1.11, vendored under =vendor/nng/= and built into =gen/nng/=
+- [[https://github.com/warmcat/libwebsockets][libwebsockets]], pinned under =vendor/libwebsockets/=; see [[file:doc/websocket.org][the selection record]]

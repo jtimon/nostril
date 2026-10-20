@@ -11,7 +11,7 @@ Nostril requires an installed Til whose support tree includes =std/crypto=,
 =vendor/bindings/secp256k1.til=, and both =libsecp256k1.a= and its interpreter
 shared-library twin (=.so=, or =.dll= on Windows; check the compiler with
 =til -v=). The =til= executable, Git, CMake
-3.15 or newer, and a C compiler must be on =PATH=, and the source must be built
+3.24 or newer, and a C compiler must be on =PATH=, and the source must be built
 from a Git checkout. Like Tiled, the build driver uses a compile-time macro to
 derive the =0.0.1-<short-commit>= version; it generates the library's shared
 version constant before building. The graphical client also requires the GUI
@@ -29,6 +29,14 @@ Linux/GNU linker and links =pthread= and =atomic= explicitly.
 The driver also compiles =lib/feed.c= into =gen/nng/feed.o= and adds it to both
 NNG artifacts. Its targeted-message helpers share NNG's socket registry in
 compiled and interpreted execution; they are not a separate FFI library.
+
+The full build also stages the [[file:websocket.org][pinned libwebsockets client dependency]] under
+=gen/websocket/= using =lib/websocket/CMakeLists.txt=. It requires OpenSSL
+development files and system CA certificates. On Ubuntu/Debian install
+=libssl-dev= and =ca-certificates=. CMake =--fresh= keeps the vendor profile
+consistent when options change. Static/shared TLS-context smoke tests run as
+part of =./make.til test=. This prepares the dependency; the GUI's remote
+WebSocket adapter is still pending.
 
 The build driver is executable Til code, =make.til=, rather than a GNU
 Makefile. It uses =--cpu=baseline --usize=64 --opt=0= by default.

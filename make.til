@@ -118,6 +118,12 @@ build_nng := proc() {
         "\")\nlink(\"pthread\")\nlink(\"atomic\")\n"))
 }
 
+build_websocket := proc() {
+    Cmd.new("cmake", "--fresh", "-S", "lib/websocket", "-B", "gen/websocket",
+        "-DCMAKE_BUILD_TYPE=Release").run_checked()
+    Cmd.new("cmake", "--build", "gen/websocket", "--parallel").run_checked()
+}
+
 build := proc(name: Str, source: Str, opt: Str) {
     Cmd.new("til", "build", "--cpu=baseline", "--usize=64", opt,
         "-o", format("bin/", name), "-c", format("gen/", name, ".c"), source).run_checked()
@@ -165,6 +171,7 @@ main := proc(args: ..Str) {
     if target == "library" { return }
     select_api()
     build_nng()
+    build_websocket()
     if target == "test" { run_tests(opt); return }
     build_mode("nostril-cli", "src/nostril_cli.til", opt)
     build_mode("nostril-relay", "src/nostril_relay.til", opt)
