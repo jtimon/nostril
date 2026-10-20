@@ -54,15 +54,51 @@ transport-adapter step, not to the context smoke test.
 ** Intended integration boundary
 
 A project-owned C adapter should own libwebsockets contexts, connections, native
-callbacks, and bounded frame assembly. Til should receive complete owned UTF-8
-messages and connection events. Event validation, subscriptions, publication
-status, retry decisions, and session ownership remain in Nostril.
+callbacks, and the native lifetime boundary. Keep transport state, bounded
+message assembly, send queues, and reconnect policy in Til wherever the FFI
+allows it. The C bridge should queue callback events for Til to poll rather
+than become a second protocol implementation. Event validation, subscriptions,
+publication status, retry decisions, and session ownership remain in Nostril.
 
 Use ordinary WebSocket text messages with no NNG framing or trailing NUL.
 Send only from libwebsockets writable callbacks. Public =wss://= connections
 must use certificate-chain and hostname verification and the system CA store.
 Do not expose vendor structs or callback lifetimes through the public libnostril
 ABI. The existing local NNG backend remains useful for deterministic tests.
+
+*** Native callback probe
+
+The callback check made with the installed compiler recorded in
+[[file:til-dependency.org][the build dependency record]] found that ordinary Til function values cannot
+be passed directly to C as native callbacks, even without captures.
+
+The minimal C boundary was:
+
+#+begin_src c
+typedef int32_t (*native_callback)(int32_t, void *);
+int32_t nostril_native_callback_probe(native_callback callback, void *state) {
+    return callback(7, state);
+}
+#+end_src
+
+The Til declaration used =Callback := func(I32, Dynamic) returns I32= and
+=nostril_native_callback_probe := ext_proc(callback: Callback, state: Dynamic)
+returns shallow I32 {}=. A noncapturing Til function attempted to add the
+argument to an I32 borrowed through =state= and return the updated count.
+
+- Marking the callback parameter =shallow= was rejected: "shallow parameter
+  'callback' must be a scalar or struct type".
+- With the ordinary parameter, compilation succeeded, but generated C defined
+  =Callback= as =TilClosure *= and passed =&on_event__til_closure= to C.
+- Executing the native call failed with SIGSEGV in both compiled and interpreted
+  execution. The scratch probe ran in isolated subprocesses with core dumps
+  disabled; it is not part of the passing application suite.
+
+This is an ABI mismatch, not evidence that all networking must be implemented
+in C. A thin native callback plus a polled event queue avoids calling through
+Til closure data. Recheck this boundary if Til adds an explicit C callback ABI
+or interpreter trampoline support. Until then, direct callback registration
+must not be assumed to work merely because the declaration type-checks.
 
 ** Alternatives considered
 
