@@ -124,6 +124,34 @@ build_websocket := proc() {
     Cmd.new("cmake", "--build", "gen/websocket", "--parallel").run_checked()
 }
 
+build_ws_library := proc(opt: Str) {
+    root := get_cwd_str()
+    escaped := root.replace("\\", "\\\\").replace("\"", "\\\"")
+    File.writefile("gen/websocket_native.til", format("mode lib\n",
+        "link(\"", escaped, "/gen/websocket/libnostril-ws-abi.a\")\n",
+        "link(\"", escaped, "/gen/lib/libwebsockets.so\")\n"))
+    Cmd.new("til", "build", "--cpu=baseline", "--usize=64", opt,
+        "-c", "gen/nostril_ws.c", "lib/websocket/nostril_ws.til").run_checked()
+    File.writefile("gen/websocket_api.til", format("mode lib\n",
+        "link(\"", escaped, "/gen/lib/libnostril_ws.so\")\n",
+        "til_nostril_x5fws__nostril_ws_open := ext_proc(url: Str, ca_file: Str) returns shallow I64 {}\n",
+        "nostril_ws_open := proc(url: Str, ca_file: Str = \"\") returns I64 { return til_nostril_x5fws__nostril_ws_open(url, ca_file) }\n",
+        "til_nostril_x5fws__nostril_ws_poll := ext_proc(shallow handle: I64) {}\n",
+        "nostril_ws_poll := proc(handle: I64) { til_nostril_x5fws__nostril_ws_poll(handle) }\n",
+        "til_nostril_x5fws__nostril_ws_publish := ext_proc(shallow handle: I64, event: Str) {}\n",
+        "nostril_ws_publish := proc(handle: I64, event: Str) { til_nostril_x5fws__nostril_ws_publish(handle, event) }\n",
+        "til_nostril_x5fws__nostril_ws_publication_status := ext_proc(shallow handle: I64, id: Str) returns shallow Str {}\n",
+        "nostril_ws_publication_status := proc(handle: I64, id: Str) returns Str { return til_nostril_x5fws__nostril_ws_publication_status(handle, id) }\n",
+        "til_nostril_x5fws__nostril_ws_receive := ext_proc(shallow handle: I64) returns shallow Str {}\n",
+        "nostril_ws_receive := proc(handle: I64) returns Str { return til_nostril_x5fws__nostril_ws_receive(handle) }\n",
+        "til_nostril_x5fws__nostril_ws_status := ext_proc(shallow handle: I64) returns shallow Str {}\n",
+        "nostril_ws_status := proc(handle: I64) returns Str { return til_nostril_x5fws__nostril_ws_status(handle) }\n",
+        "til_nostril_x5fws__nostril_ws_ready := ext_proc(shallow handle: I64) returns shallow Bool {}\n",
+        "nostril_ws_ready := proc(handle: I64) returns Bool { return til_nostril_x5fws__nostril_ws_ready(handle) }\n",
+        "til_nostril_x5fws__nostril_ws_close := ext_proc(shallow handle: I64) {}\n",
+        "nostril_ws_close := proc(handle: I64) { til_nostril_x5fws__nostril_ws_close(handle) }\n"))
+}
+
 build := proc(name: Str, source: Str, opt: Str) {
     Cmd.new("til", "build", "--cpu=baseline", "--usize=64", opt,
         "-o", format("bin/", name), "-c", format("gen/", name, ".c"), source).run_checked()
@@ -172,6 +200,7 @@ main := proc(args: ..Str) {
     select_api()
     build_nng()
     build_websocket()
+    build_ws_library(opt)
     if target == "test" { run_tests(opt); return }
     build_mode("nostril-cli", "src/nostril_cli.til", opt)
     build_mode("nostril-relay", "src/nostril_relay.til", opt)

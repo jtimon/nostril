@@ -210,10 +210,12 @@ toolchains remain future decisions.
 
 ** Future backends and NIPs
 
-NIP-01 relay communication uses WebSocket. A future WebSocket backend should
-adapt the shared messages and state machines rather than duplicate them. The
-same rule applies to WebRTC or another transport introduced for a particular
-NIP.
+The [[file:websocket.org][WebSocket client transport]] now uses the shared event validation,
+deduplication IDs, publication replies, and relay control parsing. It maintains
+one connection and one live kind-1 subscription for the selected relay. It sends
+standard NIP-01 envelopes rather than the local NNG publication framing.
+Additional relay management and other transports, such as WebRTC, should reuse
+those shared semantics rather than introduce separate NIP implementations.
 
 Transport selection may depend on the endpoint, deployment, or capabilities
 required by a NIP. Unsupported combinations should fail explicitly. A NIP may

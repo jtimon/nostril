@@ -1,0 +1,251 @@
+mode lib
+
+import("../nostril/event")
+_native_links := import("../../gen/websocket_native")
+
+ws_native_new := ext_proc(state: Dynamic, url: I8, ca_file: I8) returns ref Dynamic {}
+ws_native_connect := ext_proc(handle: Dynamic) returns shallow I32 {}
+ws_native_poll := ext_proc(handle: Dynamic) returns shallow I32 {}
+ws_native_destroy := ext_proc(handle: Dynamic) {}
+ws_native_pre := ext_proc() returns shallow U64 {}
+lws_now_usecs := ext_proc() returns shallow U64 {}
+lws_get_context := ext_proc(wsi: Dynamic) returns ref Dynamic {}
+lws_context_user := ext_proc(context: Dynamic) returns ref Dynamic {}
+lws_callback_on_writable := ext_proc(wsi: Dynamic) returns shallow I32 {}
+lws_is_final_fragment := ext_proc(wsi: Dynamic) returns shallow I32 {}
+lws_remaining_packet_payload := ext_proc(wsi: Dynamic) returns shallow USize {}
+lws_frame_is_binary := ext_proc(wsi: Dynamic) returns shallow I32 {}
+lws_write := ext_proc(wsi: Dynamic, mut bytes: Dynamic, shallow size: USize,
+    shallow protocol: I32) returns shallow I32 {}
+
+priv WS_MAX : USize = 65536
+priv WS_REQUEST := "[\"REQ\",\"local\",{\"kinds\":[1],\"limit\":0}]"
+
+priv WsPublication := struct {
+    event : Str = ""
+    id : Str = ""
+    status : Str = "pending"
+    sent := false
+    sent_at : U64 = 0
+}
+
+priv WsSession := struct {
+    ref native : Dynamic = 0
+    ref connection : Dynamic = 0
+    connected := false
+    connecting := false
+    closing := false
+    subscribed := false
+    accepting := false
+    ready := false
+    retry_at : U64 = 0
+    pre : USize = 0
+    partial := Str.with_capacity(65536)
+    events := Vec(Str).new()
+    seen := Set(Str).new()
+    publications := Vec(WsPublication).new()
+    status : Str = "connecting"
+    notice : Str = ""
+}
+
+// A heap-owned field keeps callback userdata stable when the map grows.
+priv WsOwner := struct { own state := WsSession() }
+priv mut sessions := Map(I64, WsOwner).new()
+priv mut next_handle : I64 = 1
+
+priv ws_now := proc() returns U64 { return lws_now_usecs() / 1000 }
+
+priv ws_disconnected := proc(mut session: WsSession) {
+    session.connected = false
+    session.connecting = false
+    session.ready = false
+    session.subscribed = false
+    session.accepting = false
+    no_connection : Dynamic = 0
+    session.connection = no_connection
+    session.partial = Str.with_capacity(WS_MAX)
+    session.retry_at = ws_now() + 1000
+    for mut publication : WsPublication in session.publications { publication.sent = false }
+}
+
+priv ws_write_text := proc(mut session: WsSession, text: Str) returns Bool {
+    if text.len() > WS_MAX { return false }
+    mut buffer := Str.with_capacity(session.pre + text.len())
+    memcpy(ptr_add(buffer.c_str, session.pre.to_uptr()), text.c_str, text.len().to_uptr())
+    return lws_write(session.connection, ptr_add(buffer.c_str, session.pre.to_uptr()), text.len(), 0) == text.len().to_i32()
+}
+
+priv ws_message := proc(mut session: WsSession, message: Str) returns Bool {
+    control := nostril_relay_control(message, "local")
+    if control == "eose" {
+        if session.accepting { session.ready = true; session.status = "live" }
+        return true
+    }
+    if control.starts_with("closed: ") {
+        session.ready = false
+        session.accepting = false
+        session.status = control.clone()
+        return true
+    }
+    if control.starts_with("notice: ") { session.notice = control.clone(); return true }
+    for mut publication : WsPublication in session.publications {
+        if publication.status == "pending" {
+            status := nostril_publication_status(message, publication.id)
+            if status.len() > 0 { publication.status = status.clone(); return true }
+        }
+    }
+    if !session.accepting || nostril_control_id(message, "EVENT") != "local" { return true }
+    id := nostril_relay_event_id(message)
+    if id.len() == 0 || session.seen.has(id) { return true }
+    if session.events.len() >= 256 { session.status = "receive queue full"; return false }
+    session.seen.add(own id.clone())
+    session.events.push(own message.clone())
+    return true
+}
+
+// Registered by native symbol address; this body always runs as compiled Til,
+// including when the API consumer is interpreted. No Til closure crosses C.
+ws_callback := proc(wsi: Dynamic, reason: I32, _user: Dynamic,
+        input: Dynamic, length: USize) returns I32 {
+    // Values are pinned to upstream lws-callbacks.h (asserted in the C build).
+    if reason != 1 && reason != 3 && reason != 8 && reason != 10 && reason != 75 { return 0 }
+    ref context : Dynamic = lws_get_context(wsi)
+    ref mut data : Dynamic = lws_context_user(context)
+    ref mut session : WsSession = to_ptr(data)
+    if reason == 1 || reason == 75 {
+        if reason == 1 { session.status = "connection failed" }
+        else if session.status == "live" || session.status == "subscribing" { session.status = "disconnected" }
+        ws_disconnected(session)
+        return 0
+    }
+    if session.closing {
+        if reason == 10 && session.subscribed { ws_write_text(session, "[\"CLOSE\",\"local\"]") }
+        return -1
+    }
+    if reason == 3 {
+        session.connection = wsi
+        session.connected = true
+        session.connecting = false
+        session.subscribed = false
+        session.accepting = false
+        session.ready = false
+        session.status = "subscribing"
+        lws_callback_on_writable(wsi)
+    } else if reason == 8 {
+        if lws_frame_is_binary(wsi) != 0 { session.status = "binary message rejected"; return -1 }
+        if length > WS_MAX - session.partial.len() { session.status = "message too large"; return -1 }
+        bytes := Str(c_str = to_ptr(input), count = length, cap = CAP_VIEW)
+        session.partial.push_str(bytes)
+        if lws_is_final_fragment(wsi) != 0 && lws_remaining_packet_payload(wsi) == 0 {
+            if !ws_message(session, session.partial) { return -1 }
+            session.partial = Str.with_capacity(WS_MAX)
+        }
+    } else if reason == 10 {
+        if !session.subscribed {
+            if !ws_write_text(session, WS_REQUEST) { session.status = "write failed"; return -1 }
+            session.subscribed = true
+            session.accepting = true
+        } else if session.ready {
+            now := ws_now()
+            for mut publication : WsPublication in session.publications {
+                if publication.status == "pending" && (!publication.sent || now >= publication.sent_at + 1000) {
+                    wire := format("[\"EVENT\",", publication.event, "]")
+                    if !ws_write_text(session, wire) { session.status = "write failed"; return -1 }
+                    publication.sent = true
+                    publication.sent_at = now
+                    break
+                }
+            }
+        }
+    }
+    return 0
+}
+
+// The library owns the session until close(handle). Handle 0 reports failure.
+// Calls stay on one thread; callbacks run only during poll/connect/teardown.
+nostril_ws_open := proc(url: Str, ca_file: Str) returns I64 {
+    if url.len() > 2048 || (!url.starts_with("ws://") && !url.starts_with("wss://")) { return 0 }
+    mut owner := WsOwner()
+    {
+        ref mut session : WsSession = owner.state
+        session.pre = ws_native_pre().to_usize()
+        native_url := url.clone()
+        native_ca := ca_file.clone()
+        session.native = ws_native_new(session, native_url.c_str, native_ca.c_str)
+        if session.native.is_null() { return 0 }
+    }
+    handle := next_handle
+    next_handle++
+    sessions.set(handle, own owner)
+    return handle
+}
+
+nostril_ws_poll := proc(handle: I64) {
+    ref mut session : WsSession = sessions[handle].state
+    if !session.connected && !session.connecting && ws_now() >= session.retry_at {
+        session.connecting = true
+        if ws_native_connect(session.native) != 0 {
+            session.status = "connection failed"
+            ws_disconnected(session)
+        }
+    }
+    ws_native_poll(session.native)
+    if session.connected && session.ready {
+        now := ws_now()
+        for publication : WsPublication in session.publications {
+            if publication.status == "pending" && (!publication.sent || now >= publication.sent_at + 1000) {
+                lws_callback_on_writable(session.connection)
+                break
+            }
+        }
+    }
+}
+
+nostril_ws_publish := proc(handle: I64, event: Str) {
+    ref mut session : WsSession = sessions[handle].state
+    id := nostril_event_id(event)
+    if id.len() == 0 { panic("cannot publish an invalid local event") }
+    for publication : WsPublication in session.publications { if publication.id == id { return } }
+    mut status := "pending"
+    if event.len() + 10 > WS_MAX { status = "rejected: event exceeds frame limit" }
+    session.publications.push(own WsPublication(event = event.clone(), id = id.clone(), status = status.clone()))
+}
+
+nostril_ws_publication_status := func(handle: I64, id: Str) returns Str {
+    ref session : WsSession = sessions[handle].state
+    for publication : WsPublication in session.publications { if publication.id == id { return publication.status.clone() } }
+    return "received"
+}
+
+nostril_ws_receive := func(handle: I64) returns Str {
+    ref mut session : WsSession = sessions[handle].state
+    if session.events.len() == 0 { return "" }
+    message := session.events[0].clone()
+    session.events.remove_at(0)!
+    return message
+}
+
+nostril_ws_status := func(handle: I64) returns Str {
+    ref session : WsSession = sessions[handle].state
+    if session.notice.len() > 0 { return format(session.status, " | ", session.notice) }
+    return session.status.clone()
+}
+
+nostril_ws_ready := func(handle: I64) returns Bool {
+    ref session : WsSession = sessions[handle].state
+    return session.ready
+}
+
+nostril_ws_close := proc(handle: I64) {
+    ref mut session : WsSession = sessions[handle].state
+    session.closing = true
+    if session.connected {
+        lws_callback_on_writable(session.connection)
+        // Best-effort NIP CLOSE on a writable connection; teardown never waits
+        // for a remote peer. Closing the WebSocket also drops its subscriptions.
+        mut budget : I64 = 4
+        while session.connected && budget > 0 { ws_native_poll(session.native); budget-- }
+    }
+    ws_native_destroy(session.native)
+    sessions.remove(handle)
+}

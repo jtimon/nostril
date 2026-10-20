@@ -4,14 +4,15 @@
 
 ** Selected: libwebsockets
 
-Nostril selects [[https://github.com/warmcat/libwebsockets][libwebsockets]] for the upcoming public-relay transport.
+Nostril uses [[https://github.com/warmcat/libwebsockets][libwebsockets]] for the public-relay transport.
 It is C, permissively licensed, and supplies the HTTP opening handshake,
 WebSocket framing, nonblocking client lifecycle, TLS integration, and write
 backpressure. This keeps those mechanisms out of Nostril's protocol library.
 The upstream source tree is broad; our compiled profile is deliberately narrow.
 
-The source under =vendor/libwebsockets/= is the unmodified =v5.0-stable=
+The source under =vendor/libwebsockets/= is the =v5.0-stable=
 snapshot at commit =a842936f881921b6462b3328cce8e700b7a7ecd2= (version 5.0.0).
+It has one local DNS-cache lifetime fix, described below.
 The branch name is provenance, not a floating dependency. Build configuration
 is maintained separately in =lib/websocket/CMakeLists.txt=.
 
@@ -27,6 +28,8 @@ is maintained separately in =lib/websocket/CMakeLists.txt=.
 
 The native profile builds PIC static and shared libraries with HTTP/1.1,
 WebSocket client support, OpenSSL TLS, and the built-in poll event loop. It
+enables asynchronous DNS and its UDP/system-state dependencies so hostname
+resolution does not block the GUI thread. It
 disables the server, examples, HTTP/2, HTTP/3/QUIC, MQTT, Secure Streams,
 compression extensions, image/HTML helpers, and external event-loop plugins.
 Generic crypto helpers remain enabled because this snapshot's TLS certificate
@@ -40,31 +43,67 @@ discovery is performed by CMake. An alternate development prefix can be supplied
 through CMake's standard =CMAKE_PREFIX_PATH= environment variable. Builds do not
 download or install dependencies automatically.
 
-=./make.til= and =./make.til test= build into =gen/websocket/=. The =library=
-target continues to build only libnostril. Native static/shared smoke executables
+=./make.til= and =./make.til test= build into =gen/websocket/= and =gen/lib/=.
+The =library= target continues to build only libnostril. Native static/shared smoke executables
 verify the configured protocol features, upstream revision, and repeated client
 TLS context creation/destruction. The Til suite runs both executables in its
 interpreted and compiled passes; these tests do not contact the network.
 
-This commit stages and verifies the dependency. The GUI still uses local NNG;
-it does not connect to public WebSocket relays yet. Certificate rejection,
-fragmentation, actual message exchange and reconnect tests belong to the next
-transport-adapter step, not to the context smoke test.
+The full suite additionally runs an independent loopback WS/WSS fixture using
+Python's =websockets= package (tested with 10.4, using its legacy server API).
+It generates a one-day test certificate/key under =tmp/= with the OpenSSL CLI
+and removes them after success. It tests fragmented messages (including EVENT
+before EOSE), ping/pong, malformed JSON, binary/oversized/invalid-UTF-8 rejection,
+CLOSED/NOTICE, dropped acknowledgements, reconnect/resubscription, unchanged
+signed retries, and CA/hostname rejection. It does not publish to public relays.
 
-** Intended integration boundary
+** Til transport and native boundary
 
-A project-owned C adapter should own libwebsockets contexts, connections, native
-callbacks, and the native lifetime boundary. Keep transport state, bounded
-message assembly, send queues, and reconnect policy in Til wherever the FFI
-allows it. The C bridge should queue callback events for Til to poll rather
-than become a second protocol implementation. Event validation, subscriptions,
-publication status, retry decisions, and session ownership remain in Nostril.
+=lib/websocket/nostril_ws.til= is a compiled Til library. Its callback body,
+message assembly, receive queue, publication queue/state, subscription handling,
+event verification/deduplication and reconnect policy are all Til.
+=lib/websocket/abi.c= only handles native context/connect-info layout, URI storage,
+callback-symbol registration, the nonblocking service entry, and destruction.
+There is no native callback queue or C Nostr implementation.
 
-Use ordinary WebSocket text messages with no NNG framing or trailing NUL.
-Send only from libwebsockets writable callbacks. Public =wss://= connections
-must use certificate-chain and hostname verification and the system CA store.
-Do not expose vendor structs or callback lifetimes through the public libnostril
-ABI. The existing local NNG backend remains useful for deterministic tests.
+The library owns heap-stable sessions behind integer handles. =nostril_ws_open=
+returns zero on setup failure; every successful handle must be passed to
+=nostril_ws_close= exactly once. All operations stay on the opening thread.
+Callbacks execute synchronously during connect, poll and teardown. The library
+keeps userdata alive until context destruction has finished, then removes the
+session and releases its owned buffers. Returned strings belong to the caller;
+input strings are borrowed for the call. Vendor structs do not cross the host API.
+
+The generated =gen/websocket_api.til= loads =gen/lib/libnostril_ws.so= on both
+Til execution modes. The shared libwebsockets dependency is staged beside it,
+using the generated library's origin-relative runtime lookup. Its native ABI
+glue is compiled against the pinned headers and asserts the callback constants
+and USize64 layout used by this Linux build.
+
+The GUI selects this transport for =--relay ws://...= or =--relay wss://...=;
+IPC endpoints keep the NNG backend. WebSockets send standard Nostr REQ/CLOSE and
+=["EVENT",event]= messages without NNG headers or terminating NULs. A fixed
+=local= subscription requests live kind-1 events with =limit:0=. Matching EOSE
+enables queued publications; valid events can arrive before EOSE. CLOSED stops
+that subscription, NOTICE is retained for display, and only a complete matching
+OK changes publication status. Invalid messages never enter the event queue.
+
+Messages are limited to 64 KiB and the receive queue to 256 events. Libwebsockets
+validates text UTF-8; Til rejects binary messages and enforces the assembled size
+across fragments. A queue overflow closes the connection instead of growing it
+without bound. Publication history and event-ID deduplication remain session
+memory, as with the local client.
+
+Disconnected clients retry after one second. Pending publications retry after
+one second while subscribed, retaining their original JSON and signature.
+Only the writable callback sends frames, with the required LWS_PRE headroom.
+Shutdown attempts NIP CLOSE if writable, then destroys the context without
+waiting for a peer; disconnect also releases relay subscriptions.
+
+Public =wss://= connections use certificate-chain and hostname verification and
+the system CA store. The library's optional CA-file argument exists for explicit
+trust configuration and local tests; the GUI uses system trust and exposes no
+verification bypass. The poll loop is nonblocking, including DNS resolution.
 
 *** Native callback probe
 
@@ -94,11 +133,24 @@ argument to an I32 borrowed through =state= and return the updated count.
   execution. The scratch probe ran in isolated subprocesses with core dumps
   disabled; it is not part of the passing application suite.
 
-This is an ABI mismatch, not evidence that all networking must be implemented
-in C. A thin native callback plus a polled event queue avoids calling through
-Til closure data. Recheck this boundary if Til adds an explicit C callback ABI
-or interpreter trampoline support. Until then, direct callback registration
-must not be assumed to work merely because the declaration type-checks.
+That probe tested a closure value, not a compiled library export. A subsequent
+probe built a Til library and registered the exported C function address with
+libwebsockets. Protocol init/destroy callbacks updated caller-owned Til state
+successfully from both interpreted and compiled hosts. This is the path used
+by the transport: register =til_nostril_x5fws__ws_callback=, never the address
+of a =TilClosure= object. No new Til callback feature is needed for this path.
+
+** Local upstream patch
+
+=vendor/libwebsockets/lib/system/async-dns/async-dns.c= fixes an observed cache
+leak when a cached name lacks the requested record type. Upstream removed that
+entry from the cache list and left its expiry timer to free it. Context teardown
+cancels timers and visits only the cache list, so the detached allocation leaked
+if the context was destroyed first. LeakSanitizer reported 131 bytes during the
+WebSocket retry fixture. The patch frees unreferenced entries immediately and
+keeps referenced entries linked for normal teardown, while bypassing them for
+the current lookup. The same ASan transport test passes with leak detection
+enabled after the change. Reassess this patch when updating the vendor snapshot.
 
 ** Alternatives considered
 

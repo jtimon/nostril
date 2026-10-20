@@ -64,6 +64,14 @@ handles identify connections, not public keys. The GUI owns a feed-readiness
 state machine, waits for EOSE before starting queued publications, and renews
 its kind-1 subscription after reconnecting. No history or storage is introduced.
 
+For ws/wss URLs the GUI instead uses =lib/websocket/nostril_ws.til= through its
+compiled library binding. Callback bodies, receive assembly, publication state
+and retries are Til code. =lib/websocket/abi.c= handles only libwebsockets struct
+setup and native symbol registration/lifetime. The exported callback is a real
+C function address, not a Til closure value. Both execution modes consume the
+same compiled callback implementation. See [[file:websocket.org][the WebSocket transport]] for ownership,
+limits, TLS verification, and the independent loopback tests.
+
 User configuration is likewise deferred. Possible forms include a conventional
 =~/.nostril.conf= file or executable Til startup code such as
 =nostril.d/init.til=, but neither path nor format is an interface yet. Nostril

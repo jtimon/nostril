@@ -44,6 +44,17 @@ The GUI opens a live kind-1 subscription (=REQ= with =limit:0=), waits for
 matching subscriptions; =CLOSE= removes that client's subscription. See
 [[file:doc/transports.org][the local protocol]] for supported filters and transport details.
 
+To connect to one public relay instead, pass its WebSocket URL:
+
+#+begin_src sh
+./bin/nostril-gui --relay wss://relay.damus.io
+#+end_src
+
+The WebSocket transport is implemented in a compiled Til library, including its
+callbacks. It verifies TLS certificates and hostnames, subscribes to live kind-1
+events, and preserves pending signed publications across reconnects. The GUI
+still creates a session-only account. See [[file:doc/websocket.org][WebSocket transport and dependencies]].
+
 To run the scripted local NIP-01 exchange, start the relay and then run the CLI
 from another terminal:
 

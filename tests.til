@@ -5,6 +5,152 @@ import("std/file")
 crypto := import("std/crypto")
 _nostril_test_nng := import("lib/modes/nostril_nng")
 import("lib/modes/nostril_live")
+import("gen/websocket_api")
+
+ws_wait_ready := proc(handle: I64) returns Bool {
+    deadline := nng_clock() + 5000
+    while nng_clock() < deadline {
+        nostril_ws_poll(handle)
+        if nostril_ws_ready(handle) { return true }
+        sleep_ms(5)
+    }
+    return false
+}
+
+ws_wait_publication := proc(handle: I64, id: Str) returns Str {
+    deadline := nng_clock() + 8000
+    while nng_clock() < deadline {
+        nostril_ws_poll(handle)
+        status := nostril_ws_publication_status(handle, id)
+        if status != "pending" { return status }
+        sleep_ms(5)
+    }
+    return nostril_ws_publication_status(handle, id)
+}
+
+test_websocket_transport := test() {
+    mkdir_p("tmp")
+    prefix := format("tmp/ws-", process_id().to_str())
+    cert := format(prefix, ".crt")
+    key := format(prefix, ".key")
+    ports_file := format(prefix, ".ports")
+    event_file := format(prefix, ".event")
+    File.writefile(event_file, NOSTRIL_FAKE_EVENT)
+    if File.exists(ports_file) { File.remove(ports_file) }
+    certificate := Cmd.new("openssl", "req", "-x509", "-newkey", "rsa:2048",
+        "-nodes", "-keyout", key, "-out", cert, "-days", "1", "-subj", "/CN=localhost",
+        "-addext", "subjectAltName=IP:127.0.0.1,DNS:localhost")
+    certificate.capture()
+    assert(certificate.run() == 0)
+    fixture := Cmd.new("timeout", "90", "python3", "test/ws_fixture.py", ports_file, cert, key, event_file)
+    fixture.capture()
+    fixture_pid := fixture.start()
+    deadline := nng_clock() + 5000
+    while !File.exists(ports_file) && nng_clock() < deadline { sleep_ms(10) }
+    assert(File.exists(ports_file))
+    ports_text := File.readfile(ports_file)
+    ports := ports_text.split("\n")
+    plain := format("ws://127.0.0.1:", ports[0], "/nostril?probe=1")
+    secure := format("wss://127.0.0.1:", ports[1], "/nostril?probe=1")
+    wrong_host := format("wss://127.0.0.2:", ports[2], "/nostril?probe=1")
+    early := nostril_ws_open(format("ws://127.0.0.1:", ports[0], "/nostril?probe=early"))
+    assert(ws_wait_ready(early))
+    assert(nostril_relay_event_id(nostril_ws_receive(early)) == nostril_relay_event_id(NOSTRIL_FAKE_EVENT))
+    nostril_ws_close(early)
+    // Growing and shrinking the library's handle table must not move callback
+    // userdata or invalidate another live session.
+    first_session := nostril_ws_open(plain, cert)
+    second_session := nostril_ws_open(secure, cert)
+    assert(ws_wait_ready(first_session))
+    assert(ws_wait_ready(second_session))
+    nostril_ws_close(first_session)
+    parallel_event := nostril_sign_text_note(TEST_SECRET_KEY, "second session survives", 1700000199)
+    parallel_id := nostril_event_id(parallel_event)
+    nostril_ws_publish(second_session, parallel_event)
+    assert(ws_wait_publication(second_session, parallel_id) == "accepted")
+    assert(nostril_relay_event_id(nostril_ws_receive(second_session)) == parallel_id)
+    nostril_ws_close(second_session)
+    for url : Str in array(Str, plain, secure) {
+        handle := nostril_ws_open(url, cert)
+        assert(handle != 0)
+        if !ws_wait_ready(handle) {
+            status := nostril_ws_status(handle)
+            nostril_ws_close(handle)
+            Cmd.new("kill", "-TERM", fixture_pid.to_str()).run_checked()
+            fixture.wait()
+            panic("WebSocket not ready: ", url, " status=", status, " fixture=", fixture.err())
+        }
+        assert(nostril_ws_receive(handle) == "")
+        event := nostril_sign_text_note(TEST_SECRET_KEY, "roundtrip", 1700000200)
+        id := nostril_event_id(event)
+        nostril_ws_publish(handle, event)
+        assert(ws_wait_publication(handle, id) == "accepted")
+        message := nostril_ws_receive(handle)
+        assert(nostril_relay_event_id(message) == id)
+        assert(nostril_ws_status(handle).contains("fixture ready"))
+        nostril_ws_close(handle)
+    }
+    for content : Str in array(Str, "retry", "lost-ack", "reject") {
+        handle := nostril_ws_open(secure, cert)
+        assert(handle != 0)
+        assert(ws_wait_ready(handle))
+        event := nostril_sign_text_note(TEST_SECRET_KEY, content, 1700000201)
+        id := nostril_event_id(event)
+        nostril_ws_publish(handle, event)
+        status := ws_wait_publication(handle, id)
+        if content == "reject" { assert(status == "rejected: blocked: fixture policy") }
+        else {
+            assert(status == "accepted")
+            assert(nostril_relay_event_id(nostril_ws_receive(handle)) == id)
+            assert(nostril_ws_receive(handle) == "")
+        }
+        nostril_ws_close(handle)
+    }
+    for content : Str in array(Str, "binary", "oversize", "closed", "invalid-utf8") {
+        handle := nostril_ws_open(plain)
+        assert(ws_wait_ready(handle))
+        event := nostril_sign_text_note(TEST_SECRET_KEY, content, 1700000202)
+        nostril_ws_publish(handle, event)
+        until := nng_clock() + 3000
+        mut detected := false
+        while nng_clock() < until {
+            nostril_ws_poll(handle)
+            status := nostril_ws_status(handle)
+            if status.contains("binary message rejected") || status.contains("message too large") ||
+                status.contains("closed: blocked:") ||
+                (content == "invalid-utf8" && status.starts_with("disconnected")) { detected = true; break }
+            sleep_ms(5)
+        }
+        assert(detected)
+        assert(!nostril_ws_ready(handle))
+        assert(nostril_ws_receive(handle) == "")
+        nostril_ws_close(handle)
+    }
+    // Neither an untrusted certificate nor a trusted wrong-host certificate
+    // may reach the WebSocket established/subscribed state.
+    for url : Str in array(Str, secure, wrong_host) {
+        mut trust := ""
+        if url == wrong_host { trust = cert.clone() }
+        handle := nostril_ws_open(url, trust)
+        assert(handle != 0)
+        until := nng_clock() + 2000
+        mut failed := false
+        while nng_clock() < until {
+            nostril_ws_poll(handle)
+            assert(!nostril_ws_ready(handle))
+            if nostril_ws_status(handle).contains("connection failed") { failed = true; break }
+            sleep_ms(5)
+        }
+        assert(failed)
+        nostril_ws_close(handle)
+    }
+    Cmd.new("kill", "-TERM", fixture_pid.to_str()).run_checked()
+    assert(fixture.wait() == 0)
+    File.remove(ports_file)
+    File.remove(event_file)
+    File.remove(cert)
+    File.remove(key)
+}
 
 test_websocket_dependency := test() {
     for path : Str in array(Str, "gen/websocket/nostril-websocket-smoke",

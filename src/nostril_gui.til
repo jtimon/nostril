@@ -2,6 +2,7 @@ mode gui
 
 import("../gen/nostril_api")
 import("../lib/modes/nostril_live")
+import("../gen/websocket_api")
 
 gui_utf8 := func(code: I64) returns Str {
     if code < 0 || code > 0x10ffff || (code >= 0xd800 && code <= 0xdfff) {
@@ -28,6 +29,13 @@ gui_without_last_scalar := func(text: Str) returns Str {
     mut start := text.len() - 1
     while start > 0 && text[start].cast(U8).to_i64().band(0xc0) == 0x80 { start-- }
     return text.substr(0, start).clone()
+}
+
+gui_status_text := func(text: Str) returns Str {
+    if text.len() <= 160 { return text.clone() }
+    mut end : USize = 160
+    while end > 0 && text[end].cast(U8).to_i64().band(0xc0) == 0x80 { end-- }
+    return format(text.substr(0, end), "...")
 }
 
 gui_fitting_tail := proc(text: Str, width: I32, font_size: I32) returns Str {
@@ -89,9 +97,14 @@ main := proc(args: ..Str) {
     }
     mut socket := nng_socket()
     mut publisher := nng_socket()
+    remote := live && (endpoint.starts_with("ws://") || endpoint.starts_with("wss://"))
+    mut websocket : I64 = 0
     mut outbox := Vec(Publication).new()
     mut feed := FeedClient()
-    if live {
+    if remote {
+        websocket = nostril_ws_open(endpoint)
+        if websocket == 0 { panic("could not create WebSocket client") }
+    } else if live {
         nostril_live_open(socket, endpoint, false)
         nostril_publish_open(publisher, endpoint, false)
     }
@@ -118,7 +131,17 @@ main := proc(args: ..Str) {
     SetTargetFPS(60)
 
     while !WindowShouldClose() {
-        if live {
+        if remote {
+            nostril_ws_poll(websocket)
+            delivery_status = gui_status_text(nostril_ws_status(websocket))
+            mut budget : I64 = 32
+            while budget > 0 {
+                message := nostril_ws_receive(websocket)
+                if message.len() == 0 { break }
+                nostril_live_accept(messages, message)
+                budget--
+            }
+        } else if live {
             nostril_feed_poll(socket, feed, messages)
             if feed.ready { nostril_publish_poll(publisher, outbox) }
             if feed.ready { delivery_status = "Live subscription" }
@@ -163,7 +186,9 @@ main := proc(args: ..Str) {
             event := nostril_sign_text_note(secret_key, composer, nostril_now())
             if !nostril_event_is_valid(event) { panic("newly signed event did not verify") }
             nostril_live_accept(messages, nostril_live_envelope(event))
-            if live {
+            if remote {
+                nostril_ws_publish(websocket, event)
+            } else if live {
                 nostril_publish_queue(outbox, event)
             }
             composer = ""
@@ -201,7 +226,8 @@ main := proc(args: ..Str) {
                 DrawText("Note".c_str, content_x, row_y + 9, 13, muted)
                 gui_draw_wrapped(message, message_x, row_y + 7, message_w, 16, 21, text)
                 mut publication_status := "local only"
-                if live { publication_status = nostril_publish_label(outbox, nostril_relay_event_id(event)) }
+                if remote { publication_status = gui_status_text(nostril_ws_publication_status(websocket, nostril_relay_event_id(event))) }
+                else if live { publication_status = nostril_publish_label(outbox, nostril_relay_event_id(event)) }
                 visible_status := gui_fitting_tail(publication_status, message_w, 11)
                 DrawText(visible_status.c_str, message_x, bottom - 15, 11, muted)
                 DrawRectangle(content_x, bottom - 1, content_w, 1, border)
@@ -246,7 +272,8 @@ main := proc(args: ..Str) {
     }
 
     CloseWindow()
-    if live {
+    if remote { nostril_ws_close(websocket) }
+    else if live {
         nostril_live_send(socket, NOSTRIL_LOCAL_CLOSE)
         nostril_nng_close(publisher)
         nostril_nng_close(socket)

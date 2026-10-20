@@ -35,8 +35,15 @@ The full build also stages the [[file:websocket.org][pinned libwebsockets client
 development files and system CA certificates. On Ubuntu/Debian install
 =libssl-dev= and =ca-certificates=. CMake =--fresh= keeps the vendor profile
 consistent when options change. Static/shared TLS-context smoke tests run as
-part of =./make.til test=. This prepares the dependency; the GUI's remote
-WebSocket adapter is still pending.
+part of =./make.til test=. The driver then compiles the Til WebSocket transport
+to =gen/lib/libnostril_ws.so= and generates =gen/websocket_api.til=. The small
+native ABI helper is linked into that library; libwebsockets' shared library is
+staged in =gen/lib/= alongside it.
+
+Transport integration tests additionally require Python 3 with =websockets=
+(Ubuntu/Debian: =python3-websockets=) and the =openssl= command. The fixture binds
+only loopback interfaces, uses temporary test certificates, and is bounded by
+a subprocess timeout. No external relay is required by the suite.
 
 The build driver is executable Til code, =make.til=, rather than a GNU
 Makefile. It uses =--cpu=baseline --usize=64 --opt=0= by default.

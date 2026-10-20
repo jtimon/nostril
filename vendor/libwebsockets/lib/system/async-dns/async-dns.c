@@ -1762,7 +1762,11 @@ lws_async_dns_query(struct lws_context *context, int tsi, const char *name,
 
 		if (!found) {
 			lwsl_cx_info(context, "%s: cached but missing 0x%x, bypassing", name, qtype);
-			lws_dll2_remove(&c->list); /* Remove from cache list, let sul expire it */
+			/* A detached entry is not visited by context teardown, which
+			 * also cancels its expiry timer. Free an unreferenced entry now;
+			 * keep a referenced one linked so teardown can still reclaim it. */
+			if (!c->refcount)
+				lws_adns_cache_destroy(c);
 			c = NULL;
 		}
 	}

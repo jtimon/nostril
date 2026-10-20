@@ -721,3 +721,25 @@ nostril_subscription_response := func(request: Str) returns Str {
 nostril_subscription_envelope := func(id: Str, event_json: Str) returns Str {
     return format("[\"EVENT\",", json_quote(id), ",", event_json, "]")
 }
+
+/// Parse complete relay control messages. Unknown or malformed messages do not
+/// change connection/subscription state; only this subscription's EOSE/CLOSED do.
+nostril_relay_control := func(message: Str, subscription: Str) returns Str {
+    mut cursor := JsonCursor(text = message.borrowed_view())
+    mut command := ""
+    mut value := ""
+    if !json_take(cursor, '[') || !json_parse_string(cursor, command) ||
+        !json_take(cursor, ',') || !json_parse_string(cursor, value) { return "" }
+    mut result := ""
+    if command == "NOTICE" { result = format("notice: ", value) }
+    else if command == "EOSE" && value == subscription { result = "eose" }
+    else if command == "CLOSED" && value == subscription {
+        mut reason := ""
+        if !json_take(cursor, ',') || !json_parse_string(cursor, reason) { return "" }
+        result = format("closed: ", reason)
+    } else { return "" }
+    if !json_take(cursor, ']') { return "" }
+    json_skip_ws(cursor)
+    if cursor.at != cursor.text.len() { return "" }
+    return result
+}
