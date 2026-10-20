@@ -1,0 +1,13 @@
+mode lib
+import("../gen/nostril_startup_api")
+
+// Build, then copy gen/nostril_init.til to ~/.nostril/init.til. The generated
+// copy points to the same native library as the compiled GUI.
+init := proc() {
+    nostril_config_relay("")
+    // Create an account with bin/nostril-gui --create-account, then use its
+    // printed public key here. Secret keys never belong in this init file.
+    // nostril_config_account("main", "<64 lowercase hex public key>")
+    // nostril_config_select("main")
+    // nostril_config_relay("wss://relay.damus.io")
+}

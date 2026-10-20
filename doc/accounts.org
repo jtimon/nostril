@@ -1,0 +1,136 @@
+* Accounts, following feed, and interpreted configuration
+
+[[file:../README.org][Nostril]] | [[file:build.org][Build]] | [[file:../issues/process.org][Issue workflow]]
+
+** Create and select an account
+
+From the repository root, after building:
+
+#+begin_src sh
+./bin/nostril-gui --create-account
+cp gen/nostril_init.til ~/.nostril/init.til
+#+end_src
+
+The first command creates a fresh keypair and prints only its 64-character
+lowercase public key. Edit the copied init file, retaining its generated import
+path, and use that public key:
+
+#+begin_src til
+mode lib
+// Keep the import from gen/nostril_init.til for this build.
+import("/path/to/nostril/gen/nostril_startup_api")
+
+init := proc() {
+    nostril_config_account("main", "<public key printed by --create-account>")
+    nostril_config_select("main")
+    nostril_config_relay("wss://relay.damus.io")
+}
+#+end_src
+
+Register additional local accounts with distinct names and public keys. Select
+one in init; account switching currently takes effect on the next launch.
+Names here are local aliases, not published Nostr profile metadata.
+The CLI =--relay [endpoint]= overrides the configured relay for that launch.
+An empty configured relay keeps the GUI local-only. =--version= bypasses init.
+
+Only =~/.nostril/init.til= is automatically loaded, not files in the current
+directory. Without registrations the GUI retains an explicitly labelled,
+session-only ephemeral identity; it never silently selects a key from disk.
+Missing, corrupt, mismatched or permissive key files for a selected account
+stop startup instead of generating a replacement identity.
+
+** Follow and unfollow
+
+With a persistent account selected in init:
+
+#+begin_src sh
+./bin/nostril-gui --follow <64-character-public-key>
+./bin/nostril-gui --unfollow <64-character-public-key>
+./bin/nostril-gui
+#+end_src
+
+These headless commands load the same init and account owner as the GUI, save
+the change, print the selected account identity, and exit. They do not connect
+to a relay. Restart an already-running GUI to pick up changes made by another
+process. Follow targets need only public keys, not local account registrations
+or private keys. npub/NIP-05 input and an interactive follow editor are later work.
+
+The following feed requests kind-1 events from the selected account plus its
+followed authors. With no follows, this is an own-posts feed. It never falls
+back to an unfiltered request. The local and WebSocket consumers also apply the
+filter locally, so a relay cannot inject an unfollowed author's otherwise valid
+note into this feed. Subscriptions remain live-only (=limit:0=); no history is
+downloaded yet. The first storage implementation supports up to 512 follow tags.
+
+** Files and ownership
+
+#+begin_example
+~/.nostril/init.til
+~/.nostril/accounts/<public-key>/secret.key
+~/.nostril/accounts/<public-key>/follows.json
+~/.nostril/accounts/<public-key>/.lock
+#+end_example
+
+Init is user-authored executable Til; Nostril does not rewrite it. Account data
+is application-managed. =secret.key= contains 64 lowercase hex digits and a
+newline. New directories are owner-only (0700), and keys, follow files and locks
+are owner-only (0600). Existing storage must be owned by the current user and
+have no group/other permissions. If an existing =~/.nostril= was created with
+broader permissions, explicitly correct them with =chmod 700 ~/.nostril=.
+The store rejects symlinks at account directory/file boundaries and nonregular
+files. This implementation targets the project's existing Linux/POSIX build.
+
+Keys are plaintext by explicit choice for this first slice; permissions do not
+encrypt them. Encryption/keyring support and migration are tracked in
+[[file:../issues/open/2.org][#2]]. Til still does not guarantee secure erasure of managed secret-key copies.
+The native account library owns the active secret; configuration snapshots and
+GUI getters expose the name/public key, not that secret.
+
+=follows.json= is a complete signed NIP-02 kind-3 event owned by that account.
+Loading checks its signature, ID, kind, author, and p-tag encodings. Adding a
+follow appends it without duplicates; removing one retains unrelated tags and
+existing relay hints/petnames. Edits advance the event timestamp even if the
+clock has not advanced. Local changes are not automatically published to relays;
+NIP-02 import/synchronization remains a separate step.
+
+All reads/edits lock the account directory's lock file. Follow edits reread the
+latest event while locked, write a new 0600 temporary file, fsync it, rename it
+atomically, and fsync the directory. Concurrent writers therefore do not lose
+each other's additions. Key creation is exclusive and never overwrites a key.
+Errors before atomic replacement preserve the prior follow file; no read error
+is treated as an empty/default list. A post-rename directory-sync error is
+reported even though the complete replacement may already be visible.
+
+** TilVm bridge, following Tiled
+
+=lib/accounts/nostril_startup.til= is the single native owner of staged config
+and the active account. The compiled GUI and guest init both use the generated
+=gen/nostril_startup_api.til= binding to the same shared library instance. A
+static host copy plus a separately loaded guest copy would split that state.
+
+=src/nostril_init.til= uses the matching installed SDK recorded by the build,
+loads init in-process, looks up =init()= and calls it. Registration is staged;
+only after success are the selected key and follow list validated and adopted.
+Failures clear staged/active state and report owned diagnostics. There are no
+runtime compiler subprocesses; tests run the compiled loader with an empty PATH.
+The initial slice has no retained guest commands, so its VM can be destroyed
+after init while the native account owner remains alive through the GUI loop.
+
+Use only the configuration registration/select/relay operations during init.
+Config is trusted code, not a sandbox: arbitrary file/native side effects from
+user code are not rolled back. The loader resets its staged configuration;
+it does not promise a filesystem transaction for arbitrary guest code.
+
+As in Tiled, generated imports use explicit build paths because TilVm has no
+application import-root option. Rebuild and update the init import after moving
+the checkout or changing the installed Til SDK.
+
+** Verification
+
+The canonical suite runs =test/accounts_model.til= in a compiled host with an
+empty PATH. It checks shared init/host state and process identity, repeated
+loads, persistent identity, per-account follow isolation, failed-init rollback,
+missing/corrupt/symlink/permissive key rejection, follow signature validation,
+and preservation of tag metadata. Process tests exercise headless follow edits,
+concurrent writers, version bypass, and filesystem modes. Network tests inject
+valid but unfollowed notes and check both backends drop them locally.

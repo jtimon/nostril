@@ -1,0 +1,130 @@
+mode cli
+import("std/sys")
+import("std/file")
+import("../src/nostril_init")
+import("../gen/nostril_api")
+crypto := import("std/crypto")
+
+get_cwd_str := ext_proc() returns Str {}
+chmod := ext_proc(path: I8, shallow mode: U32) returns shallow I32 {}
+symlink := ext_proc(target: I8, path: I8) returns shallow I32 {}
+
+write_init := proc(root: Str, first: Str, second: Str, selected: Str) {
+    api := format(get_cwd_str(), "/gen/nostril_startup_api")
+    File.writefile(format(root, "/init.til"), format(
+        "mode lib\nimport(\"", api, "\")\nimport(\"std/sys\")\nimport(\"std/file\")\n",
+        "init := proc() {\n",
+        "nostril_config_account(\"first\", \"", first, "\")\n",
+        "nostril_config_account(\"second\", \"", second, "\")\n",
+        "nostril_config_select(\"", selected, "\")\n",
+        "File.writefile(\"", root, "/guest-pid\", process_id().to_str())\n}\n"))
+}
+
+main := proc(home: Str) {
+    mkdir_p(home)
+    root := format(home, "/.nostril")
+    assert(nostril_load_init(root) == "")
+    assert(!nostril_account_persistent())
+    ephemeral := nostril_account_public_key()
+    assert(nostril_account_subscription().contains(format("\"authors\":[\"", ephemeral, "\"]")))
+    assert(!File.exists(root))
+    first := nostril_account_create(root)
+    second := nostril_account_create(root)
+    assert(nostril_key_encoding(first) && nostril_key_encoding(second) && first != second)
+    write_init(root, first, second, "first")
+    assert(nostril_load_init(root) == "")
+    assert(File.readfile(format(root, "/guest-pid")) == process_id().to_str())
+    assert(nostril_account_public_key() == first && nostril_account_name() == "first")
+    note := nostril_account_sign("persistent identity", 1700000400)
+    assert(nostril_event_is_valid(note) && note.contains(first))
+    own_request := nostril_account_subscription()
+    assert(nostril_subscription_matches_relay(own_request, nostril_subscription_envelope("local", note)))
+    assert(nostril_account_follow(second, false) == "")
+    assert(nostril_account_follow(second, false) == "")
+    assert(nostril_account_follows() == format(second, "\n"))
+    follows_path := format(root, "/accounts/", first, "/follows.json")
+    follows := File.readfile(follows_path)
+    assert(nostril_follows_valid(follows, first))
+    assert(nostril_load_init(root) == "")
+    assert(nostril_account_public_key() == first && nostril_account_follows() == format(second, "\n"))
+    first_request := nostril_account_subscription()
+    write_init(root, first, second, "second")
+    assert(nostril_load_init(root) == "")
+    assert(nostril_account_public_key() == second && nostril_account_follows() == "")
+    second_note := nostril_account_sign("followed author", 1700000401)
+    assert(!nostril_subscription_matches_relay(own_request, nostril_subscription_envelope("local", second_note)))
+    assert(nostril_subscription_matches_relay(first_request, nostril_subscription_envelope("local", second_note)))
+    assert(nostril_account_follow(first, false) == "")
+    write_init(root, first, second, "first")
+    assert(nostril_load_init(root) == "")
+    assert(nostril_account_follow(second, true) == "")
+    assert(nostril_account_follows() == "")
+    assert(nostril_load_init(root) == "")
+    assert(nostril_account_follows() == "")
+
+    // Failed init must not activate partial registration or alter stored keys.
+    key_path := format(root, "/accounts/", first, "/secret.key")
+    original := File.readfile(key_path)
+    api := format(get_cwd_str(), "/gen/nostril_startup_api")
+    File.writefile(format(root, "/init.til"), format("mode lib\nimport(\"", api,
+        "\")\ninit := proc() { nostril_config_account(\"bad\", \"", first,
+        "\"); nostril_config_select(\"bad\"); panic(\"intentional init failure\") }\n"))
+    assert(nostril_load_init(root).contains("intentional init failure"))
+    assert(nostril_account_public_key() == "")
+    assert(File.readfile(key_path) == original)
+    File.writefile(format(root, "/init.til"), format("mode lib\nimport(\"", api,
+        "\")\ninit := proc() returns Str { nostril_config_relay(\"\"); return \"wrong signature\" }\n"))
+    assert(nostril_load_init(root).len() > 0)
+    assert(nostril_account_public_key() == "")
+    write_init(root, first, second, "first")
+    assert(chmod(key_path.c_str, 0x1a4) == 0)
+    assert(nostril_load_init(root).contains("read secret key"))
+    assert(chmod(key_path.c_str, 0x180) == 0)
+    File.writefile(key_path, "not a secret key")
+    assert(nostril_load_init(root).contains("invalid secret key"))
+    assert(File.readfile(key_path) == "not a secret key")
+    File.writefile(key_path, original)
+    saved := format(key_path, ".saved")
+    File.rename(key_path, saved)
+    assert(nostril_load_init(root).contains("read secret key"))
+    assert(!File.exists(key_path))
+    assert(symlink(saved.c_str, key_path.c_str) == 0)
+    assert(nostril_load_init(root).contains("read secret key"))
+    File.remove(key_path)
+    File.rename(saved, key_path)
+    assert(nostril_load_init(root) == "")
+    valid_follows := File.readfile(follows_path)
+    File.writefile(follows_path, "broken follow list")
+    assert(nostril_account_follow(second, false).contains("invalid follow list"))
+    assert(File.readfile(follows_path) == "broken follow list")
+    assert(nostril_load_init(root).contains("invalid follow list"))
+    File.writefile(follows_path, valid_follows)
+    assert(nostril_load_init(root) == "")
+    assert(nostril_account_public_key() == first)
+    directory := format(root, "/accounts/", first)
+    assert(chmod(directory.c_str, 0x140) == 0)
+    assert(nostril_account_follow(second, false).contains("write follow list"))
+    assert(chmod(directory.c_str, 0x1c0) == 0)
+    assert(File.readfile(follows_path) == valid_follows)
+    // A follow edit preserves existing hints/petnames and unrelated tags.
+    secret := original.trim().clone()
+    tags := format("[[\"alt\",\"local list\"],[\"p\",\"", second, "\",\"wss://hint\",\"friend\"]]")
+    digest := crypto.sha256_str(format("[0,\"", first, "\",1700000402,3,", tags, ",\"\"]"))
+    signature := crypto.schnorr_sign(U256.from_hex(secret), digest, U256())!
+    fixture := format("{\"id\":\"", digest.to_hex(), "\",\"pubkey\":\"", first,
+        "\",\"created_at\":1700000402,\"kind\":3,\"tags\":", tags, ",\"content\":\"\",\"sig\":\"", signature.to_hex(), "\"}")
+    File.writefile(follows_path, fixture)
+    third := nostril_pubkey("0000000000000000000000000000000000000000000000000000000000000003")
+    assert(nostril_account_follow(third, false) == "")
+    extended := File.readfile(follows_path)
+    assert(nostril_follows_valid(extended, first))
+    assert(extended.contains("[\"alt\",\"local list\"]") && extended.contains("\"wss://hint\",\"friend\""))
+    assert(nostril_account_follow(second, true) == "")
+    shortened := File.readfile(follows_path)
+    assert(shortened.contains(third) && !shortened.contains(second) && shortened.contains("[\"alt\",\"local list\"]"))
+    File.writefile(follows_path, valid_follows)
+    File.writefile(format(home, "/account-public-key"), first)
+    File.writefile(format(home, "/follow-public-key"), second)
+    nostril_config_reset()
+    println("PASS: shared TilVm startup, persistent identities, follows, rollback and owner-only storage")
+}

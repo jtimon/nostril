@@ -83,7 +83,9 @@ and USize64 layout used by this Linux build.
 The GUI selects this transport for =--relay ws://...= or =--relay wss://...=;
 IPC endpoints keep the NNG backend. WebSockets send standard Nostr REQ/CLOSE and
 =["EVENT",event]= messages without NNG headers or terminating NULs. A fixed
-=local= subscription requests live kind-1 events with =limit:0=. Matching EOSE
+=local= subscription requests live kind-1 events with =limit:0=. The GUI sets
+its authors to the active account plus follows through =nostril_ws_subscribe=;
+the receiver checks this filter locally too. Matching EOSE
 enables queued publications; valid events can arrive before EOSE. CLOSED stops
 that subscription, NOTICE is retained for display, and only a complete matching
 OK changes publication status. Invalid messages never enter the event queue.

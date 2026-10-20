@@ -147,7 +147,9 @@ a filter are ANDed, and multiple filters are ORed. IDs, authors, =#e= and =#p=
 values require full lowercase 64-character hex. Tag matching uses only the
 second string of each event tag. Empty lists, duplicate fields, unknown fields,
 and nonzero or missing limits are rejected instead of silently broadening a
-subscription. The GUI currently requests kind 1 under ID =local=.
+subscription. The GUI requests kind 1 under ID =local=, restricted to its active
+account and followed authors. Received events are checked against that request
+locally as well; an empty follow list means self-only, not an unfiltered feed.
 
 GUI feed I/O is nonblocking with bounded work per frame. Before EOSE, the GUI
 retries its REQ once per second. A dead connection clears readiness and triggers

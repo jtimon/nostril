@@ -57,6 +57,7 @@ FeedClient := struct {
     peer : U32 = 0
     ready := false
     retry_at : U64 = 0
+    request : Str = NOSTRIL_LIVE_REQUEST
 }
 
 nostril_feed_poll := proc(socket: nng_socket, mut client: FeedClient, mut timeline: Vec(Str)) {
@@ -67,7 +68,7 @@ nostril_feed_poll := proc(socket: nng_socket, mut client: FeedClient, mut timeli
     }
     now := nng_clock()
     if !client.ready && now >= client.retry_at {
-        nostril_live_send(socket, NOSTRIL_LIVE_REQUEST)
+        nostril_live_send(socket, client.request)
         client.retry_at = now + 1000
     }
     mut message := ""
@@ -78,7 +79,7 @@ nostril_feed_poll := proc(socket: nng_socket, mut client: FeedClient, mut timeli
             client.peer = peer
             client.ready = true
         } else if client.ready && peer == client.peer && nostril_control_id(message, "EVENT") == "local" {
-            nostril_live_accept(timeline, message)
+            if nostril_subscription_matches_relay(client.request, message) { nostril_live_accept(timeline, message) }
         }
         budget--
     }

@@ -1,0 +1,32 @@
+# priority: high
+# category: features
+** FIXED #1 Persistent accounts, per-account follows and TilVm configuration
+
+Implemented one shared native account/config owner consumed by the compiled
+GUI and interpreted init. Keys are created exclusively with owner-only modes;
+signed follow files are validated, locked, and atomically replaced. Both
+transports request self plus follows and enforce the author filter locally.
+The GUI uses the selected account for signing without exposing its secret in
+configuration snapshots. Setup and limits are documented in doc/accounts.org;
+encrypted storage remains open as #2.
+
+Verification:
+- ./make.til built all applications and shared libraries.
+- ./make.til test: 20/20 interpreted and compiled tests passed.
+- Full 20/20 ASan suite passed with all three Til libraries and the account/GUI
+  headless consumers instrumented; leak detection stayed enabled.
+- ASan account library + model: empty-PATH TilVm loading, owned state, rollback,
+  key/follow validation, failed-write preservation and teardown passed with leak
+  detection enabled.
+- X11 GUI Send/Enter passed with a private persistent test account, normally and
+  under ASan invalid-access checking (graphical driver leak exception documented
+  in doc/build.org).
+- Process tests covered concurrent follow writers, account creation with broken
+  init, version bypass, and 0700/0600 filesystem modes. Network fixtures injected
+  signed but unfollowed events and verified both transports rejected them.
+
+Use Tiled's shared native startup library and interpreted init() pattern.
+Store plaintext owner-only account keys and signed NIP-02 follow lists under
+~/.nostril/accounts/<pubkey>/. Filter feeds by self plus followed public keys.
+Keep init.til user-authored, report invalid configuration without adopting
+partial state, and retain local-only ephemeral operation without configuration.

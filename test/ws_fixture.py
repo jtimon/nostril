@@ -11,8 +11,9 @@ from websockets.legacy.server import serve
 
 
 async def main():
-    port_file, cert, key, event_file = sys.argv[1:]
+    port_file, cert, key, event_file, unfollowed_file = sys.argv[1:]
     early_event = pathlib.Path(event_file).read_text()
+    unfollowed_event = pathlib.Path(unfollowed_file).read_text()
     tls = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     tls.load_cert_chain(cert, key)
     received = {}
@@ -28,7 +29,14 @@ async def main():
                 assert isinstance(raw, str) and "\0" not in raw
                 command = json.loads(raw)
                 if command[0] == "REQ":
-                    assert command == ["REQ", "local", {"kinds": [1], "limit": 0}]
+                    assert len(command) == 3 and command[:2] == ["REQ", "local"]
+                    assert command[2]["kinds"] == [1] and command[2]["limit"] == 0
+                    assert set(command[2]) <= {"kinds", "limit", "authors"}
+                    if "authors" in command[2]:
+                        # Deliberately violate the filter: the client must apply
+                        # author selection locally even for valid signed notes.
+                        await socket.send(unfollowed_event)
+                        await socket.send(early_event)
                     if path.endswith("=early"):
                         await socket.send(early_event)
                     await socket.send(['["EOSE",', '"local"]'])

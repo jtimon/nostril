@@ -3,6 +3,8 @@ mode gui
 import("../gen/nostril_api")
 import("../lib/modes/nostril_live")
 import("../gen/websocket_api")
+import("nostril_init")
+import("std/sys")
 
 gui_utf8 := func(code: I64) returns Str {
     if code < 0 || code > 0x10ffff || (code >= 0xd800 && code <= 0xdfff) {
@@ -88,11 +90,38 @@ main := proc(args: ..Str) {
         println(nostril_version())
         return
     }
-    mut live := false
-    mut endpoint := NOSTRIL_LIVE_ENDPOINT
+    home := get_env("HOME")
+    mut root := ""
+    if home.len() > 0 { root = format(home, "/.nostril") }
+    if args.len() == 1 && args[0] == "--create-account" {
+        result := nostril_account_create(root)
+        if !nostril_key_encoding(result) { panic(result) }
+        println(result)
+        return
+    }
+    mut follow_action := false
     if args.len() > 0 {
-        if args[0] != "--relay" || args.len() > 2 { panic("usage: nostril-gui [--version | --relay [ipc-endpoint]]") }
+        follow_action = args.len() == 2 && (args[0] == "--follow" || args[0] == "--unfollow")
+        if !follow_action && (args[0] != "--relay" || args.len() > 2) {
+            panic("usage: nostril-gui [--version | --relay [endpoint] | --create-account | --follow pubkey | --unfollow pubkey]")
+        }
+    }
+    failure := nostril_load_init(root)
+    if failure.len() > 0 { panic(failure) }
+    if follow_action {
+        name := nostril_account_name()
+        pubkey := nostril_account_public_key()
+        error := nostril_account_follow(args[1], args[0] == "--unfollow")
+        nostril_config_reset()
+        if error.len() > 0 { panic(error) }
+        println("Follow list saved locally for ", name, " (", pubkey, ")")
+        return
+    }
+    mut endpoint := nostril_account_relay()
+    mut live := endpoint.len() > 0
+    if args.len() > 0 {
         live = true
+        endpoint = NOSTRIL_LIVE_ENDPOINT
         if args.len() == 2 { endpoint = args[1].clone() }
     }
     mut socket := nng_socket()
@@ -100,10 +129,12 @@ main := proc(args: ..Str) {
     remote := live && (endpoint.starts_with("ws://") || endpoint.starts_with("wss://"))
     mut websocket : I64 = 0
     mut outbox := Vec(Publication).new()
-    mut feed := FeedClient()
+    subscription := nostril_account_subscription()
+    mut feed := FeedClient(request = subscription.clone())
     if remote {
         websocket = nostril_ws_open(endpoint)
         if websocket == 0 { panic("could not create WebSocket client") }
+        nostril_ws_subscribe(websocket, subscription)
     } else if live {
         nostril_live_open(socket, endpoint, false)
         nostril_publish_open(publisher, endpoint, false)
@@ -118,9 +149,10 @@ main := proc(args: ..Str) {
     muted := Color(r = 152, g = 152, b = 152, a = 255)
     action := Color(r = 74, g = 112, b = 170, a = 255)
 
-    // The account exists only for this process. Nothing writes the secret key.
-    secret_key := nostril_generate_secret_key()
-    public_key := nostril_pubkey(secret_key)
+    public_key := nostril_account_public_key()
+    account_name := nostril_account_name()
+    mut identity := format("Account ", account_name, " ")
+    if !nostril_account_persistent() { identity = "Ephemeral " }
     mut messages := Vec(Str).new()
     mut composer := ""
     mut composer_scalars : I32 = 0
@@ -183,7 +215,7 @@ main := proc(args: ..Str) {
             mouse.y >= field_y.to_f32() && mouse.y < (field_y + field_h).to_f32()
         submit := IsKeyPressed(257) || (button_hover && IsMouseButtonPressed(0))
         if submit && composer.trim().len() > 0 {
-            event := nostril_sign_text_note(secret_key, composer, nostril_now())
+            event := nostril_account_sign(composer, nostril_now())
             if !nostril_event_is_valid(event) { panic("newly signed event did not verify") }
             nostril_live_accept(messages, nostril_live_envelope(event))
             if remote {
@@ -200,9 +232,9 @@ main := proc(args: ..Str) {
 
         DrawRectangle(0, header_h - 1, width, 1, border)
         DrawText("Nostril".c_str, margin, 12, 20, text)
-        mut status := format("Ephemeral pubkey ", public_key, " | ", delivery_status)
+        mut status := format(identity, public_key, " | ", delivery_status)
         if MeasureText(status.c_str, 13) > width - 100 {
-            status = format("Ephemeral ", public_key.substr(0, 8), "... | ", delivery_status)
+            status = format(identity, public_key.substr(0, 8), "... | ", delivery_status)
         }
         DrawText(status.c_str, width - margin - MeasureText(status.c_str, 13), 16, 13, muted)
 
@@ -278,4 +310,5 @@ main := proc(args: ..Str) {
         nostril_nng_close(publisher)
         nostril_nng_close(socket)
     }
+    nostril_config_reset()
 }

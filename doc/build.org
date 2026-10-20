@@ -45,6 +45,13 @@ Transport integration tests additionally require Python 3 with =websockets=
 only loopback interfaces, uses temporary test certificates, and is bounded by
 a subprocess timeout. No external relay is required by the suite.
 
+The full build also compiles =lib/accounts/nostril_startup.til= as a shared
+library and generates =gen/nostril_startup_api.til=, =gen/nostril_runtime.til=
+(the matching installed SDK location), and =gen/nostril_init.til= (ready to copy
+and edit). The GUI and interpreted init use the same shared state. Runtime
+configuration uses TilVm, not a compiler subprocess. The account model test is
+built as =bin/nostril-account-tests= and exercised with an empty PATH.
+
 The build driver is executable Til code, =make.til=, rather than a GNU
 Makefile. It uses =--cpu=baseline --usize=64 --opt=0= by default.
 
@@ -82,7 +89,8 @@ directory is reserved for reference repositories and is preserved.
 
 ** GUI Send regression
 
-The optional X11 test types heap-owned composer text, clicks Send, checks that
+The optional X11 test creates a persistent test account in a private HOME,
+loads it through TilVm, types heap-owned composer text, clicks Send, checks that
 the composer is cleared, submits another note with Enter, and closes the GUI.
 It runs local-only and never publishes to a public relay. It requires Xvfb,
 =xwininfo=, and X11/XTest libraries in addition to the normal GUI dependencies:
@@ -118,3 +126,8 @@ independently owned events; string literals alone would hide this ownership bug.
 - =bin/nostril-cli=, =bin/nostril-relay=, and =bin/nostril-gui=: application executables.
 
 Generated files are ignored by Git and should not be edited by hand.
+
+** Issue summary
+
+Follow [[file:../issues/process.org][the issue workflow adapted from Tiled]]. Regenerate the summary without
+building the applications with =til interpret make.til summary=.

@@ -29,11 +29,10 @@ own other event kinds and additional relay messages and
 transport-independent client behavior. Hosts own argument handling, display
 state, input, and user interaction.
 
-The GUI keeps signed event JSON in a host-owned =Vec(Str)=. It creates one
-OS-random keypair at startup, signs each non-empty composer submission as a
-kind-1 event, verifies it, and displays content only through the shared event
-API. The key and events have process lifetime only: there is no key storage or
-persistence. With =--relay= the GUI sends signed notes through the local live
+The GUI keeps signed event JSON in a host-owned =Vec(Str)=. The shared account
+library owns either the configured persistent key or an ephemeral fallback when
+no account is configured. It signs each submission as a kind-1 event. With
+=--relay= the GUI sends signed notes through the local live
 feed. Its timeline holds relay envelopes and accepts incoming messages only
 after shared validation; matching event IDs are suppressed. Nonblocking receives
 are capped at 32 messages per frame to keep input/rendering responsive.
@@ -62,7 +61,8 @@ The library parses live-only REQ/CLOSE controls and evaluates filters; the
 host-side live module owns the connection/subscription state. Native NNG pipe
 handles identify connections, not public keys. The GUI owns a feed-readiness
 state machine, waits for EOSE before starting queued publications, and renews
-its kind-1 subscription after reconnecting. No history or storage is introduced.
+its author-filtered kind-1 subscription after reconnecting. Timelines/outboxes
+remain in memory; only accounts and follow lists are currently persisted.
 
 For ws/wss URLs the GUI instead uses =lib/websocket/nostril_ws.til= through its
 compiled library binding. Callback bodies, receive assembly, publication state
@@ -72,11 +72,13 @@ C function address, not a Til closure value. Both execution modes consume the
 same compiled callback implementation. See [[file:websocket.org][the WebSocket transport]] for ownership,
 limits, TLS verification, and the independent loopback tests.
 
-User configuration is likewise deferred. Possible forms include a conventional
-=~/.nostril.conf= file or executable Til startup code such as
-=nostril.d/init.til=, but neither path nor format is an interface yet. Nostril
-will follow the configuration and initialization model established by Tiled
-rather than define a parallel loader prematurely.
+User configuration follows Tiled's TilVm/shared-library pattern. The GUI and
+interpreted =~/.nostril/init.til= share =libnostril_startup.so=; init stages
+account declarations, selection and relay preference, then the host validates
+and adopts the selected account. Secret keys remain in the compiled account
+owner. Signed follow files are locked and atomically replaced. Both transports
+receive the same self-plus-follows request and recheck that filter locally.
+See [[file:accounts.org][accounts and configuration]] for the API and storage contracts.
 
 NNG is the initial local transport and integration harness. It may remain a
 production IPC backend after remote transports are added. WebSocket, WebRTC,
@@ -86,7 +88,6 @@ state machines rather than duplicate NIP behavior. See
 backend capabilities, and specification-derived issue planning.
 
 Transport-specific resources should have explicit ownership and teardown.
-Persistence, durable key storage, and additional supported NIPs likewise need
-documented interfaces and threat models before implementation. The current
-ephemeral signing path inherits Til =std/crypto='s experimental status and does
-not promise secure erasure of managed secret-key copies.
+Encrypted key storage is tracked in [[file:../issues/open/2.org][#2]]. Current owner-only plaintext storage
+and signing inherit Til =std/crypto='s experimental status and do not promise
+secure erasure of managed secret-key copies.

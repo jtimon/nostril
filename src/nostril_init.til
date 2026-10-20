@@ -1,0 +1,25 @@
+mode lib
+import("std/tilvm")
+import("std/file")
+import("../gen/nostril_runtime")
+import("../gen/nostril_startup_api")
+NostrilInit := proc()
+
+priv eval_init := proc(mut vm: TilVm, path: Str) throws TilVmError {
+    vm.load_file(path)?
+    mut init := vm.lookup("init", NostrilInit)?
+    init.call()?
+}
+
+nostril_load_init := proc(root: Str) returns Str {
+    nostril_config_reset()
+    path := format(root, "/init.til")
+    if root.len() > 0 && File.exists(path) {
+        mut vm := TilVm.new(NOSTRIL_SDK)
+        eval_init(vm, path)?
+        catch (error: TilVmError) { nostril_config_reset(); return error.to_str() }
+    }
+    failure := nostril_config_apply(root)
+    if failure.len() > 0 { nostril_config_reset() }
+    return failure
+}

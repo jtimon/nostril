@@ -1,0 +1,164 @@
+mode lib
+import("../nostril/event")
+link_c("store.c")
+
+nostril_store_directory := ext_proc(path: I8, shallow create: Bool) returns shallow I32 {}
+nostril_store_lock := ext_proc(path: I8, mut error: I32) returns ref Dynamic {}
+nostril_store_unlock := ext_proc(handle: Dynamic) {}
+nostril_store_read := ext_proc(handle: Dynamic, name: I8, mut error: I32) returns Str {}
+nostril_store_write := ext_proc(handle: Dynamic, name: I8, bytes: Str, shallow exclusive: Bool) returns shallow I32 {}
+
+priv AccountSpec := struct { name : Str = ""; pubkey : Str = "" }
+priv mut accounts := Vec(AccountSpec).new()
+priv mut selected := ""
+priv mut relay := ""
+priv mut config_error := ""
+priv mut active_secret := ""
+priv mut active_pubkey := ""
+priv mut active_name := ""
+priv mut active_follows := ""
+priv mut active_directory := ""
+
+nostril_config_reset := proc() {
+    noop_proc()
+    accounts.clear(); selected = ""; relay = ""; config_error = ""
+    active_secret = ""; active_pubkey = ""; active_name = ""; active_follows = ""; active_directory = ""
+}
+
+nostril_config_account := proc(name: Str, pubkey: Str) {
+    noop_proc()
+    if name.len() == 0 || name.len() > 64 || !nostril_key_encoding(pubkey) {
+        config_error = "account registration requires a name and a lowercase 64-digit public key"
+        return
+    }
+    for account : AccountSpec in accounts {
+        if account.name == name { config_error = "duplicate account name"; return }
+    }
+    accounts.push(own AccountSpec(name = name.clone(), pubkey = pubkey.clone()))
+}
+
+nostril_config_select := proc(name: Str) { noop_proc(); selected = name.clone() }
+nostril_config_relay := proc(url: Str) { noop_proc(); relay = url.clone() }
+nostril_account_relay := proc() returns Str { noop_proc(); return relay.clone() }
+nostril_account_public_key := proc() returns Str { noop_proc(); return active_pubkey.clone() }
+nostril_account_name := proc() returns Str { noop_proc(); return active_name.clone() }
+nostril_account_persistent := proc() returns Bool { noop_proc(); return active_directory.len() > 0 }
+nostril_account_follows := proc() returns Str { noop_proc(); return active_follows.clone() }
+
+priv storage_error := func(operation: Str, error: I32) returns Str {
+    return format(operation, " failed (storage error ", error.to_str(), ")")
+}
+
+priv account_tree := proc(root: Str, pubkey: Str, create: Bool) returns Str {
+    if root.len() == 0 { return "HOME is unset; persistent accounts need a home directory" }
+    for path : Str in array(Str, root, format(root, "/accounts"), format(root, "/accounts/", pubkey)) {
+        value := path.clone()
+        error := nostril_store_directory(value.c_str, create)
+        if error != 0 { return storage_error("account directory (must be owner-only)", error) }
+    }
+    return ""
+}
+
+nostril_account_create := proc(root: Str) returns Str {
+    secret := nostril_generate_secret_key()
+    pubkey := nostril_pubkey(secret)
+    error := account_tree(root, pubkey, true)
+    if error.len() > 0 { return error }
+    directory := format(root, "/accounts/", pubkey)
+    mut code : I32 = 0
+    ref handle : Dynamic = nostril_store_lock(directory.c_str, code)
+    if handle.is_null() { return storage_error("account lock", code) }
+    bytes := format(secret, "\n")
+    code = nostril_store_write(handle, "secret.key".c_str, bytes, true)
+    nostril_store_unlock(handle)
+    if code != 0 { return storage_error("create secret key", code) }
+    return pubkey
+}
+
+priv read_follows := proc(handle: Dynamic, pubkey: Str, mut event: Str) returns Str {
+    mut code : I32 = 0
+    data := nostril_store_read(handle, "follows.json".c_str, code)
+    if code == -1 { event = ""; return "" }
+    if code != 0 { return storage_error("read follow list", code) }
+    if !nostril_follows_valid(data, pubkey) { return "invalid follow list: expected this account's signed kind-3 event (at most 512 p tags)" }
+    event = data.clone()
+    return ""
+}
+
+nostril_config_apply := proc(root: Str) returns Str {
+    noop_proc()
+    if config_error.len() > 0 { return config_error.clone() }
+    if relay.len() > 0 && !relay.starts_with("wss://") && !relay.starts_with("ws://") &&
+        !relay.starts_with("ipc://") && !relay.starts_with("inproc://") { return "unsupported relay URL" }
+    if selected.len() == 0 && accounts.len() == 0 {
+        active_secret = nostril_generate_secret_key()
+        active_pubkey = nostril_pubkey(active_secret)
+        active_name = "ephemeral"
+        active_follows = ""
+        active_directory = ""
+        return ""
+    }
+    mut pubkey := ""
+    for account : AccountSpec in accounts { if account.name == selected { pubkey = account.pubkey.clone() } }
+    if pubkey.len() == 0 { return "select a registered account with nostril_config_select" }
+    directory_error := account_tree(root, pubkey, false)
+    if directory_error.len() > 0 { return directory_error }
+    directory := format(root, "/accounts/", pubkey)
+    mut code : I32 = 0
+    ref handle : Dynamic = nostril_store_lock(directory.c_str, code)
+    if handle.is_null() { return storage_error("account lock", code) }
+    bytes := nostril_store_read(handle, "secret.key".c_str, code)
+    if code != 0 { nostril_store_unlock(handle); return storage_error("read secret key", code) }
+    secret := bytes.trim().clone()
+    if !nostril_secret_valid(secret) { nostril_store_unlock(handle); return "invalid secret key encoding or scalar" }
+    if nostril_pubkey(secret) != pubkey { nostril_store_unlock(handle); return "secret key does not match the registered public key" }
+    mut event := ""
+    follow_error := read_follows(handle, pubkey, event)
+    nostril_store_unlock(handle)
+    if follow_error.len() > 0 { return follow_error }
+    // Adopt only after the entire account has been validated.
+    active_secret = secret.clone(); active_pubkey = pubkey.clone()
+    active_name = selected.clone(); active_directory = directory.clone()
+    active_follows = ""
+    if event.len() > 0 { active_follows = nostril_follows_keys(event, pubkey) }
+    return ""
+}
+
+nostril_account_sign := proc(content: Str, timestamp: I64) returns Str {
+    if active_secret.len() == 0 { panic("no active account") }
+    return nostril_sign_text_note(active_secret, content, timestamp)
+}
+
+nostril_account_follow := proc(pubkey: Str, remove: Bool) returns Str {
+    if active_directory.len() == 0 { return "select a persistent account before editing follows" }
+    if !nostril_key_encoding(pubkey) { return "follow target must be a lowercase 64-digit public key" }
+    mut code : I32 = 0
+    ref handle : Dynamic = nostril_store_lock(active_directory.c_str, code)
+    if handle.is_null() { return storage_error("follow-list lock", code) }
+    mut previous := ""
+    error := read_follows(handle, active_pubkey, previous)
+    if error.len() > 0 { nostril_store_unlock(handle); return error }
+    event := nostril_update_follows(active_secret, previous, pubkey, remove, nostril_now())
+    if event.len() == 0 { nostril_store_unlock(handle); return "cannot update follow list (limit 512 or invalid previous state)" }
+    code = nostril_store_write(handle, "follows.json".c_str, event, false)
+    nostril_store_unlock(handle)
+    if code != 0 { return storage_error("write follow list", code) }
+    active_follows = nostril_follows_keys(event, active_pubkey)
+    return ""
+}
+
+nostril_account_subscription := proc() returns Str {
+    noop_proc()
+    if active_pubkey.len() == 0 { panic("no active account") }
+    mut authors := Set(Str).new()
+    authors.add(own active_pubkey.clone())
+    for pubkey : Str in active_follows.split("\n") { if pubkey.len() > 0 { authors.add(own pubkey.clone()) } }
+    mut out := "[\"REQ\",\"local\",{\"kinds\":[1],\"limit\":0,\"authors\":["
+    mut first := true
+    for author : Str in authors {
+        if !first { out = format(out, ",") }
+        out = format(out, "\"", author, "\"")
+        first = false
+    }
+    return format(out, "]}]")
+}

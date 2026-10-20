@@ -711,6 +711,14 @@ nostril_subscription_matches := proc(request: Str, event_json: Str) returns Bool
     return subscription_parse(request, fields, id, matches) && matches
 }
 
+nostril_subscription_matches_relay := proc(request: Str, message: Str) returns Bool {
+    mut fields := NostrEventFields()
+    if !nostril_parse_relay_event(message, fields) || !nostril_valid_fields(fields) { return false }
+    mut id := ""
+    mut matches := false
+    return subscription_parse(request, fields, id, matches) && matches
+}
+
 nostril_subscription_response := func(request: Str) returns Str {
     id := nostril_subscription_id(request)
     if id.len() > 0 { return format("[\"EOSE\",", json_quote(id), "]") }
@@ -745,4 +753,105 @@ nostril_relay_control := func(message: Str, subscription: Str) returns Str {
     json_skip_ws(cursor)
     if cursor.at != cursor.text.len() { return "" }
     return result
+}
+
+nostril_key_encoding := func(key: Str) returns Bool { return nostril_is_lower_hex(key, 64) }
+
+nostril_secret_valid := func(key: Str) returns Bool {
+    if !nostril_is_lower_hex(key, 64) { return false }
+    value := U256.from_hex(key)
+    zero := U256()
+    order := U256.from_hex("fffffffffffffffffffffffffffffffebaaedce6af48a03bbfd25e8cd0364141")
+    return U256.cmp(value, zero) > 0 && U256.cmp(value, order) < 0
+}
+
+// Read p-tag public keys while retaining complete original tags for updates.
+priv follow_tags := func(tags: Str, mut keys: Vec(Str), target: Str, remove: Bool) returns Str {
+    mut cursor := JsonCursor(text = tags.borrowed_view())
+    if !json_take(cursor, '[') { return "" }
+    mut out := Str.with_capacity(tags.len() + 80)
+    out.push_str("[")
+    mut first := true
+    if !json_take(cursor, ']') {
+        while true {
+            json_skip_ws(cursor)
+            start := cursor.at
+            if !json_take(cursor, '[') { return "" }
+            mut name := ""
+            mut value := ""
+            if !json_parse_string(cursor, name) { return "" }
+            if json_take(cursor, ',') {
+                if !json_parse_string(cursor, value) { return "" }
+                while json_take(cursor, ',') {
+                    mut extra := ""
+                    if !json_parse_string(cursor, extra) { return "" }
+                }
+            }
+            if !json_take(cursor, ']') { return "" }
+            if name == "p" {
+                if !nostril_key_encoding(value) { return "" }
+                if !(remove && value == target) { keys.push(own value.clone()) }
+            }
+            if !(remove && name == "p" && value == target) {
+                if !first { out.push_str(",") }
+                out.push_str(tags.substr(start, cursor.at - start))
+                first = false
+            }
+            if json_take(cursor, ']') { break }
+            if !json_take(cursor, ',') { return "" }
+        }
+    }
+    if target.len() > 0 && !remove {
+        mut found := false
+        for key : Str in keys { if key == target { found = true } }
+        if !found {
+            if !first { out.push_str(",") }
+            out.push_str(format("[\"p\",", json_quote(target), "]"))
+            keys.push(own target.clone())
+        }
+    }
+    out.push_str("]")
+    return out
+}
+
+nostril_follows_valid := proc(event: Str, owner: Str) returns Bool {
+    mut fields := NostrEventFields()
+    if !nostril_parse_complete_event(event, fields) || fields.kind != 3 ||
+        fields.pubkey != owner || !nostril_valid_fields(fields) { return false }
+    mut keys := Vec(Str).new()
+    return follow_tags(fields.tags, keys, "", false).len() > 0 && keys.len() <= 512
+}
+
+nostril_follows_keys := proc(event: Str, owner: Str) returns Str {
+    mut fields := NostrEventFields()
+    if !nostril_parse_complete_event(event, fields) || fields.kind != 3 ||
+        fields.pubkey != owner || !nostril_valid_fields(fields) { return "" }
+    mut keys := Vec(Str).new()
+    tags := follow_tags(fields.tags, keys, "", false)
+    if tags.len() == 0 || keys.len() > 512 { return "" }
+    mut out := ""
+    for key : Str in keys { out = format(out, key, "\n") }
+    return out
+}
+
+nostril_update_follows := proc(secret: Str, previous: Str, target: Str, remove: Bool, timestamp: I64) returns Str {
+    if !nostril_secret_valid(secret) || !nostril_key_encoding(target) { return "" }
+    owner := nostril_pubkey(secret)
+    mut fields := NostrEventFields(pubkey = owner.clone(), kind = 3, tags = "[]", created_at = timestamp)
+    if previous.len() > 0 {
+        if !nostril_follows_valid(previous, owner) { return "" }
+        nostril_parse_complete_event(previous, fields)
+        if fields.created_at == I64.MAX { return "" }
+        if timestamp <= fields.created_at { fields.created_at++ }
+        else { fields.created_at = timestamp }
+    }
+    mut keys := Vec(Str).new()
+    tags := follow_tags(fields.tags, keys, target, remove)
+    if tags.len() == 0 || keys.len() > 512 { return "" }
+    fields.tags = tags.clone()
+    digest := crypto.sha256_str(nostril_serialized_event(fields))
+    signature := crypto.schnorr_sign(U256.from_hex(secret), digest, nostril_random_u256())!
+    return format("{\"id\":", json_quote(digest.to_hex()), ",\"pubkey\":", json_quote(owner),
+        ",\"created_at\":", fields.created_at.to_str(), ",\"kind\":3,\"tags\":", fields.tags,
+        ",\"content\":", json_quote(fields.content), ",\"sig\":", json_quote(signature.to_hex()), "}")
 }

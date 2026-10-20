@@ -4,7 +4,7 @@
 
 - Keep changes focused and follow existing patterns. Fix causes rather than
   hiding errors, and read actual build or test failures before changing course.
-- Preserve unrelated work. Commit only when asked; do not create branches,
+- Preserve unrelated work. Commit completed, tested tasks automatically; do not create branches,
   worktrees, or rewrite history without being asked.
 - Do not invent relay, event, key-storage, or NIP APIs without documenting the
   ownership and compatibility decisions they introduce.
@@ -21,3 +21,12 @@
   repositories under the Git-ignored =.inspirations/= directory.
 - Til development is at =~/code/jt/til/=. Distinguish that checkout's =bin/til=
   from the installed compiler used by this project.
+
+** Issues
+
+- Follow =issues/process.org=, adapted from Tiled. Track requested tasks in
+  numbered Org issues and read =issues/NEXT_ISSUE.txt= before allocating numbers.
+- Mark started issues WIP; move completed ones to fixed/ with verification in
+  the same commit. Cancelled issues go to cancelled/ with a reason.
+- Regenerate =issues/summary.org= using =til interpret make.til summary=.
+  Do not hand-edit the generated summary or reorganize unrelated issues.

@@ -18,12 +18,12 @@ From the repository root:
 ./bin/nostril-gui
 #+end_src
 
-The GUI creates an ephemeral keypair from operating-system entropy and displays
-its public key. Type into the composer and press Enter or =Send= to create a
-signed NIP-01 kind-1 event. The secret key and events remain only in memory for
-that window session; nothing is persisted. By default the GUI stays local-only.
+Without configuration the GUI creates an ephemeral keypair from OS entropy and
+stays local-only. Type into the composer and press Enter or =Send= to create a
+signed NIP-01 kind-1 event. For a stable identity and a following feed, see
+[[file:doc/accounts.org][accounts and configuration]].
 
-To exchange notes between GUI sessions, start the local live relay, then run
+To attach GUI sessions to the local live relay, start it, then run
 two GUI instances from separate terminals in this repository:
 
 #+begin_src sh
@@ -36,8 +36,9 @@ each outgoing note as pending, accepted, or rejected (with the relay's reason).
 Pending notes retry automatically after disconnection or a lost reply, retaining
 the original signed event. Both relay and GUI deduplicate by verified event ID.
 Accepted means the relay accepted the event in memory, not that every subscriber
-received it. The event feed still has no history replay; keys, pending notes,
-and relay deduplication state last only for their process session.
+received it. The event feed still has no history replay. Configured accounts and
+follow lists persist; pending notes and relay deduplication are session-only.
+Separate identities must follow each other to see each other's notes.
 
 The GUI opens a live kind-1 subscription (=REQ= with =limit:0=), waits for
 =EOSE=, and resubscribes after reconnecting. The relay routes events only to
@@ -52,8 +53,8 @@ To connect to one public relay instead, pass its WebSocket URL:
 
 The WebSocket transport is implemented in a compiled Til library, including its
 callbacks. It verifies TLS certificates and hostnames, subscribes to live kind-1
-events, and preserves pending signed publications across reconnects. The GUI
-still creates a session-only account. See [[file:doc/websocket.org][WebSocket transport and dependencies]].
+events from self and followed authors, and preserves pending signed publications
+across reconnects. See [[file:doc/websocket.org][WebSocket transport and dependencies]].
 
 To run the scripted local NIP-01 exchange, start the relay and then run the CLI
 from another terminal:
@@ -80,14 +81,14 @@ IPC backend while WebSocket, WebRTC, or other backends are added for remote
 relays and transport-specific NIPs. Backend selection must not fork the event,
 filter, subscription, or relay model.
 
-** Configuration direction
+** Accounts and configuration
 
-Nostril does not currently load user configuration. A later version may read a
-file such as =~/.nostril.conf= or a Til initialization file such as
-=nostril.d/init.til=, but those names are examples rather than a promised
-interface. Configuration loading, executable configuration, and ownership of
-user startup code will wait for Tiled to establish the corresponding patterns.
-There is no need to invent a Nostril-specific mechanism first.
+Nostril interprets =~/.nostril/init.til= in-process with TilVm, following Tiled's
+shared startup-library pattern. =--create-account= saves a plaintext owner-only
+key and prints its public key; the init file names/selects accounts and relays.
+=--follow= and =--unfollow= persist the selected account's signed follow list.
+See [[file:doc/accounts.org][setup, ownership and storage details]]. Encrypted key storage is tracked in
+[[file:issues/open/2.org][issue #2]]. The [[file:issues/process.org][issue workflow]] is adapted from Tiled.
 
 Nostril is an experimental Til project, not an urgent replacement for mature
 Nostr software. Users who need a complete Nostr client today should use one of

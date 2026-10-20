@@ -6,6 +6,7 @@ import("std/sys")
 import("std/file")
 
 get_cwd_str := ext_proc() returns Str {}
+realpath_str := ext_proc(path: Str) returns Str {}
 
 BASE_VERSION := "0.0.1-"
 
@@ -40,6 +41,53 @@ generate_version := proc() {
 library := proc(opt: Str) {
     Cmd.new("til", "build", "--cpu=baseline", "--usize=64", opt,
         "-c", "gen/nostril.c", "lib/nostril/nostril.til").run_checked()
+}
+
+startup_library := proc(opt: Str) {
+    compiler := Cmd.new("sh", "-c", "command -v til")
+    compiler.capture_out(); compiler.run_checked()
+    output := compiler.out()
+    executable := realpath_str(output.trim())
+    bindir := executable.substr(0, executable.rfind("/").to_usize()).clone()
+    prefix := bindir.substr(0, bindir.rfind("/").to_usize()).clone()
+    sdk := format(prefix, "/lib/til")
+    if !File.is_file(format(sdk, "/src/std/tilvm.til")) { panic("installed Til SDK not found: ", sdk) }
+    File.writefile("gen/nostril_runtime.til", format("mode lib\nNOSTRIL_SDK := \"",
+        sdk.replace("\\", "\\\\").replace("\"", "\\\""), "\"\n"))
+    Cmd.new("til", "build", "--cpu=baseline", "--usize=64", opt,
+        "-c", "gen/nostril_startup.c", "lib/accounts/nostril_startup.til").run_checked()
+    root := get_cwd_str().replace("\\", "\\\\").replace("\"", "\\\"")
+    mut binding := format("mode lib\nlink(\"", root, "/gen/lib/libnostril_startup.so\")\n")
+    for name : Str in array(Str, "nostril_config_reset") {
+        binding = format(binding, "til_nostril_x5fstartup__", name, " := ext_proc() {}\n",
+            name, " := proc() { til_nostril_x5fstartup__", name, "() }\n")
+    }
+    for name : Str in array(Str, "nostril_config_select", "nostril_config_relay") {
+        binding = format(binding, "til_nostril_x5fstartup__", name, " := ext_proc(value: Str) {}\n",
+            name, " := proc(value: Str) { til_nostril_x5fstartup__", name, "(value) }\n")
+    }
+    binding = format(binding,
+        "til_nostril_x5fstartup__nostril_config_account := ext_proc(name: Str, pubkey: Str) {}\n",
+        "nostril_config_account := proc(name: Str, pubkey: Str) { til_nostril_x5fstartup__nostril_config_account(name, pubkey) }\n")
+    for name : Str in array(Str, "nostril_account_relay", "nostril_account_public_key", "nostril_account_name",
+            "nostril_account_follows", "nostril_account_subscription") {
+        binding = format(binding, "til_nostril_x5fstartup__", name, " := ext_proc() returns shallow Str {}\n",
+            name, " := proc() returns Str { return til_nostril_x5fstartup__", name, "() }\n")
+    }
+    for name : Str in array(Str, "nostril_config_apply", "nostril_account_create") {
+        binding = format(binding, "til_nostril_x5fstartup__", name, " := ext_proc(root: Str) returns shallow Str {}\n",
+            name, " := proc(root: Str) returns Str { return til_nostril_x5fstartup__", name, "(root) }\n")
+    }
+    binding = format(binding,
+        "til_nostril_x5fstartup__nostril_account_persistent := ext_proc() returns shallow Bool {}\n",
+        "nostril_account_persistent := proc() returns Bool { return til_nostril_x5fstartup__nostril_account_persistent() }\n",
+        "til_nostril_x5fstartup__nostril_account_sign := ext_proc(content: Str, shallow timestamp: I64) returns shallow Str {}\n",
+        "nostril_account_sign := proc(content: Str, timestamp: I64) returns Str { return til_nostril_x5fstartup__nostril_account_sign(content, timestamp) }\n",
+        "til_nostril_x5fstartup__nostril_account_follow := ext_proc(pubkey: Str, shallow remove: Bool) returns shallow Str {}\n",
+        "nostril_account_follow := proc(pubkey: Str, remove: Bool) returns Str { return til_nostril_x5fstartup__nostril_account_follow(pubkey, remove) }\n")
+    File.writefile("gen/nostril_startup_api.til", binding)
+    template := File.readfile("defaults/init.til")
+    File.writefile("gen/nostril_init.til", template.replace("../gen/nostril_startup_api", format(root, "/gen/nostril_startup_api")))
 }
 
 select_api := proc() {
@@ -85,7 +133,13 @@ select_api := proc() {
         "til_nostril__nostril_subscription_response := ext_func(request: Str) returns shallow Str {}\n",
         "nostril_subscription_response := func(request: Str) returns Str { return til_nostril__nostril_subscription_response(request) }\n",
         "til_nostril__nostril_subscription_envelope := ext_func(id: Str, event_json: Str) returns shallow Str {}\n",
-        "nostril_subscription_envelope := func(id: Str, event_json: Str) returns Str { return til_nostril__nostril_subscription_envelope(id, event_json) }\n"))
+        "nostril_subscription_envelope := func(id: Str, event_json: Str) returns Str { return til_nostril__nostril_subscription_envelope(id, event_json) }\n",
+        "til_nostril__nostril_subscription_matches_relay := ext_proc(request: Str, message: Str) returns shallow Bool {}\n",
+        "nostril_subscription_matches_relay := proc(request: Str, message: Str) returns Bool { return til_nostril__nostril_subscription_matches_relay(request, message) }\n",
+        "til_nostril__nostril_key_encoding := ext_func(key: Str) returns shallow Bool {}\n",
+        "nostril_key_encoding := func(key: Str) returns Bool { return til_nostril__nostril_key_encoding(key) }\n",
+        "til_nostril__nostril_follows_valid := ext_proc(event: Str, owner: Str) returns shallow Bool {}\n",
+        "nostril_follows_valid := proc(event: Str, owner: Str) returns Bool { return til_nostril__nostril_follows_valid(event, owner) }\n"))
 }
 
 build_nng := proc() {
@@ -148,6 +202,8 @@ build_ws_library := proc(opt: Str) {
         "nostril_ws_status := proc(handle: I64) returns Str { return til_nostril_x5fws__nostril_ws_status(handle) }\n",
         "til_nostril_x5fws__nostril_ws_ready := ext_proc(shallow handle: I64) returns shallow Bool {}\n",
         "nostril_ws_ready := proc(handle: I64) returns Bool { return til_nostril_x5fws__nostril_ws_ready(handle) }\n",
+        "til_nostril_x5fws__nostril_ws_subscribe := ext_proc(shallow handle: I64, request: Str) {}\n",
+        "nostril_ws_subscribe := proc(handle: I64, request: Str) { til_nostril_x5fws__nostril_ws_subscribe(handle, request) }\n",
         "til_nostril_x5fws__nostril_ws_close := ext_proc(shallow handle: I64) {}\n",
         "nostril_ws_close := proc(handle: I64) { til_nostril_x5fws__nostril_ws_close(handle) }\n"))
 }
@@ -166,12 +222,18 @@ build_mode := proc(name: Str, source: Str, opt: Str) {
 run_tests := proc(opt: Str) {
     build_mode("nostril-cli", "src/nostril_cli.til", opt)
     build_mode("nostril-relay", "src/nostril_relay.til", opt)
+    build("nostril-account-tests", "test/accounts_model.til", opt)
+    build("nostril-gui", "src/nostril_gui.til", opt)
     Cmd.new("til", "test", "--cpu=baseline", "--usize=64", opt,
         "-o", "bin/nostril-tests", "-c", "gen/nostril-tests.c",
         "tests.til").run_checked()
 }
 
 main := proc(args: ..Str) {
+    if args.len() == 1 && args[0] == "summary" {
+        Cmd.new("til", "run", "-o", "tmp/issues-summary", "examples/issues.til").run_checked()
+        return
+    }
     if args.len() == 1 && args[0] == "clean" {
         if !File.is_file("make.til") || !File.is_file("src/nostril_cli.til") {
             panic("run clean from the Nostril repository root")
@@ -201,6 +263,7 @@ main := proc(args: ..Str) {
     build_nng()
     build_websocket()
     build_ws_library(opt)
+    startup_library(opt)
     if target == "test" { run_tests(opt); return }
     build_mode("nostril-cli", "src/nostril_cli.til", opt)
     build_mode("nostril-relay", "src/nostril_relay.til", opt)

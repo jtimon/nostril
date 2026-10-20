@@ -46,6 +46,7 @@ priv WsSession := struct {
     publications := Vec(WsPublication).new()
     status : Str = "connecting"
     notice : Str = ""
+    request : Str = WS_REQUEST
 }
 
 // A heap-owned field keeps callback userdata stable when the map grows.
@@ -97,6 +98,7 @@ priv ws_message := proc(mut session: WsSession, message: Str) returns Bool {
     if !session.accepting || nostril_control_id(message, "EVENT") != "local" { return true }
     id := nostril_relay_event_id(message)
     if id.len() == 0 || session.seen.has(id) { return true }
+    if !nostril_subscription_matches_relay(session.request, message) { return true }
     if session.events.len() >= 256 { session.status = "receive queue full"; return false }
     session.seen.add(own id.clone())
     session.events.push(own message.clone())
@@ -142,7 +144,7 @@ ws_callback := proc(wsi: Dynamic, reason: I32, _user: Dynamic,
         }
     } else if reason == 10 {
         if !session.subscribed {
-            if !ws_write_text(session, WS_REQUEST) { session.status = "write failed"; return -1 }
+            if !ws_write_text(session, session.request) { session.status = "write failed"; return -1 }
             session.subscribed = true
             session.accepting = true
         } else if session.ready {
@@ -209,6 +211,17 @@ nostril_ws_publish := proc(handle: I64, event: Str) {
     mut status := "pending"
     if event.len() + 10 > WS_MAX { status = "rejected: event exceeds frame limit" }
     session.publications.push(own WsPublication(event = event.clone(), id = id.clone(), status = status.clone()))
+}
+
+nostril_ws_subscribe := proc(handle: I64, request: Str) {
+    noop_proc()
+    if nostril_subscription_id(request) != "local" { panic("expected a valid live subscription named local") }
+    ref mut session : WsSession = sessions[handle].state
+    session.request = request.clone()
+    session.subscribed = false
+    session.accepting = false
+    session.ready = false
+    if session.connected { lws_callback_on_writable(session.connection) }
 }
 
 nostril_ws_publication_status := func(handle: I64, id: Str) returns Str {

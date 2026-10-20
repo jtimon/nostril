@@ -1,0 +1,45 @@
+* File-based issue tracking
+
+Adapted from Tiled's =issues/process.org=. Issues are maintained in this
+repository; [[file:summary.org][summary.org]] is generated from =issues/open/=, grouped by category,
+then High/Medium/Low priority, and sorted numerically within each group.
+
+** Creating and updating issues
+
+1. Read the next issue number from =issues/NEXT_ISSUE.txt=.
+2. Create =issues/open/NNN.org= with that number.
+3. First line: =# priority: high|medium|low=.
+4. Second line: =# category: <cat>=, using a category listed below.
+5. Add =** OPEN #NNN Title= followed by the issue body.
+6. Increment =issues/NEXT_ISSUE.txt= manually. Numbers are never reused.
+7. To start work, change =OPEN= to =WIP= without moving the file.
+8. When fixed, move the file to =issues/fixed/=, change the heading to
+   =FIXED=, and record the resolution and verification at the top.
+9. When cancelled, move it to =issues/cancelled/= with =CANCELLED= and a reason.
+   For a transfer, link the receiving tracker and explain where work continues.
+10. Regenerate the summary from the repository root:
+
+#+begin_src sh
+til interpret make.til summary
+#+end_src
+
+The generator is [[file:../examples/issues.til][examples/issues.til]]. It checks metadata, file/title numbers,
+cross-state collisions and the next-number counter before writing. Do not edit
+the generated summary by hand. Keep each filename and heading number in sync;
+=NEXT_ISSUE.txt= must exceed every allocated number.
+
+Issue creation, priority/category changes and closure follow maintainer
+decisions. Verification depends on the change; regenerating the summary is
+sufficient for a tracker-only edit.
+
+** Categories
+
+- =bugs=: correctness defects, memory safety, wrong behaviour.
+- =cleanups=: refactors, internal restructuring, technical debt, tooling.
+- =features=: new application or library capabilities.
+- =optimizations=: performance improvements with unchanged behaviour.
+- =backends=: rendering, platform, runtime or process-backend work.
+- =experiments=: exploratory or speculative directions.
+- =examples=: example/application work.
+- =deferred=: postponed platform or architecture targets.
+- =unknown=: use only when a category has not yet been decided.

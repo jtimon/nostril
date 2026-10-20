@@ -1,0 +1,17 @@
+# priority: medium
+# category: features
+** OPEN #2 Encrypt persisted account keys
+
+The initial account implementation deliberately stores secret.key as plaintext,
+with an owner-only account directory and file. Permissions are not encryption.
+
+Choose an encrypted-at-rest format and/or OS keyring integration, considering
+NIP-49 interoperability. Define unlock and recovery behaviour, key derivation,
+and account import/export before adding the encrypted representation.
+
+Acceptance:
+- Existing plaintext accounts can migrate without losing or changing identity.
+- Wrong passwords and interrupted migration leave recoverable original data.
+- Key material and passwords are never included in logs or diagnostics.
+- Unlocked key lifetime and remaining Til memory-erasure limitations are explicit.
+- Tests cover migration, wrong-password handling, reopen and cleanup.
