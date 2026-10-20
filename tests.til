@@ -2,10 +2,11 @@ mode test
 
 import("std/sys")
 import("std/file")
+crypto := import("std/crypto")
 _nostril_test_nng := import("lib/modes/nostril_nng")
 import("lib/modes/nostril_live")
 
-live_wait := proc(socket: nng_socket) returns Str {
+live_wait := proc(socket: nng_socket, context: Str = "live frame") returns Str {
     mut message := ""
     mut attempts : I64 = 0
     while attempts < 500 {
@@ -13,7 +14,7 @@ live_wait := proc(socket: nng_socket) returns Str {
         sleep_ms(10)
         attempts++
     }
-    panic("timed out waiting for a live frame")
+    panic("timed out waiting for ", context)
     return ""
 }
 
@@ -39,6 +40,169 @@ publication_pump := proc(client: nng_socket, mut outbox: Vec(Publication), id: S
     return nostril_publish_label(outbox, id)
 }
 
+subscription_exchange := proc(server: nng_socket, mut state: LiveRelay,
+        client: nng_socket, request: Str) returns Str {
+    assert(nostril_live_send(client, request))
+    mut attempts : I64 = 0
+    mut response := ""
+    while attempts < 500 {
+        nostril_subscription_step(server, state)
+        if nostril_live_receive(client, response) { return response }
+        sleep_ms(5)
+        attempts++
+    }
+    panic("timed out processing subscription")
+    return ""
+}
+
+test_subscription_filters := test() {
+    event := nostril_sign_text_note(TEST_SECRET_KEY, "filtered", 1700000100)
+    id := nostril_event_id(event)
+    author := nostril_pubkey(TEST_SECRET_KEY)
+    request := format("[\"REQ\",\"notes\",{\"limit\":0,\"ids\":[\"", id,
+        "\"],\"authors\":[\"", author, "\"],\"kinds\":[1],\"since\":1700000100,\"until\":1700000100}]")
+    assert(nostril_subscription_id(request) == "notes")
+    assert(nostril_subscription_matches(request, event))
+    assert(!nostril_subscription_matches(request.replace("\"kinds\":[1]", "\"kinds\":[2]"), event))
+    assert(!nostril_subscription_matches(request.replace("\"since\":1700000100", "\"since\":1700000101"), event))
+    assert(!nostril_subscription_matches(request.replace("\"until\":1700000100", "\"until\":1700000099"), event))
+    assert(nostril_subscription_matches("[\"REQ\",\"or\",{\"limit\":0,\"kinds\":[2]},{\"limit\":0,\"kinds\":[1]}]", event))
+    assert(!nostril_subscription_matches(NOSTRIL_LIVE_REQUEST, unsigned_event(event)))
+    digest := crypto.sha256_str(format("[0,\"", author,
+        "\",1700000100,1,[[\"t\",\"topic\",\"not-a-value\"]],\"tagged\"]"))
+    signature := crypto.schnorr_sign(U256.from_hex(TEST_SECRET_KEY), digest, U256())!
+    fixture := format("{\"id\":\"", digest.to_hex(), "\",\"pubkey\":\"", author,
+        "\",\"created_at\":1700000100,\"kind\":1,\"tags\":[[\"t\",\"topic\",\"not-a-value\"]],\"content\":\"tagged\",\"sig\":\"", signature.to_hex(), "\"}")
+    assert(nostril_subscription_matches("[\"REQ\",\"tags\",{\"limit\":0,\"#t\":[\"topic\"]}]", fixture))
+    assert(!nostril_subscription_matches("[\"REQ\",\"tags\",{\"limit\":0,\"#t\":[\"not-a-value\"]}]", fixture))
+    for invalid : Str in array(Str,
+        "[\"REQ\",\"bad\",{}]", "[\"REQ\",\"bad\",{\"limit\":1}]",
+        "[\"REQ\",\"bad\",{\"limit\":0,\"kinds\":[]}]",
+        "[\"REQ\",\"bad\",{\"limit\":0,\"limit\":0}]",
+        "[\"REQ\",\"bad\",{\"limit\":0,\"search\":\"unknown\"}]",
+        "[\"REQ\",\"bad\",{\"limit\":0,\"ids\":[\"short\"]}]",
+        "[\"REQ\",\"bad\",{\"limit\":0,\"#p\":[\"short\"]}]",
+        "[\"REQ\",\"\",{\"limit\":0}]", "[\"REQ\",\"bad\"]") {
+        assert(nostril_subscription_id(invalid) == "")
+    }
+    assert(nostril_control_id("[\"CLOSE\",\"notes\"]", "CLOSE") == "notes")
+    assert(nostril_control_id("[\"CLOSE\",\"notes\",0]", "CLOSE") == "")
+    assert(nostril_subscription_response("[\"REQ\",\"quote\\\"\",{\"limit\":0}]") == "[\"EOSE\",\"quote\\\"\"]")
+}
+
+test_subscription_lifecycle := test() {
+    endpoint := "inproc://nostril-subscriptions"
+    mut events := nng_socket()
+    mut requests := nng_socket()
+    mut first := nng_socket()
+    mut second := nng_socket()
+    mut outsider := nng_socket()
+    mut publisher := nng_socket()
+    nostril_live_open(events, endpoint, true)
+    nostril_publish_open(requests, endpoint, true)
+    nostril_live_open(first, endpoint, false, false)
+    nostril_live_open(second, endpoint, false, false)
+    nostril_live_open(outsider, endpoint, false, false)
+    nostril_publish_open(publisher, endpoint, false, false)
+    mut state := LiveRelay()
+    req := "[\"REQ\",\"same\",{\"limit\":0,\"kinds\":[1]}]"
+    assert(subscription_exchange(events, state, first, req) == "[\"EOSE\",\"same\"]")
+    assert(subscription_exchange(events, state, second, req) == "[\"EOSE\",\"same\"]")
+    assert(state.subscriptions.len() == 2)
+    mut outbox := Vec(Publication).new()
+    a := nostril_sign_text_note(TEST_SECRET_KEY, "both", 1700000110)
+    a_id := nostril_event_id(a)
+    nostril_publish_queue(outbox, a)
+    assert(publication_pump(publisher, outbox, a_id, events, requests, state) == "accepted")
+    assert(live_wait(first) == nostril_subscription_envelope("same", a))
+    assert(live_wait(second) == nostril_subscription_envelope("same", a))
+    mut unwanted := ""
+    assert(!nostril_live_receive(outsider, unwanted))
+    // Replacing the same ID changes only the requesting client's filter.
+    assert(subscription_exchange(events, state, first, req.replace("[1]", "[2]")) == "[\"EOSE\",\"same\"]")
+    assert(state.subscriptions.len() == 2)
+    b := nostril_sign_text_note(TEST_SECRET_KEY, "second only", 1700000111)
+    b_id := nostril_event_id(b)
+    nostril_publish_queue(outbox, b)
+    assert(publication_pump(publisher, outbox, b_id, events, requests, state) == "accepted")
+    assert(live_wait(second) == nostril_subscription_envelope("same", b))
+    assert(!nostril_live_receive(first, unwanted))
+    assert(!nostril_live_receive(outsider, unwanted))
+    assert(nostril_live_send(second, "[\"CLOSE\",\"same\"]"))
+    // This EOSE is an ordering barrier after CLOSE on the same connection.
+    assert(subscription_exchange(events, state, second,
+        "[\"REQ\",\"barrier\",{\"limit\":0,\"kinds\":[65535]}]") == "[\"EOSE\",\"barrier\"]")
+    c := nostril_sign_text_note(TEST_SECRET_KEY, "neither", 1700000112)
+    c_id := nostril_event_id(c)
+    nostril_publish_queue(outbox, c)
+    assert(publication_pump(publisher, outbox, c_id, events, requests, state) == "accepted")
+    assert(!nostril_live_receive(first, unwanted))
+    assert(!nostril_live_receive(second, unwanted))
+    assert(!nostril_live_receive(outsider, unwanted))
+    assert(subscription_exchange(events, state, first, "[\"REQ\",\"same\",{\"limit\":1}]").starts_with("[\"CLOSED\",\"same\","))
+    assert(state.subscriptions.len() == 1)
+    nostril_nng_close(second)
+    mut attempts : I64 = 0
+    while state.subscriptions.len() > 0 && attempts < 500 {
+        nostril_subscription_step(events, state)
+        sleep_ms(5)
+        attempts++
+    }
+    assert(state.subscriptions.len() == 0)
+    nostril_nng_close(publisher)
+    nostril_nng_close(outsider)
+    nostril_nng_close(first)
+    nostril_nng_close(requests)
+    nostril_nng_close(events)
+}
+
+test_gui_subscription_reconnect := test() {
+    endpoint := "inproc://nostril-gui-reconnect"
+    mut server := nng_socket()
+    mut client := nng_socket()
+    nostril_live_open(server, endpoint, true)
+    nostril_live_open(client, endpoint, false, false)
+    mut state := LiveRelay()
+    mut feed := FeedClient()
+    mut timeline := Vec(Str).new()
+    mut attempts : I64 = 0
+    while !feed.ready && attempts < 1000 {
+        nostril_feed_poll(client, feed, timeline)
+        nostril_subscription_step(server, state)
+        sleep_ms(5)
+        attempts++
+    }
+    assert(feed.ready)
+    assert(state.subscriptions.len() == 1)
+    assert(timeline.len() == 0)
+    old_peer := feed.peer.clone()
+    nostril_nng_close(server)
+    nostril_live_open(server, endpoint, true)
+    mut restarted := LiveRelay()
+    attempts = 0
+    while (restarted.subscriptions.len() == 0 || !feed.ready || feed.peer == old_peer) && attempts < 1000 {
+        nostril_feed_poll(client, feed, timeline)
+        nostril_subscription_step(server, restarted)
+        sleep_ms(5)
+        attempts++
+    }
+    assert(feed.ready)
+    assert(feed.peer != old_peer)
+    assert(restarted.subscriptions.len() == 1)
+    event := nostril_sign_text_note(TEST_SECRET_KEY, "reconnected feed", 1700000120)
+    assert(nostril_feed_write(server, restarted.subscriptions[0].peer, nostril_live_envelope(event)))
+    attempts = 0
+    while timeline.len() == 0 && attempts < 500 {
+        nostril_feed_poll(client, feed, timeline)
+        sleep_ms(5)
+        attempts++
+    }
+    assert(timeline.len() == 1)
+    assert(nostril_relay_event_id(timeline[0]) == nostril_event_id(event))
+    nostril_nng_close(client)
+    nostril_nng_close(server)
+}
+
 test_publication_lost_ack := test() {
     endpoint := "inproc://nostril-lost-ack"
     mut events := nng_socket()
@@ -50,6 +214,7 @@ test_publication_lost_ack := test() {
     nostril_live_open(subscriber, endpoint, false, false)
     nostril_publish_open(publisher, endpoint, false, false)
     mut state := LiveRelay()
+    assert(subscription_exchange(events, state, subscriber, NOSTRIL_LIVE_REQUEST) == NOSTRIL_LOCAL_EOSE)
     mut outbox := Vec(Publication).new()
     event := nostril_sign_text_note(TEST_SECRET_KEY, "retry exactly this signed event", 1700000020)
     id := nostril_event_id(event)
@@ -189,6 +354,10 @@ test_live_relay_process := test() {
     mut second := nng_socket()
     nostril_live_open(first, endpoint, false, false)
     nostril_live_open(second, endpoint, false, false)
+    assert(nostril_live_send(first, NOSTRIL_LIVE_REQUEST))
+    assert(nostril_live_send(second, NOSTRIL_LIVE_REQUEST))
+    assert(live_wait(first, "first EOSE") == NOSTRIL_LOCAL_EOSE)
+    assert(live_wait(second, "second EOSE") == NOSTRIL_LOCAL_EOSE)
     mut first_publisher := nng_socket()
     mut second_publisher := nng_socket()
     nostril_publish_open(first_publisher, endpoint, false, false)
@@ -204,13 +373,13 @@ test_live_relay_process := test() {
     no_invalid := !nostril_live_receive(second, rejected)
     assert(nostril_live_send(first_publisher, event))
     first_ack := live_wait(first_publisher)
-    first_echo := live_wait(first)
-    second_note := live_wait(second)
+    first_echo := live_wait(first, "first echo")
+    second_note := live_wait(second, "second delivery")
     reply := nostril_sign_text_note(nostril_generate_secret_key(), "second client", 1700000011)
     assert(nostril_live_send(second_publisher, reply))
     second_ack := live_wait(second_publisher)
-    first_reply := live_wait(first)
-    second_echo := live_wait(second)
+    first_reply := live_wait(first, "first reply")
+    second_echo := live_wait(second, "second echo")
     // Stop and restart the actual relay while a GUI-style outbox is pending.
     Cmd.new("kill", "-TERM", relay_pid.to_str()).run_checked()
     relay_status := relay.wait()
@@ -262,16 +431,16 @@ test_live_frame_bounds := test() {
     nostril_live_open(relay, "inproc://nostril-live-bounds", true)
     nostril_live_open(client, "inproc://nostril-live-bounds", false, false)
     mut unterminated := "not terminated"
-    nostril_nng_check(nng_send(relay, unterminated.c_str, unterminated.len(), 0), "send unterminated frame")
-    assert(live_wait(client) == "")
+    nostril_nng_check(nng_send(client, unterminated.c_str, unterminated.len(), 0), "send unterminated frame")
+    assert(live_wait(relay) == "")
     mut embedded := format("bad", Str.from_byte(0), "frame")
-    nostril_nng_check(nng_send(relay, embedded.c_str, embedded.len() + 1, 0), "send embedded NUL")
-    assert(live_wait(client) == "")
+    nostril_nng_check(nng_send(client, embedded.c_str, embedded.len() + 1, 0), "send embedded NUL")
+    assert(live_wait(relay) == "")
     mut oversized := repeat_text("x", NOSTRIL_NNG_MAX_MESSAGE + 1)
-    nostril_nng_check(nng_send(relay, oversized.c_str, oversized.len(), 0), "send oversized frame")
-    assert(live_wait(client) == "")
-    assert(nostril_live_send(relay, NOSTRIL_FAKE_EVENT))
-    assert(live_wait(client) == NOSTRIL_FAKE_EVENT)
+    nostril_nng_check(nng_send(client, oversized.c_str, oversized.len(), 0), "send oversized frame")
+    assert(live_wait(relay) == "")
+    assert(nostril_live_send(client, NOSTRIL_FAKE_EVENT))
+    assert(live_wait(relay) == NOSTRIL_FAKE_EVENT)
     nostril_nng_close(client)
     nostril_nng_close(relay)
 }

@@ -584,3 +584,140 @@ nostril_publication_status := func(reply: Str, expected_id: Str) returns Str {
     if accepted { return "accepted" }
     return format("rejected: ", reason)
 }
+
+// Live subscriptions deliberately require limit:0 in every filter. Unknown
+// fields are rejected rather than silently broadening a subscription.
+priv subscription_tag_matches := func(tags: Str, name: Str, wanted: Str) returns Bool {
+    mut cursor := JsonCursor(text = tags.borrowed_view())
+    if !json_take(cursor, '[') { return false }
+    while json_take(cursor, '[') {
+        mut key := ""
+        mut value := ""
+        if !json_parse_string(cursor, key) { return false }
+        if json_take(cursor, ',') {
+            if !json_parse_string(cursor, value) { return false }
+            if key == name && value == wanted { return true }
+            while json_take(cursor, ',') {
+                if !json_parse_string(cursor, value) { return false }
+            }
+        }
+        if !json_take(cursor, ']') { return false }
+        if !json_take(cursor, ',') { break }
+    }
+    return false
+}
+
+priv subscription_filter := func(mut cursor: JsonCursor, event: NostrEventFields,
+        mut matches: Bool) returns Bool {
+    if !json_take(cursor, '{') { return false }
+    mut keys := Set(Str).new()
+    matches = true
+    mut limited := false
+    while true {
+        mut key := ""
+        if !json_parse_string(cursor, key) || keys.has(key) || !json_take(cursor, ':') { return false }
+        keys.add(own key.clone())
+        if key == "limit" || key == "since" || key == "until" {
+            mut number : I64 = 0
+            if !json_parse_nonnegative_i64(cursor, number) { return false }
+            if key == "limit" { if number != 0 { return false }; limited = true }
+            else if key == "since" { matches = matches && event.created_at >= number }
+            else { matches = matches && event.created_at <= number }
+        } else {
+            mut tag := false
+            if key.len() == 2 && key[0] == '#' {
+                byte := key[1].clone()
+                tag = (byte >= 'a' && byte <= 'z') || (byte >= 'A' && byte <= 'Z')
+            }
+            if key != "ids" && key != "authors" && key != "kinds" && !tag { return false }
+            if !json_take(cursor, '[') { return false }
+            mut any_match := false
+            while true {
+                if key == "kinds" {
+                    mut kind : I64 = 0
+                    if !json_parse_nonnegative_i64(cursor, kind) || kind > 65535 { return false }
+                    any_match = any_match || kind == event.kind
+                } else {
+                    mut value := ""
+                    if !json_parse_string(cursor, value) { return false }
+                    if (!tag || key == "#e" || key == "#p") && !nostril_is_lower_hex(value, 64) { return false }
+                    if key == "ids" { any_match = any_match || value == event.id }
+                    else if key == "authors" { any_match = any_match || value == event.pubkey }
+                    else { any_match = any_match || subscription_tag_matches(event.tags, key.substr(1, 1), value) }
+                }
+                if json_take(cursor, ']') { break }
+                if !json_take(cursor, ',') { return false }
+            }
+            matches = matches && any_match
+        }
+        if json_take(cursor, '}') { break }
+        if !json_take(cursor, ',') { return false }
+    }
+    return limited
+}
+
+priv subscription_parse := func(message: Str, event: NostrEventFields,
+        mut id: Str, mut matches: Bool) returns Bool {
+    mut cursor := JsonCursor(text = message.borrowed_view())
+    mut command := ""
+    if !json_take(cursor, '[') || !json_parse_string(cursor, command) || command != "REQ" ||
+        !json_take(cursor, ',') || !json_parse_string(cursor, id) ||
+        id.len() == 0 || nostril_utf8_scalars(id) > 64 || !json_take(cursor, ',') { return false }
+    matches = false
+    while true {
+        mut filter_matches := false
+        if !subscription_filter(cursor, event, filter_matches) { return false }
+        matches = matches || filter_matches
+        if json_take(cursor, ']') { break }
+        if !json_take(cursor, ',') { return false }
+    }
+    json_skip_ws(cursor)
+    return cursor.at == cursor.text.len()
+}
+
+/// Validated live-only REQ ID, or empty for an unsupported/malformed request.
+nostril_subscription_id := func(message: Str) returns Str {
+    mut id := ""
+    mut matches := false
+    empty := NostrEventFields()
+    if !subscription_parse(message, empty, id, matches) { return "" }
+    return id
+}
+
+/// REQ prefix ID for rejection routing; CLOSE must be a complete message.
+nostril_control_id := func(message: Str, wanted: Str) returns Str {
+    mut cursor := JsonCursor(text = message.borrowed_view())
+    mut command := ""
+    mut id := ""
+    if !json_take(cursor, '[') || !json_parse_string(cursor, command) || command != wanted ||
+        !json_take(cursor, ',') || !json_parse_string(cursor, id) ||
+        id.len() == 0 || nostril_utf8_scalars(id) > 64 { return "" }
+    if wanted == "CLOSE" {
+        if !json_take(cursor, ']') { return "" }
+        json_skip_ws(cursor)
+        if cursor.at != cursor.text.len() { return "" }
+    }
+    return id
+}
+
+nostril_subscription_matches := proc(request: Str, event_json: Str) returns Bool {
+    mut fields := NostrEventFields()
+    if !nostril_parse_complete_event(event_json, fields) || !nostril_valid_fields(fields) { return false }
+    mut id := ""
+    mut matches := false
+    return subscription_parse(request, fields, id, matches) && matches
+}
+
+nostril_subscription_response := func(request: Str) returns Str {
+    id := nostril_subscription_id(request)
+    if id.len() > 0 { return format("[\"EOSE\",", json_quote(id), "]") }
+    rejected := nostril_control_id(request, "REQ")
+    if rejected.len() > 0 {
+        return format("[\"CLOSED\",", json_quote(rejected), ",\"unsupported: live filters require limit:0\"]")
+    }
+    return "[\"NOTICE\",\"invalid: expected live REQ or CLOSE\"]"
+}
+
+nostril_subscription_envelope := func(id: Str, event_json: Str) returns Str {
+    return format("[\"EVENT\",", json_quote(id), ",", event_json, "]")
+}

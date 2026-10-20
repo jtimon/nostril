@@ -75,7 +75,17 @@ select_api := proc() {
         "til_nostril__nostril_publication_reply := ext_proc(event_json: Str, shallow duplicate: Bool) returns shallow Str {}\n",
         "nostril_publication_reply := proc(event_json: Str, duplicate: Bool) returns Str { return til_nostril__nostril_publication_reply(event_json, duplicate) }\n",
         "til_nostril__nostril_publication_status := ext_func(reply: Str, expected_id: Str) returns shallow Str {}\n",
-        "nostril_publication_status := func(reply: Str, expected_id: Str) returns Str { return til_nostril__nostril_publication_status(reply, expected_id) }\n"))
+        "nostril_publication_status := func(reply: Str, expected_id: Str) returns Str { return til_nostril__nostril_publication_status(reply, expected_id) }\n",
+        "til_nostril__nostril_subscription_id := ext_func(message: Str) returns shallow Str {}\n",
+        "nostril_subscription_id := func(message: Str) returns Str { return til_nostril__nostril_subscription_id(message) }\n",
+        "til_nostril__nostril_control_id := ext_func(message: Str, wanted: Str) returns shallow Str {}\n",
+        "nostril_control_id := func(message: Str, wanted: Str) returns Str { return til_nostril__nostril_control_id(message, wanted) }\n",
+        "til_nostril__nostril_subscription_matches := ext_proc(request: Str, event_json: Str) returns shallow Bool {}\n",
+        "nostril_subscription_matches := proc(request: Str, event_json: Str) returns Bool { return til_nostril__nostril_subscription_matches(request, event_json) }\n",
+        "til_nostril__nostril_subscription_response := ext_func(request: Str) returns shallow Str {}\n",
+        "nostril_subscription_response := func(request: Str) returns Str { return til_nostril__nostril_subscription_response(request) }\n",
+        "til_nostril__nostril_subscription_envelope := ext_func(id: Str, event_json: Str) returns shallow Str {}\n",
+        "nostril_subscription_envelope := func(id: Str, event_json: Str) returns Str { return til_nostril__nostril_subscription_envelope(id, event_json) }\n"))
 }
 
 build_nng := proc() {
@@ -92,6 +102,11 @@ build_nng := proc() {
     archive := "gen/nng/build/libnng.a"
     if !File.is_file(archive) { panic("NNG build did not produce ", archive) }
     Cmd.new("cp", archive, "gen/nng/libnng.a").run_checked()
+    // Keep routed-message helpers and NNG in the same native module. A separate
+    // interpreter link_c bridge can load a second NNG socket registry.
+    Cmd.new("cc", "-fPIC", "-Wall", "-Wextra", "-Werror", "-c", "lib/feed.c",
+        "-o", "gen/nng/feed.o").run_checked()
+    Cmd.new("ar", "rcs", "gen/nng/libnng.a", "gen/nng/feed.o").run_checked()
     // The interpreter dlopens a shared twin beside each linked archive.
     Cmd.new("cc", "-shared", "-fPIC", "-o", "gen/nng/libnng.so",
         "-Wl,--whole-archive", "gen/nng/libnng.a", "-Wl,--no-whole-archive",

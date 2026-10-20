@@ -25,10 +25,6 @@ main := proc(args: ..Str) {
         if nostril_relay_signals() != 0 { panic("cannot install relay signal handlers") }
         println("nostril-relay live feed on ", live_endpoint)
         while nostril_relay_running() != 0 {
-            // Publications use the per-client reply path. Ignore old bus
-            // publications so an unacknowledged path cannot bypass dedup.
-            mut ignored := ""
-            nostril_live_receive(live_socket, ignored)
             if !nostril_live_relay_step(live_socket, requests, relay_state) { sleep_ms(5) }
         }
         nostril_nng_close(requests)

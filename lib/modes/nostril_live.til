@@ -1,19 +1,86 @@
 import("nostril_nng")
 
+nostril_feed_receive := ext_proc(shallow socket_id: U32, mut buffer: Dynamic,
+    shallow capacity: USize, mut size: USize, mut peer: U32) returns shallow I32 {}
+nostril_feed_send := ext_proc(shallow socket_id: U32, shallow peer: U32,
+    bytes: Dynamic, shallow size: USize) returns shallow I32 {}
+nostril_feed_peer_alive := ext_proc(shallow peer: U32) returns shallow I32 {}
+
 NOSTRIL_LIVE_ENDPOINT := "ipc://tmp/nostril-live.ipc"
+NOSTRIL_LIVE_REQUEST := "[\"REQ\",\"local\",{\"kinds\":[1],\"limit\":0}]"
 
 // Callers own the socket and close it before leaving the session.
 nostril_live_open := proc(mut socket: nng_socket, endpoint: Str, listen: Bool,
         asynchronous: Bool = true) {
-    nostril_nng_check(nng_bus0_open(socket), "open local live bus")
     if listen {
+        nostril_nng_check(nng_pair1_open_poly(socket), "open routed feed")
+        nostril_nng_check(nng_socket_set_int(socket, "send-buffer".c_str, 64), "buffer targeted feed sends")
         mut listener := nng_listener()
-        nostril_nng_check(nng_listen(socket, endpoint.c_str, listener, 0), "listen on live bus")
+        nostril_nng_check(nng_listen(socket, endpoint.c_str, listener, 0), "listen on routed feed")
     } else {
+        nostril_nng_check(nng_pair1_open(socket), "open feed client")
+        nostril_nng_check(nng_socket_set_int(socket, "send-buffer".c_str, 64), "buffer subscription controls")
         mut dialer := nng_dialer()
         mut flags : I32 = 0
         if asynchronous { flags = 2 }
-        nostril_nng_check(nng_dial(socket, endpoint.c_str, dialer, flags), "dial live bus")
+        nostril_nng_check(nng_dial(socket, endpoint.c_str, dialer, flags), "dial routed feed")
+    }
+}
+
+nostril_feed_read := proc(socket: nng_socket, mut message: Str, mut peer: U32) returns Bool {
+    message = ""
+    peer = 0
+    mut bytes := Str.with_capacity(NOSTRIL_NNG_MAX_MESSAGE)
+    mut size : USize = 0
+    rc := nostril_feed_receive(socket.id, bytes.c_str, NOSTRIL_NNG_MAX_MESSAGE, size, peer)
+    if rc == 8 { return false }
+    if rc == 17 { return true }
+    nostril_nng_check(rc, "receive routed feed frame")
+    if size == 0 || size > NOSTRIL_NNG_MAX_MESSAGE { return true }
+    ref last : I8 = ptr_add(bytes.c_str, (size - 1).to_uptr())
+    if last != 0 { return true }
+    bytes.count = size - 1
+    for byte : I8 in bytes { if byte == 0 { return true } }
+    message = bytes.clone()
+    return true
+}
+
+nostril_feed_write := proc(socket: nng_socket, peer: U32, message: Str) returns Bool {
+    if message.len() + 1 > NOSTRIL_NNG_MAX_MESSAGE { return false }
+    rc := nostril_feed_send(socket.id, peer, message.c_str, message.len() + 1)
+    if rc == 8 { return false }
+    nostril_nng_check(rc, "send targeted feed frame")
+    return true
+}
+
+FeedClient := struct {
+    peer : U32 = 0
+    ready := false
+    retry_at : U64 = 0
+}
+
+nostril_feed_poll := proc(socket: nng_socket, mut client: FeedClient, mut timeline: Vec(Str)) {
+    if client.peer != 0 && nostril_feed_peer_alive(client.peer) == 0 {
+        client.peer = 0
+        client.ready = false
+        client.retry_at = 0
+    }
+    now := nng_clock()
+    if !client.ready && now >= client.retry_at {
+        nostril_live_send(socket, NOSTRIL_LIVE_REQUEST)
+        client.retry_at = now + 1000
+    }
+    mut message := ""
+    mut peer : U32 = 0
+    mut budget : I64 = 32
+    while budget > 0 && nostril_feed_read(socket, message, peer) {
+        if message == NOSTRIL_LOCAL_EOSE {
+            client.peer = peer
+            client.ready = true
+        } else if client.ready && peer == client.peer && nostril_control_id(message, "EVENT") == "local" {
+            nostril_live_accept(timeline, message)
+        }
+        budget--
     }
 }
 
@@ -122,10 +189,66 @@ LiveRelay := struct {
     accepted := Set(Str).new()
     reply : Str = ""
     replying := false
+    subscriptions := Vec(LiveSubscription).new()
+    control_peer : U32 = 0
+    control_request : Str = ""
+    control_reply : Str = ""
+}
+
+LiveSubscription := struct {
+    peer : U32 = 0
+    id : Str = ""
+    request : Str = ""
+}
+
+// Reverse indexing is necessary here: removals change the collection length.
+nostril_subscription_remove := proc(mut state: LiveRelay, peer: U32, id: Str) {
+    mut i := state.subscriptions.len()
+    while i > 0 {
+        i--
+        ref sub : LiveSubscription = state.subscriptions[i]
+        if (sub.peer == peer && sub.id == id) || nostril_feed_peer_alive(sub.peer) == 0 {
+            state.subscriptions.remove_at(i)!
+        }
+    }
+}
+
+nostril_subscription_step := proc(socket: nng_socket, mut state: LiveRelay) returns Bool {
+    nostril_subscription_remove(state, 0, "")
+    if state.control_reply.len() > 0 { return nostril_subscription_flush(socket, state) }
+    mut message := ""
+    mut peer : U32 = 0
+    if !nostril_feed_read(socket, message, peer) { return false }
+    closed := nostril_control_id(message, "CLOSE")
+    if closed.len() > 0 { nostril_subscription_remove(state, peer, closed); return true }
+    requested := nostril_control_id(message, "REQ")
+    // Replacement applies within this connection only, including a rejected REQ.
+    if requested.len() > 0 { nostril_subscription_remove(state, peer, requested) }
+    state.control_peer = peer
+    state.control_request = message.clone()
+    state.control_reply = nostril_subscription_response(message)
+    nostril_subscription_flush(socket, state)
+    return true
+}
+
+nostril_subscription_flush := proc(socket: nng_socket, mut state: LiveRelay) returns Bool {
+    if nostril_feed_peer_alive(state.control_peer) != 0 {
+        if !nostril_feed_write(socket, state.control_peer, state.control_reply) { return false }
+        id := nostril_subscription_id(state.control_request)
+        if id.len() > 0 {
+            state.subscriptions.push(own LiveSubscription(peer = state.control_peer,
+                id = id.clone(), request = state.control_request.clone()))
+        }
+    }
+    state.control_reply = ""
+    state.control_request = ""
+    state.control_peer = 0
+    return true
 }
 
 nostril_live_relay_step := proc(events: nng_socket, requests: nng_socket,
         mut state: LiveRelay) returns Bool {
+    controlled := nostril_subscription_step(events, state)
     if state.replying {
         if nostril_live_send(requests, state.reply) {
             state.replying = false
@@ -134,7 +257,7 @@ nostril_live_relay_step := proc(events: nng_socket, requests: nng_socket,
         return true
     }
     mut event := ""
-    if !nostril_live_receive(requests, event) { return false }
+    if !nostril_live_receive(requests, event) { return controlled }
     id := nostril_event_id(event)
     mut duplicate := false
     if id.len() > 0 {
@@ -146,10 +269,10 @@ nostril_live_relay_step := proc(events: nng_socket, requests: nng_socket,
                 state.replying = true
                 return true
             }
-            if !nostril_live_send(events, envelope) {
-                state.reply = format("[\"OK\",\"", id, "\",false,\"error: event broadcast queue full\"]")
-                state.replying = true
-                return true
+            for sub : LiveSubscription in state.subscriptions {
+                if nostril_subscription_matches(sub.request, event) {
+                    nostril_feed_write(events, sub.peer, nostril_subscription_envelope(sub.id, event))
+                }
             }
             state.accepted.add(own id.clone())
         }

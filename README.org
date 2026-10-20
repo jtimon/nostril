@@ -39,6 +39,11 @@ Accepted means the relay accepted the event in memory, not that every subscriber
 received it. The event feed still has no history replay; keys, pending notes,
 and relay deduplication state last only for their process session.
 
+The GUI opens a live kind-1 subscription (=REQ= with =limit:0=), waits for
+=EOSE=, and resubscribes after reconnecting. The relay routes events only to
+matching subscriptions; =CLOSE= removes that client's subscription. See
+[[file:doc/transports.org][the local protocol]] for supported filters and transport details.
+
 To run the scripted local NIP-01 exchange, start the relay and then run the CLI
 from another terminal:
 

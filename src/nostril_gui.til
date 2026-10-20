@@ -90,6 +90,7 @@ main := proc(args: ..Str) {
     mut socket := nng_socket()
     mut publisher := nng_socket()
     mut outbox := Vec(Publication).new()
+    mut feed := FeedClient()
     if live {
         nostril_live_open(socket, endpoint, false)
         nostril_publish_open(publisher, endpoint, false)
@@ -118,14 +119,10 @@ main := proc(args: ..Str) {
 
     while !WindowShouldClose() {
         if live {
-            nostril_publish_poll(publisher, outbox)
-            mut incoming := ""
-            // Bound work per frame so relay traffic cannot starve input/rendering.
-            mut budget : I64 = 32
-            while budget > 0 && nostril_live_receive(socket, incoming) {
-                nostril_live_accept(messages, incoming)
-                budget--
-            }
+            nostril_feed_poll(socket, feed, messages)
+            if feed.ready { nostril_publish_poll(publisher, outbox) }
+            if feed.ready { delivery_status = "Live subscription" }
+            else { delivery_status = "Subscribing..." }
         }
         if IsKeyPressed(259) || IsKeyPressedRepeat(259) {
             if composer_scalars > 0 {
@@ -249,5 +246,9 @@ main := proc(args: ..Str) {
     }
 
     CloseWindow()
-    if live { nostril_nng_close(publisher); nostril_nng_close(socket) }
+    if live {
+        nostril_live_send(socket, NOSTRIL_LOCAL_CLOSE)
+        nostril_nng_close(publisher)
+        nostril_nng_close(socket)
+    }
 }

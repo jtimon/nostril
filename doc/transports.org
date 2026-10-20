@@ -92,8 +92,8 @@ This proves custom-mode loading, NNG linkage, process communication, bounded
 receives, basic subscription lifecycles, NNG fan-out to two local consumers,
 and rejection of unsigned, wrong-ID, and bad-signature relay events. The shared
 library parses NIP-01 event objects and relay =EVENT= envelopes, including
-canonical tag arrays; it does not yet parse every relay message, evaluate
-filters, store events, implement post-=CLOSE= delivery suppression, support
+canonical tag arrays. Live mode now evaluates subscription filters and stops
+future delivery after =CLOSE=. It does not store events, support
 multiple clients in the Pair0 harness, or implement a public WebSocket
 relay. Pair0 and the fixed 64 KiB receive buffer are prototype constraints, not
 transport-interface decisions.
@@ -102,9 +102,9 @@ transport-interface decisions.
 
 *** Local live GUI feed
 
-=nostril-relay --live [endpoint]= listens on an NNG bus0 event socket (default
+=nostril-relay --live [endpoint]= listens on an NNG pair1-poly feed socket (default
 =ipc://tmp/nostril-live.ipc=) and a REP publication socket at =endpoint.publish=.
-=nostril-gui --relay [endpoint]= attaches its bus and REQ sockets to these two
+=nostril-gui --relay [endpoint]= attaches its pair1 and REQ sockets to these two
 addresses. The suffix is part of this local IPC/inproc contract, not a second
 config knob or a mapping for arbitrary TCP/WebSocket addresses.
 
@@ -115,9 +115,10 @@ routes each response only to its requesting client. Invalid input echoes a
 well-formed claimed ID when available, or an empty ID when it cannot be read.
 An ID in a rejection is not a verified identity.
 
-The relay verifies every publication, including retries, and broadcasts a new
-event as =["EVENT","local",event]= to bus peers, including the sender. It
-records accepted IDs in memory and acknowledges repeats without rebroadcasting.
+The relay verifies every publication, including retries, and routes a new
+event as =["EVENT",subscription_id,event]= to matching subscriptions. The
+publishing client receives it only if it also has a matching subscription.
+The relay records accepted IDs in memory and acknowledges repeats without redelivery.
 Clients verify before insertion and deduplicate by event ID, including across
 different JSON whitespace and signature encodings of the same signed payload.
 
@@ -126,15 +127,45 @@ at a time; NNG REQ retries every 500 ms and reconnects automatically. A matching
 well-formed OK makes the entry accepted or rejected. Malformed/wrong-ID replies
 leave it pending and cause resubmission of those same bytes. A rejected entry
 keeps the reason; it is not automatically retried. Oversized local events are
-rejected locally before submission. Bus publications from older clients are
-ignored: clients and relay must be upgraded together for this prototype.
+rejected locally before submission. Clients and relay must be upgraded together:
+the old bus feed is no longer the live transport protocol.
 
-This is a project-owned local transport contract, not NIP-01 over WebSocket:
-the fixed =local= label identifies the feed, not a negotiated subscription.
-There are no filters, REQ/CLOSE lifecycle, history, or persistence in this live
-mode. The original Pair0 CLI harness remains available without =--live=.
+*** Live subscriptions
+
+The pair1 connection carries =["REQ",id,filter,...]= and =["CLOSE",id]=.
+IDs are scoped to an NNG connection (pipe), not shared between clients. A new
+REQ with the same ID replaces that connection's old subscription. Each filter
+must explicitly specify =limit:0=: there is no stored-event query or history.
+The relay sends =EOSE= before enabling live delivery. An unsupported or malformed
+REQ with a readable ID removes its previous subscription and sends =CLOSED=;
+unreadable controls receive =NOTICE=. CLOSE removes the subscription without
+a reply. Disconnect removes all subscriptions belonging to that pipe.
+
+Supported filters are =ids=, =authors=, =kinds=, inclusive =since=/=until=,
+and single-letter =#tag= lists. Values within a list are ORed, fields within
+a filter are ANDed, and multiple filters are ORed. IDs, authors, =#e= and =#p=
+values require full lowercase 64-character hex. Tag matching uses only the
+second string of each event tag. Empty lists, duplicate fields, unknown fields,
+and nonzero or missing limits are rejected instead of silently broadening a
+subscription. The GUI currently requests kind 1 under ID =local=.
+
+GUI feed I/O is nonblocking with bounded work per frame. Before EOSE, the GUI
+retries its REQ once per second. A dead connection clears readiness and triggers
+resubscription; queued publications start once the subscription is ready.
+Closing the window attempts CLOSE and then closes the connection, which also
+removes its relay state. Once CLOSE is processed, later publications are not
+routed to that subscription; frames already sent before CLOSE can still arrive.
+
+The small =lib/feed.c= adapter copies bounded NNG messages, preserves the pipe
+handle for targeted replies, and frees or transfers every native message. It
+is built into the same archive/shared twin as NNG to keep one socket registry
+on both Til backends. Control responses are retained on send backpressure;
+feed sends use bounded buffers and remain best effort for slow subscribers.
+
+This is a project-owned local transport contract, not NIP-01 over WebSocket.
+The original Pair0 CLI harness remains available without =--live=.
 Publication acknowledgements mean in-memory acceptance and attempted fan-out,
-not durable storage or delivery to every subscriber. Bus traffic is best effort:
+not durable storage or delivery to every subscriber. Feed traffic is best effort:
 disconnected subscribers can miss notes. Pending publishers retry after relay
 restart, while client event-ID deduplication handles a possible repeated fan-out.
 
@@ -152,6 +183,9 @@ relay with an outstanding publication and verifies acceptance without resigning.
 In-process tests drop a reply after acceptance, verify retries do not rebroadcast,
 check simultaneous clients and queued notes, and exercise mismatched/rejected
 replies. A bounded timeout owns the relay child lifetime even when a test fails.
+Subscription tests cover filter combinations, connection isolation for equal
+IDs, replacement, EOSE, close ordering, disconnect cleanup, and the GUI's
+resubscription state machine after reconnecting.
 
 Til's =examples/custom_modes.til= demonstrates NNG-backed sender, receiver,
 publisher, and subscriber modes. A Nostril-owned =mode mode= definition can

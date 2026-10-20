@@ -26,6 +26,10 @@ It then creates =gen/nng/libnng.a= and force-loads that same archive into the
 system NNG package is used. This native twin command currently targets the
 Linux/GNU linker and links =pthread= and =atomic= explicitly.
 
+The driver also compiles =lib/feed.c= into =gen/nng/feed.o= and adds it to both
+NNG artifacts. Its targeted-message helpers share NNG's socket registry in
+compiled and interpreted execution; they are not a separate FFI library.
+
 The build driver is executable Til code, =make.til=, rather than a GNU
 Makefile. It uses =--cpu=baseline --usize=64 --opt=0= by default.
 

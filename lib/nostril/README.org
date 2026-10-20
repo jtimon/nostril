@@ -11,6 +11,11 @@ into accepted/rejected state. Returned strings are owned by the caller; input
 strings are borrowed for the duration of the call. Transport sockets, outbox
 ownership, retries and session lifetime belong to the host-side live module.
 
+Live subscription helpers parse REQ/CLOSE controls, generate EOSE/CLOSED replies,
+and match verified events against filters. Every filter requires =limit:0=;
+unsupported fields are rejected. Subscription IDs are scoped by the host to
+individual connections; the library itself owns no connection or stored events.
+
 From the repository root:
 
 #+begin_src sh

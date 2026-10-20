@@ -25,20 +25,20 @@ implementations.
 
 The library owns NIP-01 kind-1 serialization and signing, event ID and signature
 validation, and parsing of relay =EVENT= envelopes. It should eventually also
-own other event kinds, relay messages, filters, subscription state, and
+own other event kinds and additional relay messages and
 transport-independent client behavior. Hosts own argument handling, display
 state, input, and user interaction.
 
 The GUI keeps signed event JSON in a host-owned =Vec(Str)=. It creates one
 OS-random keypair at startup, signs each non-empty composer submission as a
 kind-1 event, verifies it, and displays content only through the shared event
-API. The key and events have process lifetime only: there is no key storage,
+API. The key and events have process lifetime only: there is no key storage or
 persistence. With =--relay= the GUI sends signed notes through the local live
 feed. Its timeline holds relay envelopes and accepts incoming messages only
 after shared validation; matching event IDs are suppressed. Nonblocking receives
 are capped at 32 messages per frame to keep input/rendering responsive.
 
-=lib/modes/nostril_live.til= owns the local bus helpers and the timeline
+=lib/modes/nostril_live.til= owns the local transport helpers and the timeline
 acceptance operation shared by GUI and integration tests. The host owns and
 closes its sockets. Signing, validation, verified IDs, and OK parsing remain in
 libnostril; NNG types do not cross the public library ABI.
@@ -50,12 +50,19 @@ state; receiving the event on the feed is not an acknowledgement. NNG retains
 the request bytes and retries after a lost reply or reconnect. Rejected entries
 retain the reason and are not retried. Closing the GUI discards the outbox.
 
-The live relay owns a REP socket, a bus socket, a set of accepted IDs, and a
-pending reply. It verifies before deduplication, broadcasts a new valid event
-once, and replies to every valid retry with accepted/duplicate. A restart clears
+The live relay owns a REP socket, a routed pair1-poly socket, a set of accepted
+IDs, per-connection subscriptions, and pending replies. It verifies before
+deduplication, routes new valid events to matching subscriptions,
+and replies to every valid retry with accepted/duplicate. A restart clears
 the relay's set; client timeline deduplication still prevents repeated display.
 The small =src/relay_signal.c= adapter sets a signal-safe stop flag for SIGINT
 and SIGTERM; the Til main loop then closes sockets and releases its state.
+
+The library parses live-only REQ/CLOSE controls and evaluates filters; the
+host-side live module owns the connection/subscription state. Native NNG pipe
+handles identify connections, not public keys. The GUI owns a feed-readiness
+state machine, waits for EOSE before starting queued publications, and renews
+its kind-1 subscription after reconnecting. No history or storage is introduced.
 
 User configuration is likewise deferred. Possible forms include a conventional
 =~/.nostril.conf= file or executable Til startup code such as

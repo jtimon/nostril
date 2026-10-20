@@ -16,6 +16,7 @@ nng_socket := ext_struct("nng_socket_s") {
 
 nng_close := ext_proc(shallow socket: nng_socket) returns shallow I32 {}
 nng_socket_set_ms := ext_proc(shallow socket: nng_socket, option: I8, shallow duration: I32) returns shallow I32 {}
+nng_socket_set_int := ext_proc(shallow socket: nng_socket, option: I8, shallow value: I32) returns shallow I32 {}
 nng_socket_set := ext_proc(shallow socket: nng_socket, option: I8, data: Dynamic, shallow size: USize) returns shallow I32 {}
 nng_listen := ext_proc(shallow socket: nng_socket, url: I8, mut listener: nng_listener, shallow flags: I32) returns shallow I32 {}
 nng_dial := ext_proc(shallow socket: nng_socket, url: I8, mut dialer: nng_dialer, shallow flags: I32) returns shallow I32 {}
@@ -28,3 +29,6 @@ nng_sub0_open := ext_proc(mut socket: nng_socket) returns shallow I32 {}
 nng_bus0_open := ext_proc(mut socket: nng_socket) returns shallow I32 {}
 nng_req0_open := ext_proc(mut socket: nng_socket) returns shallow I32 {}
 nng_rep0_open := ext_proc(mut socket: nng_socket) returns shallow I32 {}
+nng_pair1_open := ext_proc(mut socket: nng_socket) returns shallow I32 {}
+nng_pair1_open_poly := ext_proc(mut socket: nng_socket) returns shallow I32 {}
+nng_clock := ext_proc() returns shallow U64 {}
