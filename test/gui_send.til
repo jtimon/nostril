@@ -1,0 +1,125 @@
+mode cli
+
+import("std/sys")
+link("X11")
+link(":libXtst.so.6")
+
+XOpenDisplay := ext_proc(name: I8) returns ref Dynamic {}
+XCloseDisplay := ext_proc(display: Dynamic) returns shallow I32 {}
+XSetInputFocus := ext_proc(display: Dynamic, shallow window: UPtr, shallow revert: I32, shallow time: UPtr) returns shallow I32 {}
+XKeysymToKeycode := ext_proc(display: Dynamic, shallow keysym: UPtr) returns shallow U8 {}
+XTestFakeKeyEvent := ext_proc(display: Dynamic, shallow key: U32, shallow pressed: I32, shallow delay: UPtr) returns shallow I32 {}
+XTestFakeMotionEvent := ext_proc(display: Dynamic, shallow screen: I32, shallow x: I32, shallow y: I32, shallow delay: UPtr) returns shallow I32 {}
+XTestFakeButtonEvent := ext_proc(display: Dynamic, shallow button: U32, shallow pressed: I32, shallow delay: UPtr) returns shallow I32 {}
+XFlush := ext_proc(display: Dynamic) returns shallow I32 {}
+XDefaultRootWindow := ext_proc(display: Dynamic) returns shallow UPtr {}
+XGetGeometry := ext_proc(display: Dynamic, shallow window: UPtr, mut root: UPtr, mut x: I32, mut y: I32,
+    mut width: U32, mut height: U32, mut border: U32, mut depth: U32) returns shallow I32 {}
+XTranslateCoordinates := ext_proc(display: Dynamic, shallow source: UPtr, shallow destination: UPtr,
+    shallow x: I32, shallow y: I32, mut root_x: I32, mut root_y: I32, mut child: UPtr) returns shallow I32 {}
+XGetImage := ext_proc(display: Dynamic, shallow window: UPtr, shallow x: I32, shallow y: I32,
+    shallow width: U32, shallow height: U32, shallow planes: UPtr, shallow format: I32) returns ref Dynamic {}
+XGetPixel := ext_proc(image: Dynamic, shallow x: I32, shallow y: I32) returns shallow UPtr {}
+XDestroyImage := ext_proc(image: Dynamic) returns shallow I32 {}
+
+composer_is_empty := proc(display: Dynamic, window: UPtr, height: U32, reference: Dynamic) returns Bool {
+    ref actual : Dynamic = XGetImage(display, window, 22, height.cast(I32) - 38, 180, 24, 0xffffff, 2)
+    if actual.is_null() { panic("could not capture composer") }
+    mut equal := true
+    // Pixel coordinates, rather than a collection of elements.
+    for y in 0..24 {
+        for x in 0..180 {
+            if XGetPixel(reference, x.to_i32(), y.to_i32()) != XGetPixel(actual, x.to_i32(), y.to_i32()) { equal = false }
+        }
+    }
+    XDestroyImage(actual)
+    return equal
+}
+
+find_window := proc() returns UPtr {
+    query := Cmd.new("xwininfo", "-root", "-tree", "-int")
+    query.capture()
+    if query.run() != 0 { panic("xwininfo failed: ", query.err()) }
+    output := query.out()
+    for line : Str in output.split("\n") {
+        if line.contains("\"Nostril\"") {
+            text := line.trim().clone()
+            fields := text.split(" ")
+            return fields[0].to_u64().cast(UPtr)
+        }
+    }
+    return 0
+}
+
+key := proc(display: Dynamic, symbol: UPtr) {
+    code := XKeysymToKeycode(display, symbol).cast(U32)
+    XTestFakeKeyEvent(display, code, 1, 0)
+    XFlush(display)
+    sleep_ms(25)
+    XTestFakeKeyEvent(display, code, 0, 0)
+    XFlush(display)
+    sleep_ms(25)
+}
+
+main := proc(args: ..Str) {
+    if args.len() > 1 { panic("usage: gui_send [gui-binary]") }
+    mut executable := "bin/nostril-gui"
+    if args.len() == 1 { executable = args[0].clone() }
+    // Local-only: this test never publishes to a public relay.
+    app := Cmd.new("timeout", "30", executable)
+    app.capture()
+    app.start()
+    mut window : UPtr = 0
+    mut attempts : I64 = 0
+    while window == 0 && !app.poll() && attempts < 100 {
+        window = find_window()
+        sleep_ms(50)
+        attempts++
+    }
+    if window == 0 { panic("Nostril window did not appear") }
+    display_name := get_env("DISPLAY")
+    ref display : Dynamic = XOpenDisplay(display_name.c_str)
+    if display.is_null() { panic("could not open X display") }
+    XSetInputFocus(display, window, 1, 0)
+    XFlush(display)
+    sleep_ms(150)
+
+    mut root : UPtr = 0
+    mut x : I32 = 0
+    mut y : I32 = 0
+    mut width : U32 = 0
+    mut height : U32 = 0
+    mut border : U32 = 0
+    mut depth : U32 = 0
+    if XGetGeometry(display, window, root, x, y, width, height, border, depth) == 0 { panic("missing GUI geometry") }
+    ref empty : Dynamic = XGetImage(display, window, 22, height.cast(I32) - 38, 180, 24, 0xffffff, 2)
+    if empty.is_null() { panic("could not capture empty composer") }
+    for character : I8 in "first message" { key(display, character.cast(U8).cast(UPtr)) }
+    if composer_is_empty(display, window, height, empty) { panic("typing did not reach the composer") }
+    mut root_x : I32 = 0
+    mut root_y : I32 = 0
+    mut child : UPtr = 0
+    if XTranslateCoordinates(display, window, XDefaultRootWindow(display),
+        width.cast(I32) - 44, height.cast(I32) - 28, root_x, root_y, child) == 0 { panic("cannot locate Send") }
+    XTestFakeMotionEvent(display, -1, root_x, root_y, 0)
+    XTestFakeButtonEvent(display, 1, 1, 0)
+    XFlush(display)
+    sleep_ms(50)
+    XTestFakeButtonEvent(display, 1, 0, 0)
+    XFlush(display)
+    sleep_ms(500)
+    if app.poll() { panic("GUI failed on Send: ", app.out(), app.err()) }
+    if !composer_is_empty(display, window, height, empty) { panic("Send did not clear the composer") }
+
+    for character : I8 in "second message" { key(display, character.cast(U8).cast(UPtr)) }
+    key(display, 0xff0d)
+    sleep_ms(500)
+    if app.poll() { panic("GUI failed on Enter: ", app.out(), app.err()) }
+    if !composer_is_empty(display, window, height, empty) { panic("Enter did not clear the composer") }
+    XDestroyImage(empty)
+    key(display, 0xff1b)
+    XCloseDisplay(display)
+    status := app.wait()
+    if status != 0 { panic("GUI exit failed: ", app.out(), app.err()) }
+    println("GUI Send and Enter passed with heap-owned composer text")
+}

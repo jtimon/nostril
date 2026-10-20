@@ -80,6 +80,31 @@ fake-relay lifecycle, and the separate client and relay over =ipc://=.
 =clean= removes =bin/=, =gen/=, and =tmp/=. The Git-ignored =.inspirations/=
 directory is reserved for reference repositories and is preserved.
 
+** GUI Send regression
+
+The optional X11 test types heap-owned composer text, clicks Send, checks that
+the composer is cleared, submits another note with Enter, and closes the GUI.
+It runs local-only and never publishes to a public relay. It requires Xvfb,
+=xwininfo=, and X11/XTest libraries in addition to the normal GUI dependencies:
+
+#+begin_src sh
+xvfb-run --auto-servernum til run --usize=64 test/gui_send.til
+#+end_src
+
+An optional positional argument selects a separately built GUI executable. For
+ASan invalid-access checks:
+
+#+begin_src sh
+til build --asan --cpu=baseline --usize=64 -o tmp/nostril-gui-asan src/nostril_gui.til
+ASAN_OPTIONS=detect_leaks=0 xvfb-run --auto-servernum til run --usize=64 test/gui_send.til tmp/nostril-gui-asan
+#+end_src
+
+Leak detection is disabled only in this graphical run: the Mesa/GLX backend on
+the test host retains allocations even for an empty window. The headless signer
+regression and library/transport ASan checks retain leak detection. The signing
+regression signs, edits and clears an owned composer and then validates both
+independently owned events; string literals alone would hide this ownership bug.
+
 ** Generated files
 
 - =gen/lib/libnostril.a= and =gen/lib/libnostril.so=: generated libraries.

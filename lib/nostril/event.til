@@ -497,8 +497,11 @@ nostril_sign_text_note := proc(secret_key: Str, content: Str, created_at: I64) r
     if created_at < 0 { panic("a Nostr event timestamp cannot be negative") }
     if !nostril_valid_utf8(content) { panic("Nostr event content must be valid UTF-8") }
     pubkey := nostril_pubkey(secret_key)
+    // These temporary fields must not take ownership of the caller's composer.
+    // Serialization finishes before this borrow ends; the returned JSON owns
+    // its own bytes independently of the input.
     mut fields := NostrEventFields(pubkey = pubkey, created_at = created_at,
-        kind = 1, tags = "[]", content = content)
+        kind = 1, tags = "[]", content = content.borrowed_view())
     digest := crypto.sha256_str(nostril_serialized_event(fields))
     fields.id = digest.to_hex()
     fields.sig = crypto.schnorr_sign(U256.from_hex(secret_key), digest, nostril_random_u256())!.to_hex()

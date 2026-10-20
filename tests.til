@@ -692,6 +692,25 @@ test_nip01_signing := test() {
     assert(nostril_now() > 1700000000)
 }
 
+test_signing_borrows_composer := test() {
+    secret := nostril_generate_secret_key()
+    mut composer := Str.with_capacity(128)
+    composer.push_str("first heap-owned note")
+    assert(composer.cap < CAP_VIEW)
+    first := nostril_sign_text_note(secret, composer, 1700000300)
+    // Signing must leave the caller's allocation alive and mutable.
+    composer.push_str(" edited")
+    assert(composer == "first heap-owned note edited")
+    second := nostril_sign_text_note(secret, composer, 1700000301)
+    // The GUI clears the composer immediately after Send.
+    composer = ""
+    assert(nostril_event_is_valid(first))
+    assert(nostril_event_is_valid(second))
+    assert(nostril_event_content(first) == "first heap-owned note")
+    assert(nostril_event_content(second) == "first heap-owned note edited")
+    assert(composer.len() == 0)
+}
+
 test_nip01_rejects_invalid_events := test() {
     // The fixed valid event also covers canonical tag serialization.
     assert(nostril_relay_event_is_valid(NOSTRIL_FAKE_EVENT))

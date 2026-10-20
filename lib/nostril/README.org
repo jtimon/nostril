@@ -5,6 +5,10 @@ behavior. It exports version metadata plus ephemeral key generation, public-key
 derivation, NIP-01 kind-1 signing, event validation, and validated content
 extraction from event objects and relay =EVENT= envelopes.
 
+Signing borrows the caller's secret key and content; it does not consume the
+composer buffer. The returned signed JSON owns independent bytes, so the caller
+can edit or clear the composer immediately after signing.
+
 Verified event-ID accessors support transport-independent deduplication.
 Publication helpers produce local OK replies and parse complete matching replies
 into accepted/rejected state. Returned strings are owned by the caller; input
