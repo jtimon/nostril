@@ -140,6 +140,7 @@ main := proc(args: ..Str) {
     // Panels replace the timeline temporarily; the main feed stays full-width.
     mut panel : I32 = 0
     mut scroll : I32 = 0
+    mut timeline_scroll : USize = 0
     mut follow_input := ""
     mut notice := ""
 
@@ -180,7 +181,16 @@ main := proc(args: ..Str) {
             if wheel > 0 { scroll = scroll - 3 }
             else if wheel < 0 { scroll = scroll + 3 }
             if scroll < 0 { scroll = 0 }
+        } else {
+            wheel := GetMouseWheelMove()
+            if wheel > 0 { timeline_scroll = timeline_scroll + 3 }
+            else if wheel < 0 {
+                if timeline_scroll > 3 { timeline_scroll = timeline_scroll - 3 }
+                else { timeline_scroll = 0 }
+            }
         }
+        if session.messages.len() == 0 { timeline_scroll = 0 }
+        else if timeline_scroll >= session.messages.len() { timeline_scroll = session.messages.len() - 1 }
         if IsKeyPressed(259) || IsKeyPressedRepeat(259) {
             if panel == 0 && composer_scalars > 0 {
                 composer = gui_without_last_scalar(composer); composer_scalars--
@@ -221,7 +231,7 @@ main := proc(args: ..Str) {
                         if error.len() > 0 { notice = error.clone() }
                         else {
                             composer = ""; composer_scalars = 0; follow_input = ""
-                            notice = ""; panel = 0; scroll = 0
+                            notice = ""; panel = 0; scroll = 0; timeline_scroll = 0
                         }
                     }
                 }
@@ -232,7 +242,7 @@ main := proc(args: ..Str) {
                     (clicked && gui_hit(width - 88, 88, 76, 36))) {
                 error := session.follow(follow_input.trim(), false)
                 if error.len() > 0 { notice = error.clone() }
-                else { follow_input = ""; notice = "Follow saved locally; feed updated." }
+                else { follow_input = ""; timeline_scroll = 0; notice = "Follow saved locally; feed updated." }
             }
             follows := nostril_account_follows()
             mut count : I32 = 0
@@ -249,7 +259,7 @@ main := proc(args: ..Str) {
                 if clicked && gui_hit(width - 88, row_y, 76, 28) {
                     error := session.follow(pubkey, true)
                     if error.len() > 0 { notice = error.clone() }
-                    else { notice = "Unfollow saved locally; feed updated." }
+                    else { timeline_scroll = 0; notice = "Unfollow saved locally; feed updated." }
                 }
             }
         }
@@ -257,6 +267,7 @@ main := proc(args: ..Str) {
         submit := IsKeyPressed(257) || (button_hover && IsMouseButtonPressed(0))
         if panel == 0 && submit && composer.trim().len() > 0 {
             session.send(composer)
+            timeline_scroll = 0
             composer = ""
             composer_scalars = 0
         }
@@ -284,7 +295,7 @@ main := proc(args: ..Str) {
             } else {
                 BeginScissorMode(content_x, timeline_top, content_w, timeline_bottom - timeline_top)
                 mut bottom := timeline_bottom
-                mut index := session.messages.len()
+                mut index := session.messages.len() - timeline_scroll
                 while index > 0 && bottom > timeline_top {
                     index--
                     ref event : Str = session.messages[index]

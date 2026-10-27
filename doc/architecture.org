@@ -50,19 +50,23 @@ the request bytes and retries after a lost reply or reconnect. Rejected entries
 retain the reason and are not retried. Closing the GUI discards the outbox.
 
 The live relay owns a REP socket, a routed pair1-poly socket, a set of accepted
-IDs, per-connection subscriptions, and pending replies. It verifies before
-deduplication, routes new valid events to matching subscriptions,
+IDs, a timestamp-ordered 256-event replay cache, per-connection subscriptions,
+and pending replies. It verifies before deduplication, routes new valid events
+to matching subscriptions,
 and replies to every valid retry with accepted/duplicate. A restart clears
-the relay's set; client timeline deduplication still prevents repeated display.
+the relay's set and cache; client timeline deduplication still prevents repeated display.
 The small =src/relay_signal.c= adapter sets a signal-safe stop flag for SIGINT
 and SIGTERM; the Til main loop then closes sockets and releases its state.
 
-The library parses live-only REQ/CLOSE controls and evaluates filters; the
+The library parses bounded REQ/CLOSE controls and evaluates filters; the
 host-side live module owns the connection/subscription state. Native NNG pipe
 handles identify connections, not public keys. The GUI owns a feed-readiness
 state machine, waits for EOSE before starting queued publications, and renews
-its author-filtered kind-1 subscription after reconnecting. Timelines/outboxes
-remain in memory; only accounts and follow lists are currently persisted.
+its author-filtered kind-1 subscription with a 50-note historical query after
+reconnecting. Pre-EOSE notes are bounded and sorted before timeline insertion;
+EOSE opens live delivery without applying the historical limit to new events.
+Timelines/outboxes remain in memory; only accounts and follow lists are
+currently persisted.
 
 For ws/wss URLs the GUI instead uses =lib/websocket/nostril_ws.til= through its
 compiled library binding. Callback bodies, receive assembly, publication state

@@ -40,13 +40,17 @@ each outgoing note as pending, accepted, or rejected (with the relay's reason).
 Pending notes retry automatically after disconnection or a lost reply, retaining
 the original signed event. Both relay and GUI deduplicate by verified event ID.
 Accepted means the relay accepted the event in memory, not that every subscriber
-received it. The event feed still has no history replay. Configured accounts and
-follow lists persist; pending notes and relay deduplication are session-only.
+received it. The feed requests the latest 50 matching notes, then stays live.
+Configured accounts and follow lists persist; notes, pending publications and
+relay deduplication are session-only. The local relay retains its latest 256
+verified events for replay while it is running.
 Separate identities must follow each other to see each other's notes.
 
-The GUI opens a live kind-1 subscription (=REQ= with =limit:0=), waits for
-=EOSE=, and resubscribes after reconnecting. The relay routes events only to
-matching subscriptions; =CLOSE= removes that client's subscription. See
+The GUI opens a kind-1 subscription (=REQ= with =limit:50=), collects bounded
+history until =EOSE=, and resubscribes after reconnecting. Notes are ordered by
+timestamp with deterministic ID tie-breaking; use the mouse wheel to browse
+older notes. The relay routes events only to matching subscriptions; =CLOSE=
+removes that client's subscription. See
 [[file:doc/transports.org][the local protocol]] for supported filters and transport details.
 
 To connect to one public relay instead, pass its WebSocket URL:

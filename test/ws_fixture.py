@@ -11,27 +11,49 @@ from websockets.legacy.server import serve
 
 
 async def main():
-    port_file, cert, key, event_file, unfollowed_file = sys.argv[1:]
+    port_file, cert, key, event_file, unfollowed_file, history_file = sys.argv[1:]
     early_event = pathlib.Path(event_file).read_text()
     unfollowed_event = pathlib.Path(unfollowed_file).read_text()
+    history_events = pathlib.Path(history_file).read_text().splitlines()
     tls = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     tls.load_cert_chain(cert, key)
     received = {}
     counts = {}
+    history_attempts = 0
     stopped = asyncio.Event()
     asyncio.get_running_loop().add_signal_handler(signal.SIGTERM, stopped.set)
 
     async def handler(socket, path):
+        nonlocal history_attempts
         try:
-            assert path in ("/nostril?probe=1", "/nostril?probe=early"), path
+            assert path in ("/nostril?probe=1", "/nostril?probe=early", "/nostril?probe=history", "/nostril?probe=history-retry"), path
             assert socket.subprotocol is None
             async for raw in socket:
                 assert isinstance(raw, str) and "\0" not in raw
                 command = json.loads(raw)
                 if command[0] == "REQ":
                     assert len(command) == 3 and command[:2] == ["REQ", "local"]
-                    assert command[2]["kinds"] == [1] and command[2]["limit"] == 0
+                    assert command[2]["kinds"] == [1] and command[2]["limit"] in (0, 50)
                     assert set(command[2]) <= {"kinds", "limit", "authors"}
+                    if "probe=history" in path:
+                        assert command[2]["limit"] == 50
+                        if path.endswith("history-retry"):
+                            history_attempts += 1
+                            if history_attempts == 1:
+                                await socket.send(history_events[-2])
+                                await socket.close()  # disconnect before EOSE
+                                continue
+                        # Deliberately over-deliver, duplicate and reverse order.
+                        # The receiver must retain only the newest 50 before EOSE.
+                        for event in reversed(history_events[:-1]):
+                            await socket.send(event)
+                        await socket.send(history_events[5])
+                        await socket.send(unfollowed_event)
+                        await socket.send('["EOSE","local"]')
+                        await socket.send(history_events[-2])  # history/live overlap
+                        await socket.send(history_events[0])   # late, older live event
+                        await socket.send(history_events[-1])  # newest live event
+                        continue
                     if "authors" in command[2]:
                         # Deliberately violate the filter: the client must apply
                         # author selection locally even for valid signed notes.

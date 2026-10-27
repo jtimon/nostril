@@ -133,13 +133,25 @@ test_websocket_transport := test() {
     unfollowed_file := format(prefix, ".unfollowed")
     unfollowed := nostril_sign_text_note(nostril_generate_secret_key(), "unfollowed", 1700000190)
     File.writefile(unfollowed_file, nostril_live_envelope(unfollowed))
+    history_file := format(prefix, ".history")
+    mut history_events := Vec(Str).new()
+    mut history_text := ""
+    for index in 0..63 {
+        mut timestamp := 1700001000 + index
+        if index == 60 || index == 61 { timestamp = 1700001059 }
+        event := nostril_sign_text_note(TEST_SECRET_KEY, format("history ", index.to_str()), timestamp)
+        envelope := nostril_live_envelope(event)
+        history_events.push(own envelope.clone())
+        history_text = format(history_text, envelope, "\n")
+    }
+    File.writefile(history_file, history_text)
     if File.exists(ports_file) { File.remove(ports_file) }
     certificate := Cmd.new("openssl", "req", "-x509", "-newkey", "rsa:2048",
         "-nodes", "-keyout", key, "-out", cert, "-days", "1", "-subj", "/CN=localhost",
         "-addext", "subjectAltName=IP:127.0.0.1,DNS:localhost")
     certificate.capture()
     assert(certificate.run() == 0)
-    fixture := Cmd.new("timeout", "90", "python3", "test/ws_fixture.py", ports_file, cert, key, event_file, unfollowed_file)
+    fixture := Cmd.new("timeout", "120", "python3", "test/ws_fixture.py", ports_file, cert, key, event_file, unfollowed_file, history_file)
     fixture.capture()
     fixture_pid := fixture.start()
     deadline := nng_clock() + 5000
@@ -161,6 +173,29 @@ test_websocket_transport := test() {
     assert(nostril_relay_event_id(nostril_ws_receive(filtered)) == nostril_relay_event_id(NOSTRIL_FAKE_EVENT))
     assert(nostril_ws_receive(filtered) == "")
     nostril_ws_close(filtered)
+    for scenario : Str in array(Str, "history", "history-retry") {
+        historical := nostril_ws_open(format("ws://127.0.0.1:", ports[0], "/nostril?probe=", scenario))
+        nostril_ws_subscribe(historical, format("[\"REQ\",\"local\",{\"authors\":[\"", author, "\"],\"kinds\":[1],\"limit\":50}]"))
+        mut history_timeline := Vec(Str).new()
+        history_deadline := nng_clock() + 15000
+        while history_timeline.len() < 52 && nng_clock() < history_deadline {
+            nostril_ws_poll(historical)
+            while true {
+                message := nostril_ws_receive(historical)
+                if message.len() == 0 { break }
+                nostril_live_accept(history_timeline, message)
+            }
+            sleep_ms(5)
+        }
+        assert(nostril_ws_ready(historical) && history_timeline.len() == 52)
+        assert(history_timeline[0] == history_events[0])
+        assert(history_timeline[1] == history_events[12])
+        assert(history_timeline[51] == history_events[62])
+        for index in 1..history_timeline.len() {
+            assert(nostril_relay_event_before(history_timeline[index - 1], history_timeline[index]))
+        }
+        nostril_ws_close(historical)
+    }
     // Growing and shrinking the library's handle table must not move callback
     // userdata or invalidate another live session.
     first_session := nostril_ws_open(plain, cert)
@@ -194,6 +229,7 @@ test_websocket_transport := test() {
     assert(ws_wait_ready(account_feed.websocket))
     account_feed.poll()
     assert(account_feed.messages.len() == 1)
+    assert(account_feed.messages[0] == NOSTRIL_FAKE_EVENT)
     account_feed.refresh()
     assert(ws_wait_ready(account_feed.websocket))
     // The matching fixture event is now queued in the native transport.
@@ -205,6 +241,8 @@ test_websocket_transport := test() {
     assert(account_feed.follow(author, false) == "")
     assert(ws_wait_ready(account_feed.websocket))
     account_feed.poll()
+    // A fresh query can recover the same historical note after unfollow/refollow.
+    assert(account_feed.messages.len() == 1 && account_feed.messages[0] == NOSTRIL_FAKE_EVENT)
     account_feed.send("old account queued")
     old_handle := account_feed.websocket
     assert(account_feed.switch_account(account_root, "second") == "")
@@ -305,6 +343,7 @@ test_websocket_transport := test() {
     File.remove(ports_file)
     File.remove(event_file)
     File.remove(unfollowed_file)
+    File.remove(history_file)
     File.remove(cert)
     File.remove(key)
 }
@@ -391,7 +430,8 @@ test_subscription_filters := test() {
     assert(nostril_subscription_matches("[\"REQ\",\"tags\",{\"limit\":0,\"#t\":[\"topic\"]}]", fixture))
     assert(!nostril_subscription_matches("[\"REQ\",\"tags\",{\"limit\":0,\"#t\":[\"not-a-value\"]}]", fixture))
     for invalid : Str in array(Str,
-        "[\"REQ\",\"bad\",{}]", "[\"REQ\",\"bad\",{\"limit\":1}]",
+        "[\"REQ\",\"bad\",{}]", "[\"REQ\",\"bad\",{\"limit\":51}]",
+        "[\"REQ\",\"bad\",{\"limit\":-1}]", "[\"REQ\",\"bad\",{\"limit\":30},{\"limit\":30}]",
         "[\"REQ\",\"bad\",{\"limit\":0,\"kinds\":[]}]",
         "[\"REQ\",\"bad\",{\"limit\":0,\"limit\":0}]",
         "[\"REQ\",\"bad\",{\"limit\":0,\"search\":\"unknown\"}]",
@@ -403,6 +443,119 @@ test_subscription_filters := test() {
     assert(nostril_control_id("[\"CLOSE\",\"notes\"]", "CLOSE") == "notes")
     assert(nostril_control_id("[\"CLOSE\",\"notes\",0]", "CLOSE") == "")
     assert(nostril_subscription_response("[\"REQ\",\"quote\\\"\",{\"limit\":0}]") == "[\"EOSE\",\"quote\\\"\"]")
+    history_request := request.replace("\"limit\":0", "\"limit\":50")
+    assert(nostril_subscription_id(history_request) == "notes")
+    assert(nostril_subscription_limit(history_request) == 50)
+    assert(nostril_subscription_matches(history_request, event))
+    assert(nostril_subscription_filter_at(history_request, 0) == history_request)
+    assert(nostril_subscription_filter_at(history_request, 1) == "")
+}
+
+history_exchange := proc(server: nng_socket, mut relay: LiveRelay, client: nng_socket, request: Str) returns Vec(Str) {
+    assert(nostril_live_send(client, request))
+    mut history := Vec(Str).new()
+    deadline := nng_clock() + 10000
+    while nng_clock() < deadline {
+        nostril_subscription_step(server, relay)
+        mut message := ""
+        while nostril_live_receive(client, message) {
+            if message == nostril_subscription_response(request) { return history }
+            assert(nostril_relay_event_is_valid(message))
+            if history.len() > 0 { assert(nostril_relay_event_before(message, history[history.len() - 1])) }
+            history.push(own message.clone())
+        }
+        sleep_ms(5)
+    }
+    panic("history did not finish with EOSE: request=", request, " received=", history.len().to_str(),
+        " pending=", relay.control_history.len().to_str(), " reply=", relay.control_reply)
+    return history
+}
+
+test_bounded_history := test() {
+    endpoint := "inproc://nostril-history"
+    mut server := nng_socket(); mut requests := nng_socket(); mut publisher := nng_socket(); mut client := nng_socket()
+    nostril_live_open(server, endpoint, true)
+    nostril_publish_open(requests, endpoint, true)
+    nostril_publish_open(publisher, endpoint, false, false)
+    mut relay := LiveRelay()
+    mut outbox := Vec(Publication).new()
+    mut events := Vec(Str).new()
+    // Publish before subscribing; these notes must be available to late joiners.
+    for index in 0..60 {
+        event := nostril_sign_text_note(TEST_SECRET_KEY, format("cached ", index.to_str()), 1700002000 + index)
+        events.push(own event.clone())
+        nostril_publish_queue(outbox, event)
+        assert(publication_pump(publisher, outbox, nostril_event_id(event), server, requests, relay) == "accepted")
+    }
+    other_secret := nostril_generate_secret_key()
+    other := nostril_sign_text_note(other_secret, "older other author", 1700001999)
+    nostril_publish_queue(outbox, other)
+    assert(publication_pump(publisher, outbox, nostril_event_id(other), server, requests, relay) == "accepted")
+    nostril_live_open(client, endpoint, false, false)
+    author := nostril_pubkey(TEST_SECRET_KEY)
+    request := format("[\"REQ\",\"local\",{\"authors\":[\"", author, "\"],\"kinds\":[1],\"limit\":50}]")
+    history := history_exchange(server, relay, client, request)
+    assert(history.len() == 50)
+    assert(nostril_relay_event_id(history[0]) == nostril_event_id(events[59]))
+    assert(nostril_relay_event_id(history[49]) == nostril_event_id(events[10]))
+    // Independent OR limits include the older author, and overlap is deduplicated.
+    combined := format("[\"REQ\",\"local\",{\"authors\":[\"", author, "\"],\"limit\":2},{\"authors\":[\"",
+        nostril_pubkey(other_secret), "\"],\"limit\":1}]")
+    mixed := history_exchange(server, relay, client, combined)
+    assert(mixed.len() == 3 && nostril_relay_event_id(mixed[2]) == nostril_event_id(other))
+    overlap := format("[\"REQ\",\"local\",{\"authors\":[\"", author, "\"],\"limit\":2},{\"kinds\":[1],\"limit\":1}]")
+    assert(history_exchange(server, relay, client, overlap).len() == 2)
+    assert(history_exchange(server, relay, client, NOSTRIL_LIVE_REQUEST).len() == 0)
+
+    mut feed := FeedClient(request = request.clone())
+    mut timeline := Vec(Str).new()
+    deadline := nng_clock() + 10000
+    while !feed.ready && nng_clock() < deadline {
+        nostril_feed_poll(client, feed, timeline)
+        nostril_subscription_step(server, relay)
+        sleep_ms(5)
+    }
+    assert(feed.ready && timeline.len() == 50)
+    assert(nostril_relay_event_id(timeline[0]) == nostril_event_id(events[10]))
+    // A late live event is not subject to the initial history limit.
+    late := nostril_sign_text_note(TEST_SECRET_KEY, "late live note", 1700001998)
+    assert(nostril_feed_write(server, relay.subscriptions[0].peer, nostril_live_envelope(late)))
+    assert(nostril_feed_write(server, relay.subscriptions[0].peer, nostril_live_envelope(events[59])))
+    live_deadline := nng_clock() + 5000
+    while timeline.len() < 51 && nng_clock() < live_deadline { nostril_feed_poll(client, feed, timeline); sleep_ms(5) }
+    assert(timeline.len() == 51 && nostril_relay_event_id(timeline[0]) == nostril_event_id(late))
+    // Same-timestamp ordering uses lowest ID as newest; duplicates remain one row.
+    tie_a := nostril_sign_text_note(TEST_SECRET_KEY, "tie a", 1700003000)
+    tie_b := nostril_sign_text_note(TEST_SECRET_KEY, "tie b", 1700003000)
+    nostril_live_accept(timeline, nostril_live_envelope(tie_a))
+    nostril_live_accept(timeline, nostril_live_envelope(tie_b))
+    assert(!nostril_live_accept(timeline, nostril_live_envelope(tie_a)))
+    assert(nostril_relay_event_id(timeline[51]) > nostril_relay_event_id(timeline[52]))
+    for index in 60..260 {
+        nostril_history_accept(relay.history, nostril_sign_text_note(TEST_SECRET_KEY, format("cached ", index.to_str()), 1700002000 + index))
+    }
+    assert(relay.history.len() == 256 && nostril_event_id(relay.history[0]) == nostril_event_id(events[4]))
+    empty_event := nostril_sign_text_note(TEST_SECRET_KEY, "", 1700004000)
+    large := nostril_sign_text_note(TEST_SECRET_KEY,
+        repeat_text("x", NOSTRIL_NNG_MAX_MESSAGE - nostril_live_envelope(empty_event).len() - 1), 1700004000)
+    assert(nostril_live_envelope(large).len() + 1 == NOSTRIL_NNG_MAX_MESSAGE)
+    nostril_history_accept(relay.history, large)
+    long_id := format("[\"REQ\",\"", repeat_text("s", 64), "\",{\"ids\":[\"", nostril_event_id(large), "\"],\"limit\":1}]")
+    assert(history_exchange(server, relay, client, long_id).len() == 0)
+    // A stalled/disconnected history consumer must release the pending snapshot.
+    assert(nostril_live_send(client, request))
+    pending_deadline := nng_clock() + 5000
+    while relay.control_history.len() == 0 && nng_clock() < pending_deadline {
+        nostril_subscription_step(server, relay); sleep_ms(5)
+    }
+    assert(relay.control_history.len() > 0)
+    nostril_nng_close(client)
+    close_deadline := nng_clock() + 5000
+    while relay.control_reply.len() > 0 && nng_clock() < close_deadline {
+        nostril_subscription_step(server, relay); sleep_ms(5)
+    }
+    assert(relay.control_reply == "" && relay.control_history.len() == 0)
+    nostril_nng_close(publisher); nostril_nng_close(requests); nostril_nng_close(server)
 }
 
 test_subscription_lifecycle := test() {
@@ -454,7 +607,7 @@ test_subscription_lifecycle := test() {
     assert(!nostril_live_receive(first, unwanted))
     assert(!nostril_live_receive(second, unwanted))
     assert(!nostril_live_receive(outsider, unwanted))
-    assert(subscription_exchange(events, state, first, "[\"REQ\",\"same\",{\"limit\":1}]").starts_with("[\"CLOSED\",\"same\","))
+    assert(subscription_exchange(events, state, first, "[\"REQ\",\"same\",{\"limit\":51}]").starts_with("[\"CLOSED\",\"same\","))
     assert(state.subscriptions.len() == 1)
     nostril_nng_close(second)
     mut attempts : I64 = 0

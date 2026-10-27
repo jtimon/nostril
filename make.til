@@ -145,7 +145,15 @@ select_api := proc() {
         "til_nostril__nostril_key_encoding := ext_func(key: Str) returns shallow Bool {}\n",
         "nostril_key_encoding := func(key: Str) returns Bool { return til_nostril__nostril_key_encoding(key) }\n",
         "til_nostril__nostril_follows_valid := ext_proc(event: Str, owner: Str) returns shallow Bool {}\n",
-        "nostril_follows_valid := proc(event: Str, owner: Str) returns Bool { return til_nostril__nostril_follows_valid(event, owner) }\n"))
+        "nostril_follows_valid := proc(event: Str, owner: Str) returns Bool { return til_nostril__nostril_follows_valid(event, owner) }\n",
+        "til_nostril__nostril_subscription_limit := ext_func(request: Str) returns shallow I64 {}\n",
+        "nostril_subscription_limit := func(request: Str) returns I64 { return til_nostril__nostril_subscription_limit(request) }\n",
+        "til_nostril__nostril_subscription_filter_at := ext_func(request: Str, shallow index: I64) returns shallow Str {}\n",
+        "nostril_subscription_filter_at := func(request: Str, index: I64) returns Str { return til_nostril__nostril_subscription_filter_at(request, index) }\n",
+        "til_nostril__nostril_event_before := ext_func(left: Str, right: Str) returns shallow Bool {}\n",
+        "nostril_event_before := func(left: Str, right: Str) returns Bool { return til_nostril__nostril_event_before(left, right) }\n",
+        "til_nostril__nostril_relay_event_before := ext_func(left: Str, right: Str) returns shallow Bool {}\n",
+        "nostril_relay_event_before := func(left: Str, right: Str) returns Bool { return til_nostril__nostril_relay_event_before(left, right) }\n"))
 }
 
 build_nng := proc() {

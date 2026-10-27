@@ -48,7 +48,7 @@ nostril_feed_read := proc(socket: nng_socket, mut message: Str, mut peer: U32) r
 nostril_feed_write := proc(socket: nng_socket, peer: U32, message: Str) returns Bool {
     if message.len() + 1 > NOSTRIL_NNG_MAX_MESSAGE { return false }
     rc := nostril_feed_send(socket.id, peer, message.c_str, message.len() + 1)
-    if rc == 8 { return false }
+    if rc == 8 || rc == 7 { return false }
     nostril_nng_check(rc, "send targeted feed frame")
     return true
 }
@@ -58,6 +58,7 @@ FeedClient := struct {
     ready := false
     retry_at : U64 = 0
     request : Str = NOSTRIL_LIVE_REQUEST
+    history := Vec(Str).new()
 }
 
 nostril_feed_poll := proc(socket: nng_socket, mut client: FeedClient, mut timeline: Vec(Str)) {
@@ -65,6 +66,7 @@ nostril_feed_poll := proc(socket: nng_socket, mut client: FeedClient, mut timeli
         client.peer = 0
         client.ready = false
         client.retry_at = 0
+        client.history.clear()
     }
     now := nng_clock()
     if !client.ready && now >= client.retry_at {
@@ -78,8 +80,18 @@ nostril_feed_poll := proc(socket: nng_socket, mut client: FeedClient, mut timeli
         if message == NOSTRIL_LOCAL_EOSE {
             client.peer = peer
             client.ready = true
-        } else if client.ready && peer == client.peer && nostril_control_id(message, "EVENT") == "local" {
-            if nostril_subscription_matches_relay(client.request, message) { nostril_live_accept(timeline, message) }
+            for historical : Str in client.history { nostril_live_accept(timeline, historical) }
+            client.history.clear()
+        } else if (client.peer == 0 || peer == client.peer) && nostril_control_id(message, "EVENT") == "local" {
+            if nostril_subscription_matches_relay(client.request, message) {
+                client.peer = peer
+                limit := nostril_subscription_limit(client.request)
+                if !client.ready && limit > 0 {
+                    nostril_live_accept(client.history, message)
+                    while client.history.len().to_i64() > limit { client.history.remove_at(0)! }
+                    client.retry_at = now + 5000
+                } else { nostril_live_accept(timeline, message) }
+            }
         }
         budget--
     }
@@ -122,7 +134,31 @@ nostril_live_accept := proc(mut timeline: Vec(Str), message: Str) returns Bool {
     if id.len() == 0 { return false }
     for saved : Str in timeline { if nostril_relay_event_id(saved) == id { return false } }
     timeline.push(own message.clone())
+    // Insertion shifts require indices. Store oldest first, newest at the end.
+    mut at := timeline.len() - 1
+    while at > 0 && nostril_relay_event_before(timeline[at], timeline[at - 1]) {
+        previous := timeline[at - 1].clone()
+        timeline[at - 1] = timeline[at].clone()
+        timeline[at] = previous.clone()
+        at--
+    }
     return true
+}
+
+// Session-only relay retention: the latest 256 verified events by NIP-01 order.
+nostril_history_accept := proc(mut history: Vec(Str), event: Str) {
+    id := nostril_event_id(event)
+    if id.len() == 0 { return }
+    for saved : Str in history { if nostril_event_id(saved) == id { return } }
+    history.push(own event.clone())
+    mut at := history.len() - 1
+    while at > 0 && nostril_event_before(history[at], history[at - 1]) {
+        previous := history[at - 1].clone()
+        history[at - 1] = history[at].clone()
+        history[at] = previous.clone()
+        at--
+    }
+    while history.len() > 256 { history.remove_at(0)! }
 }
 
 // One outstanding request per client socket; NNG retains and retransmits the
@@ -188,12 +224,14 @@ nostril_publish_label := func(outbox: Vec(Publication), id: Str) returns Str {
 // Relay state is session-only. NNG REP routes each OK solely to the requester.
 LiveRelay := struct {
     accepted := Set(Str).new()
+    history := Vec(Str).new()
     reply : Str = ""
     replying := false
     subscriptions := Vec(LiveSubscription).new()
     control_peer : U32 = 0
     control_request : Str = ""
     control_reply : Str = ""
+    control_history := Vec(Str).new()
 }
 
 LiveSubscription := struct {
@@ -228,20 +266,52 @@ nostril_subscription_step := proc(socket: nng_socket, mut state: LiveRelay) retu
     state.control_peer = peer
     state.control_request = message.clone()
     state.control_reply = nostril_subscription_response(message)
+    state.control_history.clear()
+    if nostril_subscription_limit(message) > 0 {
+        mut filter_index : I64 = 0
+        while true {
+            filter := nostril_subscription_filter_at(message, filter_index)
+            if filter.len() == 0 { break }
+            mut remaining := nostril_subscription_limit(filter)
+            // Walk newest first, respecting each OR filter's independent limit.
+            mut index := state.history.len()
+            while index > 0 && remaining > 0 {
+                index--
+                ref event : Str = state.history[index]
+                if nostril_subscription_matches(filter, event) {
+                    // A longer subscription ID may make an otherwise accepted
+                    // event exceed the local frame bound. Skip it, not EOSE.
+                    envelope := nostril_subscription_envelope(requested, event)
+                    if envelope.len() + 1 <= NOSTRIL_NNG_MAX_MESSAGE {
+                        nostril_history_accept(state.control_history, event)
+                        remaining--
+                    }
+                }
+            }
+            filter_index++
+        }
+    }
     nostril_subscription_flush(socket, state)
     return true
 }
 
 nostril_subscription_flush := proc(socket: nng_socket, mut state: LiveRelay) returns Bool {
     if nostril_feed_peer_alive(state.control_peer) != 0 {
-        if !nostril_feed_write(socket, state.control_peer, state.control_reply) { return false }
         id := nostril_subscription_id(state.control_request)
+        while state.control_history.len() > 0 {
+            index := state.control_history.len() - 1
+            envelope := nostril_subscription_envelope(id, state.control_history[index])
+            if !nostril_feed_write(socket, state.control_peer, envelope) { return false }
+            state.control_history.remove_at(index)!
+        }
+        if !nostril_feed_write(socket, state.control_peer, state.control_reply) { return false }
         if id.len() > 0 {
             state.subscriptions.push(own LiveSubscription(peer = state.control_peer,
                 id = id.clone(), request = state.control_request.clone()))
         }
     }
     state.control_reply = ""
+    state.control_history.clear()
     state.control_request = ""
     state.control_peer = 0
     return true
@@ -250,6 +320,9 @@ nostril_subscription_flush := proc(socket: nng_socket, mut state: LiveRelay) ret
 nostril_live_relay_step := proc(events: nng_socket, requests: nng_socket,
         mut state: LiveRelay) returns Bool {
     controlled := nostril_subscription_step(events, state)
+    // Finish history and EOSE before accepting more publications, so none fall
+    // into the gap between taking the snapshot and activating the subscription.
+    if state.control_reply.len() > 0 { return controlled }
     if state.replying {
         if nostril_live_send(requests, state.reply) {
             state.replying = false
@@ -276,6 +349,7 @@ nostril_live_relay_step := proc(events: nng_socket, requests: nng_socket,
                 }
             }
             state.accepted.add(own id.clone())
+            nostril_history_accept(state.history, event)
         }
     }
     state.reply = nostril_publication_reply(event, duplicate)

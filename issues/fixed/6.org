@@ -1,0 +1,48 @@
+# priority: medium
+# category: features
+** FIXED #6 Fetch bounded recent history for the following feed
+
+Resolution: account subscriptions request limit:50. Both transports collect a
+bounded, ordered pre-EOSE batch before merging it into the verified-ID-deduplicated
+timeline, then accept live delivery without applying the historical limit.
+Ordering is timestamp ascending with descending ID ties in the GUI; the local
+relay sends the reverse, as NIP-01 specifies. Mouse-wheel feed scrolling exposes
+older notes. Queries repeat on reconnect, switches and follow edits; explicit
+WebSocket replacement clears stale queue/dedup state so refollow restores notes.
+
+The local relay retains its newest 256 verified events in memory. Filters still
+require explicit limits, now nonnegative and totaling at most 50; OR filters get
+independent historical limits and their result union is deduplicated. No durable
+note store, pagination, or follow-list relay synchronization was added.
+
+History tests exposed upstream NNG pair1-poly silently dropping at its two-message
+per-peer queue, including EOSE despite socket-level send success. Added the pinned
+nostril_pair1_try_send extension with explicit ownership and real EAGAIN; replay
+and EOSE remain pending until accepted by the peer queue. The relay serializes
+this control snapshot before processing further publications. The private API,
+slow-peer tradeoff and upgrade requirements are documented in [[file:../../doc/transports.org][transports]].
+
+Verification with the installed Til recorded in [[file:../../doc/til-dependency.org][the generated dependency record]]:
+- =./make.til=: full library/CLI/relay/GUI build passed using the existing
+  OpenSSL development staging via CMAKE_PREFIX_PATH and CPATH.
+- =./make.til test=: 21/21 interpreted and 21/21 compiled tests passed. Coverage
+  includes 50-note replay from 60 publications, independent/overlapping OR
+  filters, limit:0, pre-EOSE acceptance, ordering/ties, late live notes beyond
+  the initial budget, 256-event retention and disconnect during backpressure.
+  Replay also skips an event that exceeds the frame bound with a longer
+  subscription ID, preserving completion/EOSE.
+- Independent WebSocket fixture deliberately sends too much history, reverse
+  order, duplicates and an unfollowed author; checks the 50-event cap, live
+  continuation, refollow and recovery from a disconnect before EOSE.
+- ASan test host: 21/21 passed with leak detection enabled. Native dependencies
+  were the normal build, not a separately instrumented vendor build.
+- =xvfb-run -a til run --usize=64 -o tmp/history-gui-check -c tmp/history-gui-check.c test/gui_send.til=:
+  real GUI Send/Enter, feed scroll up/down, account switching and follow controls
+  passed, including pixel checks and per-account signed-file validation.
+- =git diff --check= and issue summary generation passed.
+
+Request the latest 50 kind-1 notes from self and followed authors, then keep
+receiving live events. Repeat on reconnect, account switch and follow edits.
+Order verified notes deterministically and deduplicate history/live overlap.
+Support pre-EOSE delivery and a bounded session-only local relay history.
+Document NIP-01 filter limits, ordering, ownership and retention decisions.

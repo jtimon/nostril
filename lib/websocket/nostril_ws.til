@@ -42,6 +42,7 @@ priv WsSession := struct {
     pre : USize = 0
     partial := Str.with_capacity(65536)
     events := Vec(Str).new()
+    history := Vec(Str).new()
     seen := Set(Str).new()
     publications := Vec(WsPublication).new()
     status : Str = "connecting"
@@ -65,6 +66,7 @@ priv ws_disconnected := proc(mut session: WsSession) {
     no_connection : Dynamic = 0
     session.connection = no_connection
     session.partial = Str.with_capacity(WS_MAX)
+    session.history.clear()
     session.retry_at = ws_now() + 1000
     for mut publication : WsPublication in session.publications { publication.sent = false }
 }
@@ -79,7 +81,15 @@ priv ws_write_text := proc(mut session: WsSession, text: Str) returns Bool {
 priv ws_message := proc(mut session: WsSession, message: Str) returns Bool {
     control := nostril_relay_control(message, "local")
     if control == "eose" {
-        if session.accepting { session.ready = true; session.status = "live" }
+        if session.accepting && !session.ready {
+            if session.events.len() + session.history.len() > 256 { session.status = "receive queue full"; return false }
+            for event : Str in session.history {
+                session.seen.add(own nostril_relay_event_id(event))
+                session.events.push(own event.clone())
+            }
+            session.history.clear()
+            session.ready = true; session.status = "live"
+        }
         return true
     }
     if control.starts_with("closed: ") {
@@ -99,6 +109,20 @@ priv ws_message := proc(mut session: WsSession, message: Str) returns Bool {
     id := nostril_relay_event_id(message)
     if id.len() == 0 || session.seen.has(id) { return true }
     if !nostril_subscription_matches_relay(session.request, message) { return true }
+    limit := nostril_subscription_limit(session.request)
+    if !session.ready && limit > 0 {
+        for previous : Str in session.history { if nostril_relay_event_id(previous) == id { return true } }
+        session.history.push(own message.clone())
+        mut at := session.history.len() - 1
+        while at > 0 && nostril_relay_event_before(session.history[at], session.history[at - 1]) {
+            previous := session.history[at - 1].clone()
+            session.history[at - 1] = session.history[at].clone()
+            session.history[at] = previous.clone()
+            at--
+        }
+        while session.history.len().to_i64() > limit { session.history.remove_at(0)! }
+        return true
+    }
     if session.events.len() >= 256 { session.status = "receive queue full"; return false }
     session.seen.add(own id.clone())
     session.events.push(own message.clone())
@@ -116,7 +140,7 @@ ws_callback := proc(wsi: Dynamic, reason: I32, _user: Dynamic,
     ref mut session : WsSession = to_ptr(data)
     if reason == 1 || reason == 75 {
         if reason == 1 { session.status = "connection failed" }
-        else if session.status == "live" || session.status == "subscribing" { session.status = "disconnected" }
+        else if session.status == "live" || session.status == "subscribing" || session.status == "Loading recent notes..." { session.status = "disconnected" }
         ws_disconnected(session)
         return 0
     }
@@ -147,6 +171,7 @@ ws_callback := proc(wsi: Dynamic, reason: I32, _user: Dynamic,
             if !ws_write_text(session, session.request) { session.status = "write failed"; return -1 }
             session.subscribed = true
             session.accepting = true
+            if nostril_subscription_limit(session.request) > 0 { session.status = "Loading recent notes..." }
         } else if session.ready {
             now := ws_now()
             for mut publication : WsPublication in session.publications {
@@ -215,12 +240,19 @@ nostril_ws_publish := proc(handle: I64, event: Str) {
 
 nostril_ws_subscribe := proc(handle: I64, request: Str) {
     noop_proc()
-    if nostril_subscription_id(request) != "local" { panic("expected a valid live subscription named local") }
+    if nostril_subscription_id(request) != "local" { panic("expected a valid bounded subscription named local") }
     ref mut session : WsSession = sessions[handle].state
     session.request = request.clone()
     session.subscribed = false
     session.accepting = false
     session.ready = false
+    // Explicit replacement is a fresh query. In particular an unfollow/refollow
+    // must be able to recover previously displayed historical events.
+    session.history.clear()
+    session.events.clear()
+    session.seen.clear()
+    session.notice = ""
+    session.status = "subscribing"
     if session.connected { lws_callback_on_writable(session.connection) }
 }
 

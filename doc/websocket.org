@@ -83,18 +83,28 @@ and USize64 layout used by this Linux build.
 The GUI selects this transport for =--relay ws://...= or =--relay wss://...=;
 IPC endpoints keep the NNG backend. WebSockets send standard Nostr REQ/CLOSE and
 =["EVENT",event]= messages without NNG headers or terminating NULs. A fixed
-=local= subscription requests live kind-1 events with =limit:0=. The GUI sets
+=local= subscription requests recent kind-1 events with =limit:50=. The GUI sets
 its authors to the active account plus follows through =nostril_ws_subscribe=;
 the receiver checks this filter locally too. Matching EOSE
 enables queued publications; valid events can arrive before EOSE. CLOSED stops
 that subscription, NOTICE is retained for display, and only a complete matching
 OK changes publication status. Invalid messages never enter the event queue.
+For nonzero limits, matching pre-EOSE events are sorted and bounded to the
+request's history budget (at most 50). EOSE releases that batch to the consumer;
+subsequent live events are not limited by the initial query. The low-level
+default remains =limit:0= for live-only callers.
 
 Messages are limited to 64 KiB and the receive queue to 256 events. Libwebsockets
 validates text UTF-8; Til rejects binary messages and enforces the assembled size
 across fragments. A queue overflow closes the connection instead of growing it
 without bound. Publication history and event-ID deduplication remain session
 memory, as with the local client.
+
+Explicit subscription replacement clears queued events and transport dedup state,
+so unfollow/refollow can recover previously displayed historical notes. The GUI
+still deduplicates its retained timeline. Disconnect discards only incomplete
+history; IDs are marked delivered when their history batch reaches EOSE, so a
+retry can recover a partially received batch.
 
 Disconnected clients retry after one second. Pending publications retry after
 one second while subscribed, retaining their original JSON and signature.

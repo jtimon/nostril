@@ -520,6 +520,38 @@ static nni_proto_sock_ops pair1poly_sock_ops = {
 	.sock_options = pair1poly_sock_options,
 };
 
+// Nostril extension: report per-peer backpressure to the targeted feed sender.
+// Upstream's upper send queue silently drops at the two-message pipe queue.
+// Own msg only on success; the caller retains it on every error. Holding the
+// socket and its pipe-map lock protects the queue against concurrent teardown.
+int
+nostril_pair1_try_send(uint32_t socket_id, uint32_t peer, nni_msg *msg)
+{
+	nni_sock       *sock;
+	pair1poly_sock *s;
+	pair1poly_pipe *p;
+	size_t         len = nni_msg_len(msg);
+	int            rv;
+
+	if ((rv = nni_sock_find(&sock, socket_id)) != 0) {
+		return (rv);
+	}
+	if (nni_sock_proto_ops(sock)->sock_init != pair1poly_sock_init) {
+		nni_sock_rele(sock);
+		return (NNG_ENOTSUP);
+	}
+	s = nni_sock_proto_data(sock);
+	nni_mtx_lock(&s->mtx);
+	p = nni_id_get(&s->pipes, peer);
+	rv = p == NULL ? NNG_ECLOSED : nni_msgq_tryput(p->send_queue, msg);
+	nni_mtx_unlock(&s->mtx);
+	if (rv == 0) {
+		nni_sock_bump_tx(sock, len);
+	}
+	nni_sock_rele(sock);
+	return (rv);
+}
+
 static nni_proto pair1poly_proto = {
 	.proto_version  = NNI_PROTOCOL_VERSION,
 	.proto_self     = { NNG_PAIR1_SELF, NNG_PAIR1_SELF_NAME },

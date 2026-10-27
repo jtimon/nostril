@@ -29,6 +29,8 @@ Linux/GNU linker and links =pthread= and =atomic= explicitly.
 The driver also compiles =lib/feed.c= into =gen/nng/feed.o= and adds it to both
 NNG artifacts. Its targeted-message helpers share NNG's socket registry in
 compiled and interpreted execution; they are not a separate FFI library.
+The pinned pair1-poly source includes the documented targeted-send backpressure
+extension described in [[file:transports.org][the local transport contract]]. Review it when upgrading NNG.
 
 The full build also stages the [[file:websocket.org][pinned libwebsockets client dependency]] under
 =gen/websocket/= using =lib/websocket/CMakeLists.txt=. It requires OpenSSL

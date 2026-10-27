@@ -24,18 +24,22 @@ XGetImage := ext_proc(display: Dynamic, shallow window: UPtr, shallow x: I32, sh
 XGetPixel := ext_proc(image: Dynamic, shallow x: I32, shallow y: I32) returns shallow UPtr {}
 XDestroyImage := ext_proc(image: Dynamic) returns shallow I32 {}
 
-composer_is_empty := proc(display: Dynamic, window: UPtr, height: U32, reference: Dynamic) returns Bool {
-    ref actual : Dynamic = XGetImage(display, window, 22, height.cast(I32) - 38, 180, 24, 0xffffff, 2)
-    if actual.is_null() { panic("could not capture composer") }
+region_matches := proc(display: Dynamic, window: UPtr, x: I32, y: I32, reference: Dynamic) returns Bool {
+    ref actual : Dynamic = XGetImage(display, window, x, y, 180, 24, 0xffffff, 2)
+    if actual.is_null() { panic("could not capture GUI region") }
     mut equal := true
     // Pixel coordinates, rather than a collection of elements.
-    for y in 0..24 {
-        for x in 0..180 {
-            if XGetPixel(reference, x.to_i32(), y.to_i32()) != XGetPixel(actual, x.to_i32(), y.to_i32()) { equal = false }
+    for row in 0..24 {
+        for column in 0..180 {
+            if XGetPixel(reference, column.to_i32(), row.to_i32()) != XGetPixel(actual, column.to_i32(), row.to_i32()) { equal = false }
         }
     }
     XDestroyImage(actual)
     return equal
+}
+
+composer_is_empty := proc(display: Dynamic, window: UPtr, height: U32, reference: Dynamic) returns Bool {
+    return region_matches(display, window, 22, height.cast(I32) - 38, reference)
 }
 
 find_window := proc() returns UPtr {
@@ -154,6 +158,15 @@ main := proc(args: ..Str) {
     sleep_ms(500)
     if app.poll() { panic("GUI failed on Enter: ", app.out(), app.err()) }
     if !composer_is_empty(display, window, height, empty) { panic("Enter did not clear the composer") }
+    ref recent : Dynamic = XGetImage(display, window, 22, height.cast(I32) - 108, 180, 24, 0xffffff, 2)
+    if recent.is_null() { panic("could not capture recent feed") }
+    XTestFakeButtonEvent(display, 4, 1, 0); XTestFakeButtonEvent(display, 4, 0, 0); XFlush(display)
+    sleep_ms(150)
+    assert(!region_matches(display, window, 22, height.cast(I32) - 108, recent))
+    XTestFakeButtonEvent(display, 5, 1, 0); XTestFakeButtonEvent(display, 5, 0, 0); XFlush(display)
+    sleep_ms(150)
+    assert(region_matches(display, window, 22, height.cast(I32) - 108, recent))
+    XDestroyImage(recent)
 
     // Manage follows through real controls, then switch identities and verify
     // the signed lists stay with their owners. Enter in this panel is Follow.
@@ -189,5 +202,5 @@ main := proc(args: ..Str) {
     status := app.wait()
     if status != 0 { panic("GUI exit failed: ", app.out(), app.err()) }
     File.remove_tree(home)
-    println("GUI Send/Enter, account switching, draft reset and per-account Follow/Unfollow passed")
+    println("GUI Send/Enter, feed scrolling, account switching, draft reset and per-account Follow/Unfollow passed")
 }

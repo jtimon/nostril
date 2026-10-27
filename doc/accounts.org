@@ -83,8 +83,19 @@ The following feed requests kind-1 events from the selected account plus its
 followed authors. With no follows, this is an own-posts feed. It never falls
 back to an unfiltered request. The local and WebSocket consumers also apply the
 filter locally, so a relay cannot inject an unfollowed author's otherwise valid
-note into this feed. Subscriptions remain live-only (=limit:0=); no history is
-downloaded yet. The first storage implementation supports up to 512 follow tags.
+note into this feed. Each connection, account switch and follow edit requests
+the latest 50 matching notes (=limit:50=), followed by live delivery. Both
+receivers keep at most the newest 50 matching pre-EOSE events, then merge them
+into the timeline. The history limit does not cap subsequent live delivery.
+The GUI shows oldest-to-newest by =created_at=, with the lowest event ID treated
+as newest on timestamp ties (the reverse of NIP-01's newest-first query order).
+History/live overlap is deduplicated by verified ID. Scroll the feed with the
+mouse wheel; sending or changing account/follows returns to its newest end.
+
+History availability depends on the relay. The local relay retains only its
+latest 256 verified events in memory; restarting it clears that cache. There is
+no durable note database or pagination yet. The first follow storage implementation
+supports up to 512 follow tags.
 
 ** Files and ownership
 

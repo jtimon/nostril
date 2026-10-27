@@ -588,8 +588,9 @@ nostril_publication_status := func(reply: Str, expected_id: Str) returns Str {
     return format("rejected: ", reason)
 }
 
-// Live subscriptions deliberately require limit:0 in every filter. Unknown
-// fields are rejected rather than silently broadening a subscription.
+// This bounded subscription dialect requires an explicit limit in each filter,
+// with a total history budget <= 50. Limit never affects live event matching.
+// Unknown fields are rejected rather than silently broadening a subscription.
 priv subscription_tag_matches := func(tags: Str, name: Str, wanted: Str) returns Bool {
     mut cursor := JsonCursor(text = tags.borrowed_view())
     if !json_take(cursor, '[') { return false }
@@ -611,7 +612,7 @@ priv subscription_tag_matches := func(tags: Str, name: Str, wanted: Str) returns
 }
 
 priv subscription_filter := func(mut cursor: JsonCursor, event: NostrEventFields,
-        mut matches: Bool) returns Bool {
+        mut matches: Bool, mut limit: I64) returns Bool {
     if !json_take(cursor, '{') { return false }
     mut keys := Set(Str).new()
     matches = true
@@ -623,7 +624,7 @@ priv subscription_filter := func(mut cursor: JsonCursor, event: NostrEventFields
         if key == "limit" || key == "since" || key == "until" {
             mut number : I64 = 0
             if !json_parse_nonnegative_i64(cursor, number) { return false }
-            if key == "limit" { if number != 0 { return false }; limited = true }
+            if key == "limit" { if number > 50 { return false }; limit = number; limited = true }
             else if key == "since" { matches = matches && event.created_at >= number }
             else { matches = matches && event.created_at <= number }
         } else {
@@ -660,16 +661,20 @@ priv subscription_filter := func(mut cursor: JsonCursor, event: NostrEventFields
 }
 
 priv subscription_parse := func(message: Str, event: NostrEventFields,
-        mut id: Str, mut matches: Bool) returns Bool {
+        mut id: Str, mut matches: Bool, mut history_limit: I64) returns Bool {
     mut cursor := JsonCursor(text = message.borrowed_view())
     mut command := ""
     if !json_take(cursor, '[') || !json_parse_string(cursor, command) || command != "REQ" ||
         !json_take(cursor, ',') || !json_parse_string(cursor, id) ||
         id.len() == 0 || nostril_utf8_scalars(id) > 64 || !json_take(cursor, ',') { return false }
     matches = false
+    history_limit = 0
     while true {
         mut filter_matches := false
-        if !subscription_filter(cursor, event, filter_matches) { return false }
+        mut limit : I64 = 0
+        if !subscription_filter(cursor, event, filter_matches, limit) { return false }
+        history_limit = history_limit + limit
+        if history_limit > 50 { return false }
         matches = matches || filter_matches
         if json_take(cursor, ']') { break }
         if !json_take(cursor, ',') { return false }
@@ -678,13 +683,61 @@ priv subscription_parse := func(message: Str, event: NostrEventFields,
     return cursor.at == cursor.text.len()
 }
 
-/// Validated live-only REQ ID, or empty for an unsupported/malformed request.
+/// Validated bounded REQ ID, or empty for an unsupported/malformed request.
 nostril_subscription_id := func(message: Str) returns Str {
     mut id := ""
     mut matches := false
     empty := NostrEventFields()
-    if !subscription_parse(message, empty, id, matches) { return "" }
+    mut limit : I64 = 0
+    if !subscription_parse(message, empty, id, matches, limit) { return "" }
     return id
+}
+
+/// Sum of per-filter history limits (0..50), or -1 for an invalid request.
+nostril_subscription_limit := func(request: Str) returns I64 {
+    mut id := ""
+    mut matches := false
+    mut limit : I64 = 0
+    empty := NostrEventFields()
+    if !subscription_parse(request, empty, id, matches, limit) { return -1 }
+    return limit
+}
+
+/// An independent single-filter REQ for history selection; empty at end/error.
+nostril_subscription_filter_at := func(request: Str, index: I64) returns Str {
+    id := nostril_subscription_id(request)
+    if id.len() == 0 || index < 0 { return "" }
+    mut cursor := JsonCursor(text = request.borrowed_view())
+    mut value := ""
+    if !json_take(cursor, '[') || !json_parse_string(cursor, value) ||
+        !json_take(cursor, ',') || !json_parse_string(cursor, value) { return "" }
+    mut at : I64 = 0
+    empty := NostrEventFields()
+    while json_take(cursor, ',') {
+        start := cursor.at
+        mut matches := false
+        mut limit : I64 = 0
+        if !subscription_filter(cursor, empty, matches, limit) { return "" }
+        if at == index { return format("[\"REQ\",", json_quote(id), ",", request.substr(start, cursor.at - start), "]") }
+        at++
+    }
+    return ""
+}
+
+// Ordering helpers for already-verified events. Parsing here does not authenticate
+// an event; callers must validate before insertion. Ascending storage order puts
+// newest timestamps (and lowest IDs on ties) at the end, as the GUI expects.
+priv nostril_fields_before := func(left: NostrEventFields, right: NostrEventFields) returns Bool {
+    return left.created_at < right.created_at ||
+        (left.created_at == right.created_at && left.id > right.id)
+}
+nostril_event_before := func(left: Str, right: Str) returns Bool {
+    mut a := NostrEventFields(); mut b := NostrEventFields()
+    return nostril_parse_complete_event(left, a) && nostril_parse_complete_event(right, b) && nostril_fields_before(a, b)
+}
+nostril_relay_event_before := func(left: Str, right: Str) returns Bool {
+    mut a := NostrEventFields(); mut b := NostrEventFields()
+    return nostril_parse_relay_event(left, a) && nostril_parse_relay_event(right, b) && nostril_fields_before(a, b)
 }
 
 /// REQ prefix ID for rejection routing; CLOSE must be a complete message.
@@ -708,7 +761,8 @@ nostril_subscription_matches := proc(request: Str, event_json: Str) returns Bool
     if !nostril_parse_complete_event(event_json, fields) || !nostril_valid_fields(fields) { return false }
     mut id := ""
     mut matches := false
-    return subscription_parse(request, fields, id, matches) && matches
+    mut limit : I64 = 0
+    return subscription_parse(request, fields, id, matches, limit) && matches
 }
 
 nostril_subscription_matches_relay := proc(request: Str, message: Str) returns Bool {
@@ -716,7 +770,8 @@ nostril_subscription_matches_relay := proc(request: Str, message: Str) returns B
     if !nostril_parse_relay_event(message, fields) || !nostril_valid_fields(fields) { return false }
     mut id := ""
     mut matches := false
-    return subscription_parse(request, fields, id, matches) && matches
+    mut limit : I64 = 0
+    return subscription_parse(request, fields, id, matches, limit) && matches
 }
 
 nostril_subscription_response := func(request: Str) returns Str {
@@ -724,9 +779,9 @@ nostril_subscription_response := func(request: Str) returns Str {
     if id.len() > 0 { return format("[\"EOSE\",", json_quote(id), "]") }
     rejected := nostril_control_id(request, "REQ")
     if rejected.len() > 0 {
-        return format("[\"CLOSED\",", json_quote(rejected), ",\"unsupported: live filters require limit:0\"]")
+        return format("[\"CLOSED\",", json_quote(rejected), ",\"unsupported: filters require explicit limits totaling at most 50\"]")
     }
-    return "[\"NOTICE\",\"invalid: expected live REQ or CLOSE\"]"
+    return "[\"NOTICE\",\"invalid: expected bounded REQ or CLOSE\"]"
 }
 
 nostril_subscription_envelope := func(id: Str, event_json: Str) returns Str {

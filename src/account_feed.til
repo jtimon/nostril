@@ -91,7 +91,7 @@ namespace:
         if self.remote { return nostril_ws_status(self.websocket) }
         if !self.live { return "Local only" }
         if self.feed.ready { return "Live subscription" }
-        return "Subscribing..."
+        return "Loading recent notes..."
     }
     publication_status := proc(self: AccountFeed, event: Str) returns Str {
         if self.remote { return nostril_ws_publication_status(self.websocket, nostril_relay_event_id(event)) }

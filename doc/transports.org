@@ -130,29 +130,40 @@ keeps the reason; it is not automatically retried. Oversized local events are
 rejected locally before submission. Clients and relay must be upgraded together:
 the old bus feed is no longer the live transport protocol.
 
-*** Live subscriptions
+*** Historical and live subscriptions
 
 The pair1 connection carries =["REQ",id,filter,...]= and =["CLOSE",id]=.
 IDs are scoped to an NNG connection (pipe), not shared between clients. A new
 REQ with the same ID replaces that connection's old subscription. Each filter
-must explicitly specify =limit:0=: there is no stored-event query or history.
-The relay sends =EOSE= before enabling live delivery. An unsupported or malformed
+must explicitly specify a nonnegative =limit=, with the sum of limits at most
+50. A zero limit remains live-only. The relay selects the newest matching events
+from a session-only cache of its latest 256 verified publications, respecting
+each OR filter's limit independently and deduplicating the union. It sends that
+snapshot newest-first (=created_at= descending, event ID ascending on ties),
+then =EOSE= before enabling live delivery. An unsupported or malformed
 REQ with a readable ID removes its previous subscription and sends =CLOSED=;
 unreadable controls receive =NOTICE=. CLOSE removes the subscription without
 a reply. Disconnect removes all subscriptions belonging to that pipe.
+If a longer subscription ID would push a cached event over the local frame
+limit, that event is omitted from replay so it cannot prevent EOSE delivery.
 
 Supported filters are =ids=, =authors=, =kinds=, inclusive =since=/=until=,
 and single-letter =#tag= lists. Values within a list are ORed, fields within
 a filter are ANDed, and multiple filters are ORed. IDs, authors, =#e= and =#p=
 values require full lowercase 64-character hex. Tag matching uses only the
 second string of each event tag. Empty lists, duplicate fields, unknown fields,
-and nonzero or missing limits are rejected instead of silently broadening a
-subscription. The GUI requests kind 1 under ID =local=, restricted to its active
+and missing/negative/over-budget limits are rejected instead of silently broadening
+a subscription. This bounded filter dialect is a prototype restriction, not a
+NIP-01 requirement. Limits do not affect live matching. The GUI requests kind 1
+with =limit:50= under ID =local=, restricted to its active
 account and followed authors. Received events are checked against that request
 locally as well; an empty follow list means self-only, not an unfiltered feed.
 
-GUI feed I/O is nonblocking with bounded work per frame. Before EOSE, the GUI
-retries its REQ once per second. A dead connection clears readiness and triggers
+GUI feed I/O is nonblocking with bounded work per frame. Before EOSE, the receiver
+buffers at most the newest requested number of matching notes. EOSE merges the
+batch into the timestamp-ordered, ID-deduplicated timeline. Before any response,
+the GUI retries its REQ once per second; historical progress extends that retry
+deadline to five seconds. A dead connection clears readiness and triggers
 resubscription; queued publications start once the subscription is ready.
 Closing the window attempts CLOSE and then closes the connection, which also
 removes its relay state. Once CLOSE is processed, later publications are not
@@ -161,8 +172,28 @@ routed to that subscription; frames already sent before CLOSE can still arrive.
 The small =lib/feed.c= adapter copies bounded NNG messages, preserves the pipe
 handle for targeted replies, and frees or transfers every native message. It
 is built into the same archive/shared twin as NNG to keep one socket registry
-on both Til backends. Control responses are retained on send backpressure;
-feed sends use bounded buffers and remain best effort for slow subscribers.
+on both Til backends. Historical frames and EOSE are retained on send backpressure.
+The simple relay serializes pending history/control output before accepting further
+publications, avoiding a snapshot/live gap; a slow history consumer can therefore
+delay publication processing. Live fan-out remains best effort for slow subscribers.
+
+The pinned =vendor/nng/src/sp/protocol/pair1/pair1_poly.c= has one project-owned
+extension, =nostril_pair1_try_send=. Upstream's poly sender can accept a message
+into its socket queue and then silently drop it at the two-message per-pipe queue;
+the history regression exposed missing events and EOSE. The extension bypasses
+that outer queue for explicitly targeted sends and reports per-peer =EAGAIN=.
+It holds the socket and pipe-map lock, verifies the protocol implementation, and
+transfers message ownership only on success; =lib/feed.c= frees on failure.
+It neither changes upstream's normal send API nor enlarges the pipe queue.
+This private extension is tied to the vendored revision and must be reviewed on
+NNG upgrades. Relay history uses its backpressure result to retry unchanged bytes.
+
+The protocol library also exports =nostril_subscription_limit= (budget or -1),
+=nostril_subscription_filter_at= (owned single-filter request or empty at end),
+and raw/enveloped =nostril_*event_before= ordering helpers. Ordering helpers
+parse already-verified inputs; they are not signature-validation APIs. The host
+owns cached strings, pending snapshots and timeline vectors. These are prototype
+library interfaces, not additional Nostr wire messages.
 
 This is a project-owned local transport contract, not NIP-01 over WebSocket.
 The original Pair0 CLI harness remains available without =--live=.

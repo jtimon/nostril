@@ -180,7 +180,7 @@ nostril_account_subscription := proc() returns Str {
     mut authors := Set(Str).new()
     authors.add(own active_pubkey.clone())
     for pubkey : Str in active_follows.split("\n") { if pubkey.len() > 0 { authors.add(own pubkey.clone()) } }
-    mut out := "[\"REQ\",\"local\",{\"kinds\":[1],\"limit\":0,\"authors\":["
+    mut out := "[\"REQ\",\"local\",{\"kinds\":[1],\"limit\":50,\"authors\":["
     mut first := true
     for author : Str in authors {
         if !first { out = format(out, ",") }
