@@ -2,6 +2,10 @@
 
 A [[https://github.com/nostr-protocol/nostr][nostr]] client written in [[https://github.com/jtimon/til][Til]] language.
 
+*Warning: Nostril is an early development prototype, not ready for use.*
+Configuration, storage formats and APIs may break without compatibility or
+migration guarantees. Use disposable test identities, not valuable keys or data.
+
 - =nostril-cli= is the local command-line client in =mode nostril_client=.
 - =nostril-relay= is the local relay harness in =mode nostril_relay=.
 - =nostril-gui= is the graphical client in =mode gui=.
@@ -83,8 +87,10 @@ filter, subscription, or relay model.
 
 ** Accounts and configuration
 
-Nostril interprets =~/.nostril/init.til= in-process with TilVm, following Tiled's
-shared startup-library pattern. =--create-account= saves a plaintext owner-only
+Nostril interprets =$XDG_CONFIG_HOME/nostril/init.til= (default
+=~/.config/nostril/init.til=) in-process with TilVm, following Tiled's host-prelude
+and shared startup-library patterns. Accounts live in =accounts/= beside init.
+=--create-account= saves a plaintext owner-only
 key and prints its public key; the init file names/selects accounts and relays.
 =--follow= and =--unfollow= persist the selected account's signed follow list.
 See [[file:doc/accounts.org][setup, ownership and storage details]]. Encrypted key storage is tracked in

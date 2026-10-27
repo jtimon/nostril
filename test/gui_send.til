@@ -46,6 +46,11 @@ find_window := proc() returns UPtr {
         if line.contains("\"Nostril\"") {
             text := line.trim().clone()
             fields := text.split(" ")
+            // A named window can exist before it is mapped. XSetInputFocus
+            // requires a viewable window; let the bounded polling loop wait.
+            state := Cmd.new("xwininfo", "-id", fields[0])
+            state.capture()
+            if state.run() != 0 || !state.out().contains("Map State: IsViewable") { continue }
             return fields[0].to_u64().cast(UPtr)
         }
     }
@@ -71,7 +76,7 @@ main := proc(args: ..Str) {
     home := format("tmp/gui-send-", process_id().to_str())
     mkdir_p(home)
     create := Cmd.new(executable, "--create-account")
-    create.env("HOME", home).capture()
+    create.env("HOME", home).env("XDG_CONFIG_HOME", "").capture()
     if create.run() != 0 { panic("could not create GUI test account: ", create.err()) }
     output := create.out()
     pubkey := output.trim().clone()
@@ -79,8 +84,9 @@ main := proc(args: ..Str) {
     configured := template.replace("nostril_config_relay(\"\")", format(
         "nostril_config_relay(\"\")\nnostril_config_account(\"gui-test\", \"", pubkey,
         "\")\nnostril_config_select(\"gui-test\")"))
-    File.writefile(format(home, "/.nostril/init.til"), configured)
-    app.env("HOME", home)
+    mkdir_p(format(home, "/.config/nostril"))
+    File.writefile(format(home, "/.config/nostril/init.til"), configured)
+    app.env("HOME", home).env("XDG_CONFIG_HOME", "")
     app.capture()
     app.start()
     mut window : UPtr = 0

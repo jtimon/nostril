@@ -1,5 +1,6 @@
 mode lib
 import("../nostril/event")
+import("std/sys")
 link_c("store.c")
 
 nostril_store_directory := ext_proc(path: I8, shallow create: Bool) returns shallow I32 {}
@@ -50,7 +51,14 @@ priv storage_error := func(operation: Str, error: I32) returns Str {
 }
 
 priv account_tree := proc(root: Str, pubkey: Str, create: Bool) returns Str {
-    if root.len() == 0 { return "HOME is unset; persistent accounts need a home directory" }
+    if root.len() == 0 { return "persistent accounts need an absolute XDG_CONFIG_HOME or HOME" }
+    // The shared XDG parent may not exist yet and need not be owner-only.
+    // The application directory and account subtree are checked below.
+    slash := root.rfind("/")
+    if create && slash > 0 {
+        error := mkdir_p(root.substr(0, slash.to_usize()))
+        if error != 0 { return storage_error("configuration parent directory", error) }
+    }
     for path : Str in array(Str, root, format(root, "/accounts"), format(root, "/accounts/", pubkey)) {
         value := path.clone()
         error := nostril_store_directory(value.c_str, create)

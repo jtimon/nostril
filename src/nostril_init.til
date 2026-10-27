@@ -6,7 +6,8 @@ import("../gen/nostril_startup_api")
 NostrilInit := proc()
 
 priv eval_init := proc(mut vm: TilVm, path: Str) throws TilVmError {
-    vm.load_file(path)?
+    vm.load_file(path, prelude_source = "import(\"nostril_startup_api\")\n",
+        prelude_name = "nostril-api", prelude_base = NOSTRIL_API_BASE)?
     mut init := vm.lookup("init", NostrilInit)?
     init.call()?
 }

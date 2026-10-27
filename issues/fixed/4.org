@@ -1,0 +1,29 @@
+# priority: medium
+# category: features
+** FIXED #4 Follow Tiled's host-prelude and XDG configuration patterns
+
+Resolution: the host supplies the generated API through TilVm's prelude. User
+init and relative helpers need no application import. Init and accounts share
+the XDG-selected Nostril directory (default ~/.config/nostril/), with no legacy
+or missing-file fallback. Account creation handles a missing shared parent;
+application/account directories retain owner-only checks. README now prominently
+states the prototype's readiness and breaking-change policy.
+
+Verification with the installed Til recorded in [[file:../../doc/til-dependency.org][the dependency record]]:
+- =./make.til=: library, CLI, relay and GUI built successfully.
+- =./make.til test=: 20/20 interpreted and 20/20 compiled tests passed, including
+  implicit API access in relative helpers, shared state, empty PATH, default and
+  absolute/relative XDG selection, relocated account lookup and no fallback.
+- =xvfb-run -a til run --usize=64 -o tmp/xdg-gui-send -c tmp/xdg-gui-send.c test/gui_send.til=:
+  persistent-account Send/Enter passed. Fixed the harness to wait for a viewable
+  window before requesting input focus after observing an X11 BadMatch race.
+- Builds used the existing OpenSSL development staging under =tmp/openssl-dev/=
+  via CMAKE_PREFIX_PATH and CPATH. =git diff --check= passed.
+
+Supply the application API through TilVm's host prelude and select exactly one
+init path using Tiled's XDG rules. Keep accounts beside init in the selected
+Nostril directory. This is a breaking replacement for the ~/.nostril/ layout;
+no compatibility or migration support is required. Add an early-development
+warning to the README, including unstable configuration/storage/API contracts.
+Verify implicit API access, relative user helpers, shared native state, path
+selection and missing-file behavior, alongside the normal build and tests.

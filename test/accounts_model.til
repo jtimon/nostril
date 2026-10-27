@@ -5,24 +5,25 @@ import("../src/nostril_init")
 import("../gen/nostril_api")
 crypto := import("std/crypto")
 
-get_cwd_str := ext_proc() returns Str {}
 chmod := ext_proc(path: I8, shallow mode: U32) returns shallow I32 {}
 symlink := ext_proc(target: I8, path: I8) returns shallow I32 {}
 
 write_init := proc(root: Str, first: Str, second: Str, selected: Str) {
-    api := format(get_cwd_str(), "/gen/nostril_startup_api")
+    File.writefile(format(root, "/helper.til"), format(
+        "mode lib\nselect_account := proc() { nostril_config_select(\"", selected, "\") }\n"))
     File.writefile(format(root, "/init.til"), format(
-        "mode lib\nimport(\"", api, "\")\nimport(\"std/sys\")\nimport(\"std/file\")\n",
+        "mode lib\nimport(\"helper\")\nimport(\"std/sys\")\nimport(\"std/file\")\n",
         "init := proc() {\n",
         "nostril_config_account(\"first\", \"", first, "\")\n",
         "nostril_config_account(\"second\", \"", second, "\")\n",
-        "nostril_config_select(\"", selected, "\")\n",
+        "select_account()\n",
         "File.writefile(\"", root, "/guest-pid\", process_id().to_str())\n}\n"))
 }
 
 main := proc(home: Str) {
     mkdir_p(home)
-    root := format(home, "/.nostril")
+    root := format(home, "/.config/nostril")
+    init_path := format(root, "/init.til")
     assert(nostril_load_init(root) == "")
     assert(!nostril_account_persistent())
     ephemeral := nostril_account_public_key()
@@ -65,15 +66,12 @@ main := proc(home: Str) {
     // Failed init must not activate partial registration or alter stored keys.
     key_path := format(root, "/accounts/", first, "/secret.key")
     original := File.readfile(key_path)
-    api := format(get_cwd_str(), "/gen/nostril_startup_api")
-    File.writefile(format(root, "/init.til"), format("mode lib\nimport(\"", api,
-        "\")\ninit := proc() { nostril_config_account(\"bad\", \"", first,
+    File.writefile(init_path, format("mode lib\ninit := proc() { nostril_config_account(\"bad\", \"", first,
         "\"); nostril_config_select(\"bad\"); panic(\"intentional init failure\") }\n"))
     assert(nostril_load_init(root).contains("intentional init failure"))
     assert(nostril_account_public_key() == "")
     assert(File.readfile(key_path) == original)
-    File.writefile(format(root, "/init.til"), format("mode lib\nimport(\"", api,
-        "\")\ninit := proc() returns Str { nostril_config_relay(\"\"); return \"wrong signature\" }\n"))
+    File.writefile(init_path, "mode lib\ninit := proc() returns Str { nostril_config_relay(\"\"); return \"wrong signature\" }\n")
     assert(nostril_load_init(root).len() > 0)
     assert(nostril_account_public_key() == "")
     write_init(root, first, second, "first")

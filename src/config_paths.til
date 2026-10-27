@@ -1,0 +1,13 @@
+mode lib
+import("std/sys")
+import("std/file")
+
+// Follow Tiled: select one host entry point, ignoring relative XDG roots.
+// A missing selected file does not trigger a search of other locations.
+user_config_directory := proc(host: Str) returns Str {
+    root := get_env("XDG_CONFIG_HOME")
+    if File.is_absolute(root) { return format(root, "/", host) }
+    home := get_env("HOME")
+    if home.len() > 0 { return format(home, "/.config/", host) }
+    return ""
+}

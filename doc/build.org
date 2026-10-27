@@ -47,8 +47,9 @@ a subprocess timeout. No external relay is required by the suite.
 
 The full build also compiles =lib/accounts/nostril_startup.til= as a shared
 library and generates =gen/nostril_startup_api.til=, =gen/nostril_runtime.til=
-(the matching installed SDK location), and =gen/nostril_init.til= (ready to copy
-and edit). The GUI and interpreted init use the same shared state. Runtime
+(the matching installed SDK and host API locations), and =gen/nostril_init.til=
+(an identical convenience copy of =defaults/init.til=). The host supplies the API
+through a prelude; the GUI and interpreted init use the same shared state. Runtime
 configuration uses TilVm, not a compiler subprocess. The account model test is
 built as =bin/nostril-account-tests= and exercised with an empty PATH.
 

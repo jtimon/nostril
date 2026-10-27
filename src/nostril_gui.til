@@ -4,7 +4,7 @@ import("../gen/nostril_api")
 import("../lib/modes/nostril_live")
 import("../gen/websocket_api")
 import("nostril_init")
-import("std/sys")
+import("config_paths")
 
 gui_utf8 := func(code: I64) returns Str {
     if code < 0 || code > 0x10ffff || (code >= 0xd800 && code <= 0xdfff) {
@@ -90,9 +90,7 @@ main := proc(args: ..Str) {
         println(nostril_version())
         return
     }
-    home := get_env("HOME")
-    mut root := ""
-    if home.len() > 0 { root = format(home, "/.nostril") }
+    root := user_config_directory("nostril")
     if args.len() == 1 && args[0] == "--create-account" {
         result := nostril_account_create(root)
         if !nostril_key_encoding(result) { panic(result) }

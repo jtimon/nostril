@@ -52,11 +52,11 @@ startup_library := proc(opt: Str) {
     prefix := bindir.substr(0, bindir.rfind("/").to_usize()).clone()
     sdk := format(prefix, "/lib/til")
     if !File.is_file(format(sdk, "/src/std/tilvm.til")) { panic("installed Til SDK not found: ", sdk) }
+    root := get_cwd_str().replace("\\", "\\\\").replace("\"", "\\\"")
     File.writefile("gen/nostril_runtime.til", format("mode lib\nNOSTRIL_SDK := \"",
-        sdk.replace("\\", "\\\\").replace("\"", "\\\""), "\"\n"))
+        sdk.replace("\\", "\\\\").replace("\"", "\\\""), "\"\nNOSTRIL_API_BASE := \"", root, "/gen\"\n"))
     Cmd.new("til", "build", "--cpu=baseline", "--usize=64", opt,
         "-c", "gen/nostril_startup.c", "lib/accounts/nostril_startup.til").run_checked()
-    root := get_cwd_str().replace("\\", "\\\\").replace("\"", "\\\"")
     mut binding := format("mode lib\nlink(\"", root, "/gen/lib/libnostril_startup.so\")\n")
     for name : Str in array(Str, "nostril_config_reset") {
         binding = format(binding, "til_nostril_x5fstartup__", name, " := ext_proc() {}\n",
@@ -87,7 +87,7 @@ startup_library := proc(opt: Str) {
         "nostril_account_follow := proc(pubkey: Str, remove: Bool) returns Str { return til_nostril_x5fstartup__nostril_account_follow(pubkey, remove) }\n")
     File.writefile("gen/nostril_startup_api.til", binding)
     template := File.readfile("defaults/init.til")
-    File.writefile("gen/nostril_init.til", template.replace("../gen/nostril_startup_api", format(root, "/gen/nostril_startup_api")))
+    File.writefile("gen/nostril_init.til", template)
 }
 
 select_api := proc() {

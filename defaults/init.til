@@ -1,8 +1,8 @@
 mode lib
-import("../gen/nostril_startup_api")
 
-// Build, then copy gen/nostril_init.til to ~/.nostril/init.til. The generated
-// copy points to the same native library as the compiled GUI.
+// Copy to $XDG_CONFIG_HOME/nostril/init.til (default ~/.config/nostril/init.til).
+// Nostril supplies its API as a host prelude. User helper imports are relative
+// to this file. Nostril interprets init() in-process before opening its window.
 init := proc() {
     nostril_config_relay("")
     // Create an account with bin/nostril-gui --create-account, then use its

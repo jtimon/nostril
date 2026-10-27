@@ -73,7 +73,8 @@ same compiled callback implementation. See [[file:websocket.org][the WebSocket t
 limits, TLS verification, and the independent loopback tests.
 
 User configuration follows Tiled's TilVm/shared-library pattern. The GUI and
-interpreted =~/.nostril/init.til= share =libnostril_startup.so=; init stages
+interpreted XDG init (default =~/.config/nostril/init.til=) share
+=libnostril_startup.so= through the host API prelude; init stages
 account declarations, selection and relay preference, then the host validates
 and adopts the selected account. Secret keys remain in the compiled account
 owner. Signed follow files are locked and atomically replaced. Both transports
