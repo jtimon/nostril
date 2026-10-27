@@ -1,8 +1,7 @@
 mode gui
 
 import("../gen/nostril_api")
-import("../lib/modes/nostril_live")
-import("../gen/websocket_api")
+import("account_feed")
 import("nostril_init")
 import("config_paths")
 
@@ -85,6 +84,12 @@ gui_draw_wrapped := proc(text: Str, x: I32, y: I32, width: I32, font_size: I32,
     DrawText(line.c_str, x, y + row * line_height, font_size, color)
 }
 
+gui_hit := proc(x: I32, y: I32, width: I32, height: I32) returns Bool {
+    mouse := GetMousePosition()
+    return mouse.x >= x.to_f32() && mouse.x < (x + width).to_f32() &&
+        mouse.y >= y.to_f32() && mouse.y < (y + height).to_f32()
+}
+
 main := proc(args: ..Str) {
     if args.len() == 1 && (args[0] == "-v" || args[0] == "--version") {
         println(nostril_version())
@@ -116,29 +121,12 @@ main := proc(args: ..Str) {
         return
     }
     mut endpoint := nostril_account_relay()
-    mut live := endpoint.len() > 0
     if args.len() > 0 {
-        live = true
         endpoint = NOSTRIL_LIVE_ENDPOINT
         if args.len() == 2 { endpoint = args[1].clone() }
     }
-    mut socket := nng_socket()
-    mut publisher := nng_socket()
-    remote := live && (endpoint.starts_with("ws://") || endpoint.starts_with("wss://"))
-    mut websocket : I64 = 0
-    mut outbox := Vec(Publication).new()
-    subscription := nostril_account_subscription()
-    mut feed := FeedClient(request = subscription.clone())
-    if remote {
-        websocket = nostril_ws_open(endpoint)
-        if websocket == 0 { panic("could not create WebSocket client") }
-        nostril_ws_subscribe(websocket, subscription)
-    } else if live {
-        nostril_live_open(socket, endpoint, false)
-        nostril_publish_open(publisher, endpoint, false)
-    }
-    mut delivery_status := "Local only"
-    if live { delivery_status = "Local relay" }
+    mut session := AccountFeed()
+    session.open(endpoint)
 
     background := Color(r = 24, g = 24, b = 24, a = 255)
     field := Color(r = 32, g = 32, b = 32, a = 255)
@@ -147,13 +135,13 @@ main := proc(args: ..Str) {
     muted := Color(r = 152, g = 152, b = 152, a = 255)
     action := Color(r = 74, g = 112, b = 170, a = 255)
 
-    public_key := nostril_account_public_key()
-    account_name := nostril_account_name()
-    mut identity := format("Account ", account_name, " ")
-    if !nostril_account_persistent() { identity = "Ephemeral " }
-    mut messages := Vec(Str).new()
     mut composer := ""
     mut composer_scalars : I32 = 0
+    // Panels replace the timeline temporarily; the main feed stays full-width.
+    mut panel : I32 = 0
+    mut scroll : I32 = 0
+    mut follow_input := ""
+    mut notice := ""
 
     SetConfigFlags(FLAG_WINDOW_RESIZABLE.cast(U32))
     InitWindow(900, 640, "Nostril".c_str)
@@ -161,43 +149,13 @@ main := proc(args: ..Str) {
     SetTargetFPS(60)
 
     while !WindowShouldClose() {
-        if remote {
-            nostril_ws_poll(websocket)
-            delivery_status = gui_status_text(nostril_ws_status(websocket))
-            mut budget : I64 = 32
-            while budget > 0 {
-                message := nostril_ws_receive(websocket)
-                if message.len() == 0 { break }
-                nostril_live_accept(messages, message)
-                budget--
-            }
-        } else if live {
-            nostril_feed_poll(socket, feed, messages)
-            if feed.ready { nostril_publish_poll(publisher, outbox) }
-            if feed.ready { delivery_status = "Live subscription" }
-            else { delivery_status = "Subscribing..." }
-        }
-        if IsKeyPressed(259) || IsKeyPressedRepeat(259) {
-            if composer_scalars > 0 {
-                composer = gui_without_last_scalar(composer)
-                composer_scalars--
-            }
-        }
-        mut code := GetCharPressed()
-        while code > 0 {
-            if code >= 32 && code != 127 && composer_scalars < 280 {
-                composer = format(composer, gui_utf8(code.cast(I64)))
-                composer_scalars++
-            }
-            code = GetCharPressed()
-        }
-
+        session.poll()
         width := GetScreenWidth()
         height := GetScreenHeight()
         margin : I32 = 12
         content_x := margin
         content_w := width - margin * 2
-        header_h : I32 = 44
+        header_h : I32 = 76
         composer_h : I32 = 56
         composer_y := height - composer_h
         field_x := margin
@@ -207,20 +165,98 @@ main := proc(args: ..Str) {
         field_w := width - margin * 3 - button_w
         button_x := field_x + field_w + margin
 
-        mouse := GetMousePosition()
-        button_hover := mouse.x >= button_x.to_f32() &&
-            mouse.x < (button_x + button_w).to_f32() &&
-            mouse.y >= field_y.to_f32() && mouse.y < (field_y + field_h).to_f32()
-        submit := IsKeyPressed(257) || (button_hover && IsMouseButtonPressed(0))
-        if submit && composer.trim().len() > 0 {
-            event := nostril_account_sign(composer, nostril_now())
-            if !nostril_event_is_valid(event) { panic("newly signed event did not verify") }
-            nostril_live_accept(messages, nostril_live_envelope(event))
-            if remote {
-                nostril_ws_publish(websocket, event)
-            } else if live {
-                nostril_publish_queue(outbox, event)
+        clicked := IsMouseButtonPressed(0)
+        if clicked && gui_hit(margin, 8, 210, 30) {
+            if panel == 1 { panel = 0 } else { panel = 1 }
+            scroll = 0; notice = ""
+        }
+        if clicked && gui_hit(width - 108, 8, 96, 30) {
+            if panel == 2 { panel = 0 } else { panel = 2 }
+            scroll = 0; notice = ""
+        }
+        if panel > 0 && clicked && gui_hit(width - 180, 8, 60, 30) { panel = 0 }
+        if panel > 0 {
+            wheel := GetMouseWheelMove()
+            if wheel > 0 { scroll = scroll - 3 }
+            else if wheel < 0 { scroll = scroll + 3 }
+            if scroll < 0 { scroll = 0 }
+        }
+        if IsKeyPressed(259) || IsKeyPressedRepeat(259) {
+            if panel == 0 && composer_scalars > 0 {
+                composer = gui_without_last_scalar(composer); composer_scalars--
+            } else if panel == 2 { follow_input = gui_without_last_scalar(follow_input) }
+        }
+        if panel == 2 && (IsKeyDown(341) || IsKeyDown(345)) && IsKeyPressed(86) {
+            ref clipboard : I8 = GetClipboardText()
+            pasted := Str.from_c_str(clipboard)
+            candidate := pasted.trim().clone()
+            if candidate.len() <= 64 { follow_input = candidate.clone() }
+            else { notice = "Use a 64-character hex public key." }
+        }
+        mut code := GetCharPressed()
+        while code > 0 {
+            if code >= 32 && code != 127 {
+                if panel == 0 && composer_scalars < 280 {
+                    composer = format(composer, gui_utf8(code.cast(I64))); composer_scalars++
+                } else if panel == 2 && follow_input.len() < 64 && code < 128 {
+                    follow_input = format(follow_input, gui_utf8(code.cast(I64)))
+                }
             }
+            code = GetCharPressed()
+        }
+        if panel == 1 {
+            count := nostril_account_count().to_i32()
+            visible := (height - 148) / 34
+            mut maximum := count - visible
+            if maximum < 0 { maximum = 0 }
+            if scroll > maximum { scroll = maximum }
+            for index in 0..nostril_account_count() {
+                row_y : I32 = 104 + (index.to_i32() - scroll) * 34
+                if row_y < 104 || row_y + 30 > height - 44 { continue }
+                if clicked && gui_hit(margin, row_y, content_w, 30) {
+                    name := nostril_account_name_at(index)
+                    if name == nostril_account_name() { panel = 0 }
+                    else {
+                        error := session.switch_account(root, name)
+                        if error.len() > 0 { notice = error.clone() }
+                        else {
+                            composer = ""; composer_scalars = 0; follow_input = ""
+                            notice = ""; panel = 0; scroll = 0
+                        }
+                    }
+                }
+            }
+        }
+        if panel == 2 {
+            if nostril_account_persistent() && (IsKeyPressed(257) ||
+                    (clicked && gui_hit(width - 88, 88, 76, 36))) {
+                error := session.follow(follow_input.trim(), false)
+                if error.len() > 0 { notice = error.clone() }
+                else { follow_input = ""; notice = "Follow saved locally; feed updated." }
+            }
+            follows := nostril_account_follows()
+            mut count : I32 = 0
+            for pubkey : Str in follows.split("\n") { if pubkey.len() > 0 { count++ } }
+            mut maximum := count - (height - 200) / 34
+            if maximum < 0 { maximum = 0 }
+            if scroll > maximum { scroll = maximum }
+            mut row : I32 = 0
+            for pubkey : Str in follows.split("\n") {
+                if pubkey.len() == 0 { continue }
+                row_y : I32 = 156 + (row - scroll) * 34
+                row++
+                if row_y < 156 || row_y + 30 > height - 44 { continue }
+                if clicked && gui_hit(width - 88, row_y, 76, 28) {
+                    error := session.follow(pubkey, true)
+                    if error.len() > 0 { notice = error.clone() }
+                    else { notice = "Unfollow saved locally; feed updated." }
+                }
+            }
+        }
+        button_hover := gui_hit(button_x, field_y, button_w, field_h)
+        submit := IsKeyPressed(257) || (button_hover && IsMouseButtonPressed(0))
+        if panel == 0 && submit && composer.trim().len() > 0 {
+            session.send(composer)
             composer = ""
             composer_scalars = 0
         }
@@ -229,84 +265,129 @@ main := proc(args: ..Str) {
         ClearBackground(background)
 
         DrawRectangle(0, header_h - 1, width, 1, border)
-        DrawText("Nostril".c_str, margin, 12, 20, text)
-        mut status := format(identity, public_key, " | ", delivery_status)
-        if MeasureText(status.c_str, 13) > width - 100 {
-            status = format(identity, public_key.substr(0, 8), "... | ", delivery_status)
-        }
-        DrawText(status.c_str, width - margin - MeasureText(status.c_str, 13), 16, 13, muted)
+        DrawRectangle(margin, 8, 210, 30, field)
+        account_label := gui_fitting_tail(format("Account: ", nostril_account_name()), 194, 14)
+        DrawText(account_label.c_str, margin + 8, 16, 14, text)
+        DrawRectangle(width - 108, 8, 96, 30, field)
+        DrawText("Following".c_str, width - 100, 16, 14, text)
+        if panel > 0 { DrawText("Back".c_str, width - 174, 16, 14, text) }
+        public_key := nostril_account_public_key()
+        status := gui_fitting_tail(format(public_key.substr(0, 16), "... | ",
+            gui_status_text(session.status())), content_w, 13)
+        DrawText(status.c_str, margin, 50, 13, muted)
 
-        timeline_top := header_h + 8
-        timeline_bottom := composer_y - 8
-        if messages.len() == 0 {
-            DrawText("No messages.".c_str, content_x, timeline_top + 4, 14, muted)
-        } else {
-            BeginScissorMode(content_x, timeline_top, content_w, timeline_bottom - timeline_top)
-            mut bottom := timeline_bottom
-            mut index := messages.len()
-            while index > 0 && bottom > timeline_top {
-                index--
-                ref event : Str = messages[index]
-                message := nostril_relay_event_content(event)
-                message_x := content_x + 48
-                message_w := content_w - 48
-                line_count := gui_wrapped_lines(message, message_w, 16)
-                row_h : I32 = 34 + line_count * 21
-                row_y : I32 = bottom - row_h
-                DrawText("Note".c_str, content_x, row_y + 9, 13, muted)
-                gui_draw_wrapped(message, message_x, row_y + 7, message_w, 16, 21, text)
-                mut publication_status := "local only"
-                if remote { publication_status = gui_status_text(nostril_ws_publication_status(websocket, nostril_relay_event_id(event))) }
-                else if live { publication_status = nostril_publish_label(outbox, nostril_relay_event_id(event)) }
-                visible_status := gui_fitting_tail(publication_status, message_w, 11)
-                DrawText(visible_status.c_str, message_x, bottom - 15, 11, muted)
-                DrawRectangle(content_x, bottom - 1, content_w, 1, border)
-                bottom = row_y
+        if panel == 0 {
+            timeline_top := header_h + 8
+            timeline_bottom := composer_y - 8
+            if session.messages.len() == 0 {
+                DrawText("No messages.".c_str, content_x, timeline_top + 4, 14, muted)
+            } else {
+                BeginScissorMode(content_x, timeline_top, content_w, timeline_bottom - timeline_top)
+                mut bottom := timeline_bottom
+                mut index := session.messages.len()
+                while index > 0 && bottom > timeline_top {
+                    index--
+                    ref event : Str = session.messages[index]
+                    message := nostril_relay_event_content(event)
+                    message_x := content_x + 48
+                    message_w := content_w - 48
+                    line_count := gui_wrapped_lines(message, message_w, 16)
+                    row_h : I32 = 34 + line_count * 21
+                    row_y : I32 = bottom - row_h
+                    DrawText("Note".c_str, content_x, row_y + 9, 13, muted)
+                    gui_draw_wrapped(message, message_x, row_y + 7, message_w, 16, 21, text)
+                    publication_status := gui_status_text(session.publication_status(event))
+                    visible_status := gui_fitting_tail(publication_status, message_w, 11)
+                    DrawText(visible_status.c_str, message_x, bottom - 15, 11, muted)
+                    DrawRectangle(content_x, bottom - 1, content_w, 1, border)
+                    bottom = row_y
+                }
+                EndScissorMode()
+            }
+
+            DrawRectangle(0, composer_y, width, composer_h, background)
+            DrawRectangle(0, composer_y, width, 1, border)
+            DrawRectangle(field_x, field_y, field_w, field_h, field)
+            DrawRectangleLines(field_x, field_y, field_w, field_h, border)
+
+            count := format(composer_scalars.to_str(), "/280")
+            count_w := MeasureText(count.c_str, 11)
+            input_w := field_w - count_w - 28
+            BeginScissorMode(field_x + 10, field_y + 1, input_w, field_h - 2)
+            if composer.len() == 0 {
+                DrawText("Message".c_str, field_x + 10, field_y + 12, 16, muted)
+            } else {
+                visible := gui_fitting_tail(composer, input_w, 16)
+                DrawText(visible.c_str, field_x + 10, field_y + 12, 16, text)
+                if (GetTime() * 2).to_i64().mod(2) == 0 {
+                    caret_x := field_x + 12 + MeasureText(visible.c_str, 16)
+                    DrawRectangle(caret_x, field_y + 10, 1, 21, text)
+                }
             }
             EndScissorMode()
-        }
+            DrawText(count.c_str, field_x + field_w - count_w - 8, field_y + 14, 11, muted)
 
-        DrawRectangle(0, composer_y, width, composer_h, background)
-        DrawRectangle(0, composer_y, width, 1, border)
-        DrawRectangle(field_x, field_y, field_w, field_h, field)
-        DrawRectangleLines(field_x, field_y, field_w, field_h, border)
-
-        count := format(composer_scalars.to_str(), "/280")
-        count_w := MeasureText(count.c_str, 11)
-        input_w := field_w - count_w - 28
-        BeginScissorMode(field_x + 10, field_y + 1, input_w, field_h - 2)
-        if composer.len() == 0 {
-            DrawText("Message".c_str, field_x + 10, field_y + 12, 16, muted)
-        } else {
-            visible := gui_fitting_tail(composer, input_w, 16)
-            DrawText(visible.c_str, field_x + 10, field_y + 12, 16, text)
-            if (GetTime() * 2).to_i64().mod(2) == 0 {
-                caret_x := field_x + 12 + MeasureText(visible.c_str, 16)
-                DrawRectangle(caret_x, field_y + 10, 1, 21, text)
+            mut button_color := border
+            if composer.trim().len() > 0 { button_color = action }
+            if button_hover && composer.trim().len() > 0 {
+                button_color = Color(r = 88, g = 128, b = 188, a = 255)
             }
+            DrawRectangle(button_x, field_y, button_w, field_h, button_color)
+            send_label := "Send"
+            send_x := button_x + (button_w - MeasureText(send_label.c_str, 14)) / 2
+            DrawText(send_label.c_str, send_x, field_y + 13, 14, text)
+        } else {
+            BeginScissorMode(margin, header_h + 1, content_w, height - header_h - 2)
+            if panel == 1 {
+                DrawText("Switching clears the draft/feed and stops pending retries.".c_str, margin, 84, 12, muted)
+                if nostril_account_count() == 0 {
+                    DrawText("Register accounts in init.til to switch here.".c_str, margin, 110, 14, muted)
+                }
+                for index in 0..nostril_account_count() {
+                    row_y : I32 = 104 + (index.to_i32() - scroll) * 34
+                    if row_y < 104 || row_y + 30 > height - 44 { continue }
+                    name := nostril_account_name_at(index)
+                    mut color := field
+                    if name == nostril_account_name() { color = action }
+                    DrawRectangle(margin, row_y, content_w, 30, color)
+                    label := gui_fitting_tail(name, content_w - 16, 14)
+                    DrawText(label.c_str, margin + 8, row_y + 8, 14, text)
+                }
+            } else {
+                DrawRectangle(margin, 88, width - 112, 36, field)
+                mut input_label := "Hex public key (Ctrl+V to paste)"
+                if follow_input.len() > 0 { input_label = gui_fitting_tail(follow_input, width - 132, 14) }
+                DrawText(input_label.c_str, margin + 8, 99, 14, text)
+                mut color := border
+                if nostril_account_persistent() { color = action }
+                DrawRectangle(width - 88, 88, 76, 36, color)
+                DrawText("Follow".c_str, width - 78, 99, 14, text)
+                mut hint := "Following for this account (saved locally)"
+                if !nostril_account_persistent() { hint = "Select a persistent account to manage follows." }
+                DrawText(hint.c_str, margin, 134, 12, muted)
+                follows := nostril_account_follows()
+                if follows.len() == 0 { DrawText("No follows yet.".c_str, margin, 164, 14, muted) }
+                mut row : I32 = 0
+                for pubkey : Str in follows.split("\n") {
+                    if pubkey.len() == 0 { continue }
+                    row_y : I32 = 156 + (row - scroll) * 34
+                    row++
+                    if row_y < 156 || row_y + 30 > height - 44 { continue }
+                    label := gui_fitting_tail(pubkey, width - 124, 13)
+                    DrawText(label.c_str, margin, row_y + 8, 13, text)
+                    DrawRectangle(width - 88, row_y, 76, 28, field)
+                    DrawText("Unfollow".c_str, width - 82, row_y + 7, 13, text)
+                }
+            }
+            visible_notice := gui_fitting_tail(notice, content_w, 12)
+            DrawText(visible_notice.c_str, margin, height - 28, 12, muted)
+            EndScissorMode()
         }
-        EndScissorMode()
-        DrawText(count.c_str, field_x + field_w - count_w - 8, field_y + 14, 11, muted)
-
-        mut button_color := border
-        if composer.trim().len() > 0 { button_color = action }
-        if button_hover && composer.trim().len() > 0 {
-            button_color = Color(r = 88, g = 128, b = 188, a = 255)
-        }
-        DrawRectangle(button_x, field_y, button_w, field_h, button_color)
-        send_label := "Send"
-        send_x := button_x + (button_w - MeasureText(send_label.c_str, 14)) / 2
-        DrawText(send_label.c_str, send_x, field_y + 13, 14, text)
 
         EndDrawing()
     }
 
     CloseWindow()
-    if remote { nostril_ws_close(websocket) }
-    else if live {
-        nostril_live_send(socket, NOSTRIL_LOCAL_CLOSE)
-        nostril_nng_close(publisher)
-        nostril_nng_close(socket)
-    }
+    session.close()
     nostril_config_reset()
 }

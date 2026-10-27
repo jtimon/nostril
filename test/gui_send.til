@@ -2,6 +2,7 @@ mode cli
 
 import("std/sys")
 import("std/file")
+import("../gen/nostril_api")
 link("X11")
 link(":libXtst.so.6")
 
@@ -67,12 +68,23 @@ key := proc(display: Dynamic, symbol: UPtr) {
     sleep_ms(25)
 }
 
+click := proc(display: Dynamic, window: UPtr, x: I32, y: I32) {
+    mut root_x : I32 = 0
+    mut root_y : I32 = 0
+    mut child : UPtr = 0
+    if XTranslateCoordinates(display, window, XDefaultRootWindow(display),
+            x, y, root_x, root_y, child) == 0 { panic("cannot locate GUI control") }
+    XTestFakeMotionEvent(display, -1, root_x, root_y, 0)
+    XTestFakeButtonEvent(display, 1, 1, 0); XFlush(display); sleep_ms(50)
+    XTestFakeButtonEvent(display, 1, 0, 0); XFlush(display); sleep_ms(150)
+}
+
 main := proc(args: ..Str) {
     if args.len() > 1 { panic("usage: gui_send [gui-binary]") }
     mut executable := "bin/nostril-gui"
     if args.len() == 1 { executable = args[0].clone() }
     // Local-only: this test never publishes to a public relay.
-    app := Cmd.new("timeout", "30", executable)
+    app := Cmd.new("timeout", "45", executable)
     home := format("tmp/gui-send-", process_id().to_str())
     mkdir_p(home)
     create := Cmd.new(executable, "--create-account")
@@ -80,9 +92,15 @@ main := proc(args: ..Str) {
     if create.run() != 0 { panic("could not create GUI test account: ", create.err()) }
     output := create.out()
     pubkey := output.trim().clone()
+    create_second := Cmd.new(executable, "--create-account")
+    create_second.env("HOME", home).env("XDG_CONFIG_HOME", "").capture()
+    if create_second.run() != 0 { panic("could not create second GUI test account: ", create_second.out()) }
+    second_output := create_second.out()
+    second := second_output.trim().clone()
     template := File.readfile("gen/nostril_init.til")
     configured := template.replace("nostril_config_relay(\"\")", format(
         "nostril_config_relay(\"\")\nnostril_config_account(\"gui-test\", \"", pubkey,
+        "\")\nnostril_config_account(\"second\", \"", second,
         "\")\nnostril_config_select(\"gui-test\")"))
     mkdir_p(format(home, "/.config/nostril"))
     File.writefile(format(home, "/.config/nostril/init.til"), configured)
@@ -136,11 +154,40 @@ main := proc(args: ..Str) {
     sleep_ms(500)
     if app.poll() { panic("GUI failed on Enter: ", app.out(), app.err()) }
     if !composer_is_empty(display, window, height, empty) { panic("Enter did not clear the composer") }
+
+    // Manage follows through real controls, then switch identities and verify
+    // the signed lists stay with their owners. Enter in this panel is Follow.
+    click(display, window, width.cast(I32) - 60, 24)
+    for character : I8 in second { key(display, character.cast(U8).cast(UPtr)) }
+    key(display, 0xff0d); sleep_ms(200)
+    first_path := format(home, "/.config/nostril/accounts/", pubkey, "/follows.json")
+    first_follows := File.readfile(first_path)
+    assert(nostril_follows_valid(first_follows, pubkey) && first_follows.contains(second))
+    click(display, window, width.cast(I32) - 150, 24)
+    for character : I8 in "discard this draft" { key(display, character.cast(U8).cast(UPtr)) }
+    assert(!composer_is_empty(display, window, height, empty))
+    click(display, window, 90, 24)
+    click(display, window, 90, 150)
+    assert(composer_is_empty(display, window, height, empty))
+    click(display, window, width.cast(I32) - 60, 24)
+    for character : I8 in pubkey { key(display, character.cast(U8).cast(UPtr)) }
+    click(display, window, width.cast(I32) - 50, 105)
+    second_path := format(home, "/.config/nostril/accounts/", second, "/follows.json")
+    second_follows := File.readfile(second_path)
+    assert(nostril_follows_valid(second_follows, second) && second_follows.contains(pubkey))
+    assert(File.readfile(first_path) == first_follows)
+    click(display, window, 90, 24)
+    click(display, window, 90, 116)
+    click(display, window, width.cast(I32) - 60, 24)
+    click(display, window, width.cast(I32) - 50, 168)
+    removed := File.readfile(first_path)
+    assert(nostril_follows_valid(removed, pubkey) && !removed.contains(second))
+    assert(File.readfile(second_path) == second_follows)
     XDestroyImage(empty)
     key(display, 0xff1b)
     XCloseDisplay(display)
     status := app.wait()
     if status != 0 { panic("GUI exit failed: ", app.out(), app.err()) }
     File.remove_tree(home)
-    println("GUI Send and Enter passed with heap-owned composer text")
+    println("GUI Send/Enter, account switching, draft reset and per-account Follow/Unfollow passed")
 }

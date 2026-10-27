@@ -1,0 +1,37 @@
+# priority: medium
+# category: features
+** FIXED #5 Switch accounts and manage per-account follows in the GUI
+
+Resolution: added an account picker and scrollable Following panel with hex-key
+entry/paste, Follow/Enter and per-row Unfollow. All edits use the existing shared
+native owner and per-account signed files. The GUI session controller refreshes
+both transports' filters, prunes the timeline and rejects pre-edit queued notes.
+Account selection is transactional on validation failure; successful switches
+close the old session and reset draft/feed/retries. Initial selection remains in
+user init; no configuration rewriting or relay follow-list sync was introduced.
+
+Verification:
+- =./make.til=: library and all clients built with the installed Til recorded in
+  [[file:../../doc/til-dependency.org][the generated dependency record]]. Existing OpenSSL staging was supplied
+  through CMAKE_PREFIX_PATH and CPATH.
+- =./make.til test=: 20/20 interpreted and 20/20 compiled tests. Extended the
+  account model with local-relay switches, failed-switch rollback, pending-queue
+  reset, filter replacement, timeline pruning and account isolation. Extended
+  the independent WebSocket fixture coverage with switching, unfollow queue
+  rejection and publication under the new identity.
+- =xvfb-run -a til run --usize=64 -o tmp/gui-accounts-check -c tmp/gui-accounts-check.c test/gui_send.til=:
+  real Send/Enter, switching, draft reset, Follow/Unfollow and signed per-owner
+  file checks passed. The same check passed with an ASan GUI host; GUI leak
+  detection was disabled for the previously documented Mesa/GLX baseline leak.
+- ASan account-model host passed with empty PATH and leak detection enabled.
+- =git diff --check= and issue summary generation passed.
+
+Add a compact account picker and follow/unfollow panel using the existing
+per-account signed NIP-02 storage. Switching validates the destination before
+adoption; errors keep the current account/session. A successful switch starts a
+fresh feed session, clears its timeline/draft and stops old publication retries.
+Already transmitted events cannot be recalled. Follow edits refresh the live
+subscription and remove no-longer-matching notes without restarting the GUI.
+
+Keep the shared native library as the account owner. Document the new host APIs,
+session-only account selection, and local-only follow-list persistence.

@@ -2,6 +2,7 @@ mode cli
 import("std/sys")
 import("std/file")
 import("../src/nostril_init")
+import("../src/account_feed")
 import("../gen/nostril_api")
 crypto := import("std/crypto")
 
@@ -18,6 +19,18 @@ write_init := proc(root: Str, first: Str, second: Str, selected: Str) {
         "nostril_config_account(\"second\", \"", second, "\")\n",
         "select_account()\n",
         "File.writefile(\"", root, "/guest-pid\", process_id().to_str())\n}\n"))
+}
+
+wait_feed := proc(mut session: AccountFeed, events: nng_socket, requests: nng_socket, mut relay: LiveRelay) {
+    deadline := nng_clock() + 5000
+    while nng_clock() < deadline {
+        nostril_live_relay_step(events, requests, relay)
+        session.poll()
+        if session.feed.ready && relay.subscriptions.len() == 1 &&
+                relay.subscriptions[0].request == session.feed.request { return }
+        sleep_ms(5)
+    }
+    panic("account feed did not establish its updated subscription")
 }
 
 main := proc(home: Str) {
@@ -121,6 +134,62 @@ main := proc(home: Str) {
     shortened := File.readfile(follows_path)
     assert(shortened.contains(third) && !shortened.contains(second) && shortened.contains("[\"alt\",\"local list\"]"))
     File.writefile(follows_path, valid_follows)
+    assert(nostril_account_count() == 2)
+    assert(nostril_account_name_at(0) == "first" && nostril_account_name_at(1) == "second")
+    assert(nostril_account_name_at(-1) == "" && nostril_account_name_at(2) == "")
+
+    // Exercise the same session transitions used by the GUI against a relay.
+    mut events := nng_socket()
+    mut requests := nng_socket()
+    endpoint := "inproc://account-switch-test"
+    nostril_live_open(events, endpoint, true)
+    nostril_publish_open(requests, endpoint, true)
+    mut relay := LiveRelay()
+    mut session := AccountFeed()
+    assert(nostril_account_switch(root, "first") == "")
+    session.open(endpoint)
+    wait_feed(session, events, requests, relay)
+    session.send("old account pending note")
+    assert(session.outbox.len() == 1 && session.messages.len() == 1)
+    assert(session.switch_account(root, "unknown").len() > 0)
+    assert(nostril_account_public_key() == first && session.outbox.len() == 1)
+    assert(session.switch_account(root, "second") == "")
+    assert(session.messages.len() == 0 && session.outbox.len() == 0)
+    assert(nostril_account_public_key() == second && nostril_account_follows() == format(first, "\n"))
+    wait_feed(session, events, requests, relay)
+    assert(relay.accepted.len() == 0)
+    second_subscription := session.feed.request.clone()
+    File.writefile(key_path, "broken destination key")
+    assert(session.switch_account(root, "first").contains("invalid secret key"))
+    assert(nostril_account_public_key() == second && session.feed.request == second_subscription)
+    assert(nostril_account_sign("still second", 1700000403).contains(second))
+    File.writefile(key_path, original)
+    assert(session.switch_account(root, "first") == "")
+    assert(nostril_account_follows() == "")
+    wait_feed(session, events, requests, relay)
+    assert(session.follow(second, false) == "")
+    wait_feed(session, events, requests, relay)
+    envelope := nostril_live_envelope(second_note)
+    assert(nostril_feed_write(events, relay.subscriptions[0].peer, envelope))
+    deadline := nng_clock() + 5000
+    while session.messages.len() == 0 && nng_clock() < deadline { session.poll(); sleep_ms(5) }
+    assert(session.messages.len() == 1)
+    assert(session.follow("not a pubkey", false).len() > 0 && session.messages.len() == 1)
+    assert(session.follow(second, true) == "")
+    assert(session.messages.len() == 0)
+    wait_feed(session, events, requests, relay)
+    assert(!nostril_subscription_matches_relay(session.feed.request, envelope))
+    assert(nostril_feed_write(events, relay.subscriptions[0].peer, envelope))
+    // A relay delivering an unfollowed author still cannot inject it locally.
+    sleep_ms(30); session.poll()
+    assert(session.messages.len() == 0)
+    assert(session.switch_account(root, "second") == "")
+    assert(nostril_account_follows() == format(first, "\n"))
+    assert(session.follow(first, true) == "")
+    assert(session.switch_account(root, "first") == "")
+    assert(nostril_account_follows() == "")
+    session.close()
+    nostril_nng_close(requests); nostril_nng_close(events)
     File.writefile(format(home, "/account-public-key"), first)
     File.writefile(format(home, "/follow-public-key"), second)
     nostril_config_reset()

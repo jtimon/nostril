@@ -45,6 +45,25 @@ nostril_account_public_key := proc() returns Str { noop_proc(); return active_pu
 nostril_account_name := proc() returns Str { noop_proc(); return active_name.clone() }
 nostril_account_persistent := proc() returns Bool { noop_proc(); return active_directory.len() > 0 }
 nostril_account_follows := proc() returns Str { noop_proc(); return active_follows.clone() }
+nostril_account_count := proc() returns I64 { noop_proc(); return accounts.len().to_i64() }
+nostril_account_name_at := proc(index: I64) returns Str {
+    noop_proc()
+    if index < 0 || index >= accounts.len().to_i64() { return "" }
+    return accounts[index.to_usize()].name.clone()
+}
+
+// Host operation: keep both selection and active identity on a failed switch.
+// Configuration registration stays intact; init need not be evaluated again.
+nostril_account_switch := proc(root: Str, name: Str) returns Str {
+    mut found := false
+    for account : AccountSpec in accounts { if account.name == name { found = true } }
+    if !found { return "select a registered account" }
+    previous := selected.clone()
+    selected = name.clone()
+    error := nostril_config_apply(root)
+    if error.len() > 0 { selected = previous.clone() }
+    return error
+}
 
 priv storage_error := func(operation: Str, error: I32) returns Str {
     return format(operation, " failed (storage error ", error.to_str(), ")")

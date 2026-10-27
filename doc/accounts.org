@@ -26,7 +26,10 @@ init := proc() {
 #+end_src
 
 Register additional local accounts with distinct names and public keys. Select
-one in init; account switching currently takes effect on the next launch.
+the initial account in init. Click the =Account:= button in the GUI and choose
+another registered account to switch immediately. The selection lasts for that
+process; the next launch uses init again. Creating/registering accounts still
+uses =--create-account= and init.
 Names here are local aliases, not published Nostr profile metadata.
 The CLI =--relay [endpoint]= overrides the configured relay for that launch.
 An empty configured relay keeps the GUI local-only. =--version= bypasses init.
@@ -43,9 +46,25 @@ session-only ephemeral identity; it never silently selects a key from disk.
 Missing, corrupt, mismatched or permissive key files for a selected account
 stop startup instead of generating a replacement identity.
 
+Switching first validates the destination key and its own follow list. A failed
+switch shows an error and retains the current identity, draft, feed and transport.
+A successful switch closes the previous transport session, clears the timeline
+and draft, stops pending publication retries, and subscribes using the new
+account's follows. Already transmitted notes may still have reached a relay;
+switching cannot recall them. The configured/CLI relay endpoint stays the same.
+
 ** Follow and unfollow
 
-With a persistent account selected in init:
+In the GUI, open =Following= for the active account. Type or paste (Ctrl+V) a
+64-character lowercase hex public key and click =Follow= or press Enter. Each
+listed key has an =Unfollow= button. Scroll long account/follow lists with the
+mouse wheel; =Back= returns to the feed. Ephemeral identities cannot save follows.
+
+Each account owns its own =follows.json=. GUI edits persist immediately, refresh
+the live subscription, and remove notes that no longer match. Other accounts'
+lists are not edited. The composer is inactive while either panel is open.
+
+The headless commands remain available, using the account selected in init:
 
 #+begin_src sh
 ./bin/nostril-gui --follow <64-character-public-key>
@@ -55,9 +74,10 @@ With a persistent account selected in init:
 
 These headless commands load the same init and account owner as the GUI, save
 the change, print the selected account identity, and exit. They do not connect
-to a relay. Restart an already-running GUI to pick up changes made by another
-process. Follow targets need only public keys, not local account registrations
-or private keys. npub/NIP-05 input and an interactive follow editor are later work.
+to a relay. Changes from another process are reread on switching to the account
+or on a follow edit; there is no filesystem watcher. Follow targets need only
+public keys, not local account registrations or private keys. npub/NIP-05 input
+remains later work.
 
 The following feed requests kind-1 events from the selected account plus its
 followed authors. With no follows, this is an own-posts feed. It never falls
@@ -117,6 +137,14 @@ and the active account. The compiled GUI and guest init both use the generated
 =gen/nostril_startup_api.til= binding to the same shared library instance. A
 static host copy plus a separately loaded guest copy would split that state.
 
+The generated bridge also exposes host operations =nostril_account_count()=,
+=nostril_account_name_at(index)= (owned name, empty for an invalid index), and
+=nostril_account_switch(root, name)= (empty on success, owned diagnostic on
+failure). The native owner retains registrations and validates before replacing
+active state; GUI code receives no secret keys. These are prototype APIs, not a
+new NIP or a stable external ABI. =src/account_feed.til= owns the active GUI
+transport handles, timeline and retry queue, with explicit open/close lifetime.
+
 =src/nostril_init.til= uses the matching installed SDK recorded by the build,
 loads =mode lib= init in-process with a host prelude importing the generated API,
 looks up =init()= and calls it. User helper imports resolve relative to the init
@@ -148,3 +176,10 @@ and preservation of tag metadata. Process tests exercise headless follow edits,
 concurrent writers, version bypass, filesystem modes, XDG/default selection and
 absence of missing-file or legacy fallback. Network tests inject
 valid but unfollowed notes and check both backends drop them locally.
+The account model additionally exercises the GUI's session controller against
+a local relay: successful/failed switches, old pending-queue cleanup, follow
+subscription replacement, timeline pruning and per-account isolation. The X11
+=test/gui_send.til= check uses real account-picker, Follow and Unfollow controls,
+checks signed files for both owners, and verifies draft reset and Send/Enter.
+The WebSocket fixture exercises the same controller's account switches, signed
+publication under the new identity, and rejection of queued events after unfollow.

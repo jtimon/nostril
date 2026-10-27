@@ -93,6 +93,9 @@ and shared startup-library patterns. Accounts live in =accounts/= beside init.
 =--create-account= saves a plaintext owner-only
 key and prints its public key; the init file names/selects accounts and relays.
 =--follow= and =--unfollow= persist the selected account's signed follow list.
+The GUI's =Account:= picker switches between registered accounts; =Following=
+adds/removes follows for the active account and updates its feed immediately.
+Switching starts a fresh feed session and clears the draft and pending retries.
 See [[file:doc/accounts.org][setup, ownership and storage details]]. Encrypted key storage is tracked in
 [[file:issues/open/2.org][issue #2]]. The [[file:issues/process.org][issue workflow]] is adapted from Tiled.
 

@@ -79,6 +79,12 @@ startup_library := proc(opt: Str) {
             name, " := proc(root: Str) returns Str { return til_nostril_x5fstartup__", name, "(root) }\n")
     }
     binding = format(binding,
+        "til_nostril_x5fstartup__nostril_account_count := ext_proc() returns shallow I64 {}\n",
+        "nostril_account_count := proc() returns I64 { return til_nostril_x5fstartup__nostril_account_count() }\n",
+        "til_nostril_x5fstartup__nostril_account_name_at := ext_proc(shallow index: I64) returns shallow Str {}\n",
+        "nostril_account_name_at := proc(index: I64) returns Str { return til_nostril_x5fstartup__nostril_account_name_at(index) }\n",
+        "til_nostril_x5fstartup__nostril_account_switch := ext_proc(root: Str, name: Str) returns shallow Str {}\n",
+        "nostril_account_switch := proc(root: Str, name: Str) returns Str { return til_nostril_x5fstartup__nostril_account_switch(root, name) }\n",
         "til_nostril_x5fstartup__nostril_account_persistent := ext_proc() returns shallow Bool {}\n",
         "nostril_account_persistent := proc() returns Bool { return til_nostril_x5fstartup__nostril_account_persistent() }\n",
         "til_nostril_x5fstartup__nostril_account_sign := ext_proc(content: Str, shallow timestamp: I64) returns shallow Str {}\n",
