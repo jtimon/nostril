@@ -50,6 +50,17 @@ gui_fitting_tail := proc(text: Str, width: I32, font_size: I32) returns Str {
     return visible
 }
 
+gui_fitting_head := proc(text: Str, width: I32, font_size: I32) returns Str {
+    if MeasureText(text.c_str, font_size) <= width { return text.clone() }
+    mut visible := text.clone()
+    while visible.len() > 0 {
+        visible = gui_without_last_scalar(visible)
+        candidate := format(visible, "...")
+        if MeasureText(candidate.c_str, font_size) <= width { return candidate }
+    }
+    return ""
+}
+
 gui_wrapped_lines := proc(text: Str, width: I32, font_size: I32) returns I32 {
     mut count : I32 = 1
     mut line := ""
@@ -142,6 +153,8 @@ main := proc(args: ..Str) {
     mut scroll : I32 = 0
     mut timeline_scroll : USize = 0
     mut follow_input := ""
+    mut editing_key := ""
+    mut petname_input := ""
     mut notice := ""
 
     SetConfigFlags(FLAG_WINDOW_RESIZABLE.cast(U32))
@@ -175,7 +188,10 @@ main := proc(args: ..Str) {
             if panel == 2 { panel = 0 } else { panel = 2 }
             scroll = 0; notice = ""
         }
-        if panel > 0 && clicked && gui_hit(width - 180, 8, 60, 30) { panel = 0 }
+        if panel > 0 && clicked && gui_hit(width - 180, 8, 60, 30) {
+            if panel == 3 { panel = 2 } else { panel = 0 }
+            notice = ""
+        }
         if panel > 0 {
             wheel := GetMouseWheelMove()
             if wheel > 0 { scroll = scroll - 3 }
@@ -195,13 +211,19 @@ main := proc(args: ..Str) {
             if panel == 0 && composer_scalars > 0 {
                 composer = gui_without_last_scalar(composer); composer_scalars--
             } else if panel == 2 { follow_input = gui_without_last_scalar(follow_input) }
+            else if panel == 3 { petname_input = gui_without_last_scalar(petname_input) }
         }
-        if panel == 2 && (IsKeyDown(341) || IsKeyDown(345)) && IsKeyPressed(86) {
+        if (panel == 2 || panel == 3) && (IsKeyDown(341) || IsKeyDown(345)) && IsKeyPressed(86) {
             ref clipboard : I8 = GetClipboardText()
             pasted := Str.from_c_str(clipboard)
-            candidate := pasted.trim().clone()
-            if candidate.len() <= 64 { follow_input = candidate.clone() }
-            else { notice = "Use a 64-character hex public key." }
+            if panel == 2 {
+                candidate := pasted.trim().clone()
+                if candidate.len() <= 64 { follow_input = candidate.clone() }
+                else { notice = "Use a 64-character hex public key." }
+            } else {
+                if pasted.len() <= 64 { petname_input = pasted.clone() }
+                else { notice = "Petnames have at most 64 characters." }
+            }
         }
         mut code := GetCharPressed()
         while code > 0 {
@@ -210,7 +232,9 @@ main := proc(args: ..Str) {
                     composer = format(composer, gui_utf8(code.cast(I64))); composer_scalars++
                 } else if panel == 2 && follow_input.len() < 64 && code < 128 {
                     follow_input = format(follow_input, gui_utf8(code.cast(I64)))
-                }
+                } else if panel == 3 && petname_input.len() < 64 && code < 128 {
+                    petname_input = format(petname_input, gui_utf8(code.cast(I64)))
+                } else if panel == 3 && code >= 128 { notice = "Use ASCII letters, digits or underscore." }
             }
             code = GetCharPressed()
         }
@@ -231,6 +255,7 @@ main := proc(args: ..Str) {
                         if error.len() > 0 { notice = error.clone() }
                         else {
                             composer = ""; composer_scalars = 0; follow_input = ""
+                            editing_key = ""; petname_input = ""
                             notice = ""; panel = 0; scroll = 0; timeline_scroll = 0
                         }
                     }
@@ -247,20 +272,40 @@ main := proc(args: ..Str) {
             follows := nostril_account_follows()
             mut count : I32 = 0
             for pubkey : Str in follows.split("\n") { if pubkey.len() > 0 { count++ } }
-            mut maximum := count - (height - 200) / 34
+            mut maximum := count - (height - 200) / 46
             if maximum < 0 { maximum = 0 }
             if scroll > maximum { scroll = maximum }
             mut row : I32 = 0
             for pubkey : Str in follows.split("\n") {
                 if pubkey.len() == 0 { continue }
-                row_y : I32 = 156 + (row - scroll) * 34
+                row_y : I32 = 156 + (row - scroll) * 46
                 row++
-                if row_y < 156 || row_y + 30 > height - 44 { continue }
+                if row_y < 156 || row_y + 42 > height - 44 { continue }
+                if clicked && gui_hit(width - 216, row_y, 48, 28) {
+                    SetClipboardText(pubkey.c_str); notice = "Public key copied."
+                }
+                if clicked && gui_hit(width - 156, row_y, 60, 28) {
+                    editing_key = pubkey.clone()
+                    petname_input = nostril_account_petname(pubkey)
+                    notice = ""; panel = 3
+                }
                 if clicked && gui_hit(width - 88, row_y, 76, 28) {
                     error := session.follow(pubkey, true)
                     if error.len() > 0 { notice = error.clone() }
                     else { timeline_scroll = 0; notice = "Unfollow saved locally; feed updated." }
                 }
+            }
+        }
+        if panel == 3 {
+            if clicked && gui_hit(width - 88, 88, 76, 28) {
+                SetClipboardText(editing_key.c_str); notice = "Public key copied."
+            }
+            clear := clicked && gui_hit(margin, 212, 96, 30)
+            if clear { petname_input = "" }
+            if clear || IsKeyPressed(257) || (clicked && gui_hit(width - 88, 156, 76, 36)) {
+                error := nostril_account_set_petname(editing_key, petname_input)
+                if error.len() > 0 { notice = error.clone() }
+                else { panel = 2; notice = "Petname saved locally." }
             }
         }
         button_hover := gui_hit(button_x, field_y, button_w, field_h)
@@ -303,10 +348,16 @@ main := proc(args: ..Str) {
                     message_x := content_x + 48
                     message_w := content_w - 48
                     line_count := gui_wrapped_lines(message, message_w, 16)
-                    row_h : I32 = 34 + line_count * 21
+                    row_h : I32 = 54 + line_count * 21
                     row_y : I32 = bottom - row_h
-                    DrawText("Note".c_str, content_x, row_y + 9, 13, muted)
-                    gui_draw_wrapped(message, message_x, row_y + 7, message_w, 16, 21, text)
+                    author := nostril_relay_event_pubkey(event)
+                    author_label := gui_fitting_head(nostril_account_author_label(author), content_w - 180, 13)
+                    key_hint := format(author.substr(0, 8), "...", author.substr(56, 8))
+                    DrawText(author_label.c_str, content_x, row_y + 7, 13, text)
+                    DrawText(key_hint.c_str, width - margin - MeasureText(key_hint.c_str, 12), row_y + 7, 12, muted)
+                    if row_y + 3 >= timeline_top && row_y + 23 <= timeline_bottom &&
+                            clicked && gui_hit(content_x, row_y + 3, content_w, 20) { SetClipboardText(author.c_str) }
+                    gui_draw_wrapped(message, message_x, row_y + 27, message_w, 16, 21, text)
                     publication_status := gui_status_text(session.publication_status(event))
                     visible_status := gui_fitting_tail(publication_status, message_w, 11)
                     DrawText(visible_status.c_str, message_x, bottom - 15, 11, muted)
@@ -364,7 +415,7 @@ main := proc(args: ..Str) {
                     label := gui_fitting_tail(name, content_w - 16, 14)
                     DrawText(label.c_str, margin + 8, row_y + 8, 14, text)
                 }
-            } else {
+            } else if panel == 2 {
                 DrawRectangle(margin, 88, width - 112, 36, field)
                 mut input_label := "Hex public key (Ctrl+V to paste)"
                 if follow_input.len() > 0 { input_label = gui_fitting_tail(follow_input, width - 132, 14) }
@@ -381,16 +432,36 @@ main := proc(args: ..Str) {
                 mut row : I32 = 0
                 for pubkey : Str in follows.split("\n") {
                     if pubkey.len() == 0 { continue }
-                    row_y : I32 = 156 + (row - scroll) * 34
+                    row_y : I32 = 156 + (row - scroll) * 46
                     row++
-                    if row_y < 156 || row_y + 30 > height - 44 { continue }
-                    label := gui_fitting_tail(pubkey, width - 124, 13)
-                    DrawText(label.c_str, margin, row_y + 8, 13, text)
+                    if row_y < 156 || row_y + 42 > height - 44 { continue }
+                    label := gui_fitting_head(nostril_account_author_label(pubkey), width - 240, 14)
+                    key_hint := format(pubkey.substr(0, 8), "...", pubkey.substr(56, 8))
+                    DrawText(label.c_str, margin, row_y + 3, 14, text)
+                    DrawText(key_hint.c_str, margin, row_y + 23, 11, muted)
+                    DrawRectangle(width - 216, row_y, 48, 28, field)
+                    DrawText("Key".c_str, width - 208, row_y + 7, 13, text)
+                    DrawRectangle(width - 156, row_y, 60, 28, field)
+                    DrawText("Name".c_str, width - 148, row_y + 7, 13, text)
                     DrawRectangle(width - 88, row_y, 76, 28, field)
                     DrawText("Unfollow".c_str, width - 82, row_y + 7, 13, text)
                 }
+            } else {
+                DrawText("Petname for this public key".c_str, margin, 92, 14, text)
+                DrawRectangle(width - 88, 88, 76, 28, field)
+                DrawText("Copy key".c_str, width - 82, 95, 13, text)
+                DrawText(editing_key.c_str, margin, 128, 12, muted)
+                DrawRectangle(margin, 156, width - 112, 36, field)
+                DrawRectangleLines(margin, 156, width - 112, 36, action)
+                input_label := gui_fitting_tail(petname_input, width - 132, 14)
+                DrawText(input_label.c_str, margin + 8, 167, 14, text)
+                DrawRectangle(width - 88, 156, 76, 36, action)
+                DrawText("Save".c_str, width - 76, 167, 14, text)
+                DrawRectangle(margin, 212, 96, 30, field)
+                DrawText("Clear name".c_str, margin + 8, 220, 13, text)
+                DrawText("Letters, digits, underscore; names are per account.".c_str, margin, 254, 12, muted)
             }
-            visible_notice := gui_fitting_tail(notice, content_w, 12)
+            visible_notice := gui_fitting_head(notice, content_w, 12)
             DrawText(visible_notice.c_str, margin, height - 28, 12, muted)
             EndScissorMode()
         }

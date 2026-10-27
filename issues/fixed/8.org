@@ -1,0 +1,43 @@
+# priority: medium
+# category: features
+** FIXED #8 Add per-account petnames and petname-first identity labels
+
+Resolution: Following rows have Name/Key controls. The petname editor supports
+Save/Enter, Clear name, paste and Back without saving. Assigned names are the
+primary following/feed author labels; shortened keys remain visible and full
+keys can be copied. Existing notes immediately reflect edits. Names live in the
+active account's signed NIP-02 p tags, never in remote profile-name state.
+
+The shared native owner locks/reloads the latest list for uniqueness checks and
+atomic signing/storage, then updates its own key-to-name cache. Names are
+case-sensitive ASCII letters/digits/underscore, up to 64 bytes; empty clears an
+existing follow's name. Duplicate names for different keys, conflicting names
+for one key and invalid imported names fall back to key-based labels rather than
+being arbitrarily resolved. Rename repairs all tags for a key while retaining
+relay hints, extra fields, unrelated tags and content. Publishing the list later
+would publish its petnames too; no private alias store or path resolver was added.
+Ownership and the new prototype APIs are documented in [[file:../../doc/accounts.org][accounts]].
+
+Verification using the installed compiler recorded in [[file:../../doc/til-dependency.org][the dependency record]]:
+- =./make.til=: library, CLI, relay and GUI built successfully with existing
+  OpenSSL staging supplied through CMAKE_PREFIX_PATH and CPATH.
+- =./make.til test=: 21/21 interpreted and 21/21 compiled tests passed. Expanded
+  account-model checks cover persistence/reload, case-sensitive collision
+  rejection, stale-cache/disk collision checks, failed writes, invalid names,
+  per-account isolation, clearing, ambiguity repair, metadata preservation,
+  removal/reset cleanup and verified author extraction.
+- ASan account-model host passed with empty PATH and leak detection enabled.
+- =xvfb-run -a til run --usize=64 -o tmp/petnames-gui-check -c tmp/petnames-gui-check.c test/gui_send.til=:
+  real GUI Name/Save/Enter/Clear controls, switching/isolation, signed follow files
+  and pixel-verified immediate author-label changes passed, along with existing
+  Send/Enter, feed scrolling and Follow/Unfollow checks.
+- The same GUI check passed with an ASan host; GUI leak detection was disabled
+  for the documented Mesa/GLX baseline leak. Native libraries used normal builds.
+- =git diff --check= and issue summary generation passed.
+
+Edit NIP-02 p-tag petnames in the Following panel and display locally assigned
+names as primary feed/follow labels, with public keys available. Names belong
+to the active account, not remote profile metadata. Use 1..64 ASCII letters,
+digits or underscore, case-sensitive uniqueness per account; empty clears a name.
+Preserve relay hints, extra tag fields and unrelated tags during signed updates.
+Keep locking/reload/atomic-write ownership in the shared account library.

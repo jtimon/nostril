@@ -79,6 +79,42 @@ or on a follow edit; there is no filesystem watcher. Follow targets need only
 public keys, not local account registrations or private keys. npub/NIP-05 input
 remains later work.
 
+*** Petnames: names assigned by you
+
+In =Following=, click =Name= beside a followed key. Enter a petname and click
+=Save= or press Enter. =Clear name= removes the name while keeping the follow;
+=Back= leaves the editor without saving. Paste is supported with Ctrl+V.
+
+Names use 1..64 ASCII letters, digits or underscore, following NIP-02's spelling
+for petname resolution. They are case-sensitive and unique to a public key
+within the active account: =alice= and =Alice= are different names. Another
+account can assign its own name to the same key, or reuse =alice= for a different
+person. There is no global naming authority, profile-name substitution or nested
+petname-path resolution in this slice.
+
+A locally assigned petname is the primary identity label in the feed and follow
+list. Without one, the GUI shows a shortened key (=You= for the active key).
+Shortened public keys remain visible alongside names. The follow-list =Key=
+button, the petname editor's =Copy key= button, and clicking an author line in
+the feed copy the full public key. Remote profile metadata cannot rename anyone.
+Changing a petname updates existing note labels immediately without resubscribing.
+
+Petnames are the fourth field of the account's signed NIP-02 =p= tags:
+
+#+begin_example
+["p", "<public-key>", "<relay-hint-or-empty>", "alice"]
+#+end_example
+
+They are currently saved locally. Publishing this follow list in a future sync
+feature would publish the petnames too; these are not separately stored private
+aliases. Rename/clear updates all tags for that followed key and preserves relay
+hints, trailing tag fields, unrelated tags and event content. Unfollowing removes
+the key's petname as well. An imported invalid name, a name shared by different
+keys, or conflicting names for one key falls back to key-based display until
+explicitly repaired; Nostril never picks an arbitrary owner of an ambiguous name.
+
+** Following feed
+
 The following feed requests kind-1 events from the selected account plus its
 followed authors. With no follows, this is an own-posts feed. It never falls
 back to an unfiltered request. The local and WebSocket consumers also apply the
@@ -156,6 +192,17 @@ active state; GUI code receives no secret keys. These are prototype APIs, not a
 new NIP or a stable external ABI. =src/account_feed.til= owns the active GUI
 transport handles, timeline and retry queue, with explicit open/close lifetime.
 
+Petname edits use =nostril_account_set_petname(pubkey, name)=, returning an owned
+diagnostic or empty on success. It locks and rereads the latest signed list,
+checks uniqueness there, signs and atomically writes, then updates the native
+owner's key-to-name cache. Failures retain the previous active cache. Getters
+=nostril_account_petname= and =nostril_account_author_label= return owned strings
+for the active account. The protocol layer owns validation/tag editing and can
+return an owned =nostril_follows_petnames= map or a single validated petname;
+=nostril_relay_event_pubkey= exposes only a verified author's key. The curated
+host bindings use string results, not shared mutable maps. These remain prototype
+APIs with the same shared-library ownership boundary.
+
 =src/nostril_init.til= uses the matching installed SDK recorded by the build,
 loads =mode lib= init in-process with a host prelude importing the generated API,
 looks up =init()= and calls it. User helper imports resolve relative to the init
@@ -194,3 +241,7 @@ subscription replacement, timeline pruning and per-account isolation. The X11
 checks signed files for both owners, and verifies draft reset and Send/Enter.
 The WebSocket fixture exercises the same controller's account switches, signed
 publication under the new identity, and rejection of queued events after unfollow.
+Petname coverage includes signed persistence, case-sensitive collisions, locked
+file reload, failed writes, alias clearing, per-account isolation, ambiguous
+import fallback and preservation of relay hints/extra fields. GUI checks exercise
+Name/Save/Clear and verify immediate author-label changes using captured pixels.

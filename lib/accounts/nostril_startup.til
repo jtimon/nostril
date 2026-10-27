@@ -18,12 +18,14 @@ priv mut active_secret := ""
 priv mut active_pubkey := ""
 priv mut active_name := ""
 priv mut active_follows := ""
+priv mut active_petnames := Map(Str, Str).new()
 priv mut active_directory := ""
 
 nostril_config_reset := proc() {
     noop_proc()
     accounts.clear(); selected = ""; relay = ""; config_error = ""
     active_secret = ""; active_pubkey = ""; active_name = ""; active_follows = ""; active_directory = ""
+    active_petnames.clear()
 }
 
 nostril_config_account := proc(name: Str, pubkey: Str) {
@@ -45,6 +47,19 @@ nostril_account_public_key := proc() returns Str { noop_proc(); return active_pu
 nostril_account_name := proc() returns Str { noop_proc(); return active_name.clone() }
 nostril_account_persistent := proc() returns Bool { noop_proc(); return active_directory.len() > 0 }
 nostril_account_follows := proc() returns Str { noop_proc(); return active_follows.clone() }
+nostril_account_petname := proc(pubkey: Str) returns Str {
+    noop_proc()
+    if active_petnames.has(pubkey) { return active_petnames[pubkey].clone() }
+    return ""
+}
+// A local label, never profile-supplied. The GUI displays the key alongside it.
+nostril_account_author_label := proc(pubkey: Str) returns Str {
+    name := nostril_account_petname(pubkey)
+    if name.len() > 0 { return name }
+    if pubkey == active_pubkey { return "You" }
+    if nostril_key_encoding(pubkey) { return format(pubkey.substr(0, 8), "...", pubkey.substr(56, 8)) }
+    return "Unknown"
+}
 nostril_account_count := proc() returns I64 { noop_proc(); return accounts.len().to_i64() }
 nostril_account_name_at := proc(index: I64) returns Str {
     noop_proc()
@@ -122,6 +137,7 @@ nostril_config_apply := proc(root: Str) returns Str {
         active_pubkey = nostril_pubkey(active_secret)
         active_name = "ephemeral"
         active_follows = ""
+        active_petnames.clear()
         active_directory = ""
         return ""
     }
@@ -148,6 +164,7 @@ nostril_config_apply := proc(root: Str) returns Str {
     active_name = selected.clone(); active_directory = directory.clone()
     active_follows = ""
     if event.len() > 0 { active_follows = nostril_follows_keys(event, pubkey) }
+    active_petnames = nostril_follows_petnames(event, pubkey)
     return ""
 }
 
@@ -156,22 +173,37 @@ nostril_account_sign := proc(content: Str, timestamp: I64) returns Str {
     return nostril_sign_text_note(active_secret, content, timestamp)
 }
 
-nostril_account_follow := proc(pubkey: Str, remove: Bool) returns Str {
+priv edit_follow := proc(pubkey: Str, remove: Bool, rename: Bool, name: Str) returns Str {
     if active_directory.len() == 0 { return "select a persistent account before editing follows" }
     if !nostril_key_encoding(pubkey) { return "follow target must be a lowercase 64-digit public key" }
+    if rename && !nostril_petname_valid(name) { return "Petnames use up to 64 ASCII letters, digits or underscore; empty clears." }
     mut code : I32 = 0
     ref handle : Dynamic = nostril_store_lock(active_directory.c_str, code)
     if handle.is_null() { return storage_error("follow-list lock", code) }
     mut previous := ""
     error := read_follows(handle, active_pubkey, previous)
     if error.len() > 0 { nostril_store_unlock(handle); return error }
-    event := nostril_update_follows(active_secret, previous, pubkey, remove, nostril_now())
-    if event.len() == 0 { nostril_store_unlock(handle); return "cannot update follow list (limit 512 or invalid previous state)" }
+    mut event := ""
+    if rename { event = nostril_update_petname(active_secret, previous, pubkey, name, nostril_now()) }
+    else { event = nostril_update_follows(active_secret, previous, pubkey, remove, nostril_now()) }
+    if event.len() == 0 {
+        nostril_store_unlock(handle)
+        if rename { return "Cannot save petname: follow must exist and name must be unique in this account." }
+        return "cannot update follow list (limit 512 or invalid previous state)"
+    }
     code = nostril_store_write(handle, "follows.json".c_str, event, false)
     nostril_store_unlock(handle)
     if code != 0 { return storage_error("write follow list", code) }
     active_follows = nostril_follows_keys(event, active_pubkey)
+    active_petnames = nostril_follows_petnames(event, active_pubkey)
     return ""
+}
+
+nostril_account_follow := proc(pubkey: Str, remove: Bool) returns Str {
+    return edit_follow(pubkey, remove, false, "")
+}
+nostril_account_set_petname := proc(pubkey: Str, name: Str) returns Str {
+    return edit_follow(pubkey, false, true, name)
 }
 
 nostril_account_subscription := proc() returns Str {

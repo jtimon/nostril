@@ -537,6 +537,13 @@ nostril_relay_event_content := proc(message: Str) returns Str {
     return fields.content.clone()
 }
 
+/// Verified author identity for a relay EVENT, or empty for invalid input.
+nostril_relay_event_pubkey := proc(message: Str) returns Str {
+    mut fields := NostrEventFields()
+    if !nostril_parse_relay_event(message, fields) || !nostril_valid_fields(fields) { return "" }
+    return fields.pubkey.clone()
+}
+
 /// A verified event ID, or empty for invalid input.
 nostril_event_id := proc(event_json: Str) returns Str {
     mut fields := NostrEventFields()
@@ -821,7 +828,8 @@ nostril_secret_valid := func(key: Str) returns Bool {
 }
 
 // Read p-tag public keys while retaining complete original tags for updates.
-priv follow_tags := func(tags: Str, mut keys: Vec(Str), target: Str, remove: Bool) returns Str {
+priv follow_tags := func(tags: Str, mut keys: Vec(Str), target: Str, remove: Bool,
+        rename: Bool = false, petname: Str = "") returns Str {
     mut cursor := JsonCursor(text = tags.borrowed_view())
     if !json_take(cursor, '[') { return "" }
     mut out := Str.with_capacity(tags.len() + 80)
@@ -834,12 +842,18 @@ priv follow_tags := func(tags: Str, mut keys: Vec(Str), target: Str, remove: Boo
             if !json_take(cursor, '[') { return "" }
             mut name := ""
             mut value := ""
+            mut relay_hint := ""
+            mut trailing := ""
             if !json_parse_string(cursor, name) { return "" }
             if json_take(cursor, ',') {
                 if !json_parse_string(cursor, value) { return "" }
+                mut position : I64 = 2
                 while json_take(cursor, ',') {
                     mut extra := ""
                     if !json_parse_string(cursor, extra) { return "" }
+                    if position == 2 { relay_hint = extra.clone() }
+                    else if position >= 4 { trailing = format(trailing, ",", json_quote(extra)) }
+                    position++
                 }
             }
             if !json_take(cursor, ']') { return "" }
@@ -849,14 +863,17 @@ priv follow_tags := func(tags: Str, mut keys: Vec(Str), target: Str, remove: Boo
             }
             if !(remove && name == "p" && value == target) {
                 if !first { out.push_str(",") }
-                out.push_str(tags.substr(start, cursor.at - start))
+                if rename && name == "p" && value == target {
+                    out.push_str(format("[\"p\",", json_quote(value), ",", json_quote(relay_hint),
+                        ",", json_quote(petname), trailing, "]"))
+                } else { out.push_str(tags.substr(start, cursor.at - start)) }
                 first = false
             }
             if json_take(cursor, ']') { break }
             if !json_take(cursor, ',') { return "" }
         }
     }
-    if target.len() > 0 && !remove {
+    if target.len() > 0 && !remove && !rename {
         mut found := false
         for key : Str in keys { if key == target { found = true } }
         if !found {
@@ -889,7 +906,77 @@ nostril_follows_keys := proc(event: Str, owner: Str) returns Str {
     return out
 }
 
-nostril_update_follows := proc(secret: Str, previous: Str, target: Str, remove: Bool, timestamp: I64) returns Str {
+/// Empty clears a petname; nonempty names follow NIP-02's resolution spelling.
+nostril_petname_valid := func(name: Str) returns Bool {
+    if name.len() > 64 { return false }
+    for byte : I8 in name {
+        if !((byte >= 'a' && byte <= 'z') || (byte >= 'A' && byte <= 'Z') ||
+                (byte >= '0' && byte <= '9') || byte == '_') { return false }
+    }
+    return true
+}
+
+priv FollowName := struct { pubkey := ""; petname := "" }
+
+// Called only on validated follow tags; preserve all tags elsewhere for edits.
+priv follow_names := func(tags: Str) returns Vec(FollowName) {
+    mut entries := Vec(FollowName).new()
+    mut cursor := JsonCursor(text = tags.borrowed_view())
+    if !json_take(cursor, '[') { return entries }
+    while json_take(cursor, '[') {
+        mut values := Vec(Str).new()
+        mut value := ""
+        while json_parse_string(cursor, value) {
+            values.push(own value.clone())
+            if !json_take(cursor, ',') { break }
+        }
+        if !json_take(cursor, ']') { return entries }
+        if values.len() >= 2 && values[0] == "p" {
+            mut name := ""
+            if values.len() >= 4 { name = values[3].clone() }
+            entries.push(own FollowName(pubkey = values[1].clone(), petname = name.clone()))
+        }
+        if !json_take(cursor, ',') { break }
+    }
+    return entries
+}
+
+/// Owned key->petname snapshot. Invalid, duplicate-name or conflicting-key
+/// aliases are omitted, never arbitrarily resolved to one identity.
+nostril_follows_petnames := proc(event: Str, owner: Str) returns Map(Str, Str) {
+    mut result := Map(Str, Str).new()
+    if !nostril_follows_valid(event, owner) { return result }
+    mut fields := NostrEventFields()
+    nostril_parse_complete_event(event, fields)
+    entries := follow_names(fields.tags)
+    mut owners := Map(Str, Str).new()
+    mut names := Map(Str, Str).new()
+    for entry : FollowName in entries {
+        if names.has(entry.pubkey) {
+            if names[entry.pubkey] != entry.petname { names.set(entry.pubkey, own Str.with_capacity(0)) }
+        } else { names.set(entry.pubkey, own entry.petname.clone()) }
+        if entry.petname.len() == 0 || !nostril_petname_valid(entry.petname) { continue }
+        if owners.has(entry.petname) {
+            if owners[entry.petname] != entry.pubkey { owners.set(entry.petname, own Str.with_capacity(0)) }
+        } else { owners.set(entry.petname, own entry.pubkey.clone()) }
+    }
+    for entry : FollowName in entries {
+        if entry.petname.len() > 0 && names[entry.pubkey] == entry.petname &&
+                owners.has(entry.petname) && owners[entry.petname] == entry.pubkey {
+            result.set(entry.pubkey, own entry.petname.clone())
+        }
+    }
+    return result
+}
+
+nostril_follows_petname := proc(event: Str, owner: Str, target: Str) returns Str {
+    names := nostril_follows_petnames(event, owner)
+    if names.has(target) { return names[target].clone() }
+    return ""
+}
+
+priv update_follow_event := proc(secret: Str, previous: Str, target: Str, remove: Bool,
+        timestamp: I64, rename: Bool, petname: Str) returns Str {
     if !nostril_secret_valid(secret) || !nostril_key_encoding(target) { return "" }
     owner := nostril_pubkey(secret)
     mut fields := NostrEventFields(pubkey = owner.clone(), kind = 3, tags = "[]", created_at = timestamp)
@@ -901,7 +988,7 @@ nostril_update_follows := proc(secret: Str, previous: Str, target: Str, remove: 
         else { fields.created_at = timestamp }
     }
     mut keys := Vec(Str).new()
-    tags := follow_tags(fields.tags, keys, target, remove)
+    tags := follow_tags(fields.tags, keys, target, remove, rename, petname)
     if tags.len() == 0 || keys.len() > 512 { return "" }
     fields.tags = tags.clone()
     digest := crypto.sha256_str(nostril_serialized_event(fields))
@@ -909,4 +996,25 @@ nostril_update_follows := proc(secret: Str, previous: Str, target: Str, remove: 
     return format("{\"id\":", json_quote(digest.to_hex()), ",\"pubkey\":", json_quote(owner),
         ",\"created_at\":", fields.created_at.to_str(), ",\"kind\":3,\"tags\":", fields.tags,
         ",\"content\":", json_quote(fields.content), ",\"sig\":", json_quote(signature.to_hex()), "}")
+}
+
+nostril_update_follows := proc(secret: Str, previous: Str, target: Str, remove: Bool, timestamp: I64) returns Str {
+    return update_follow_event(secret, previous, target, remove, timestamp, false, "")
+}
+
+/// Rename only an existing follow, rejecting aliases belonging to another key.
+nostril_update_petname := proc(secret: Str, previous: Str, target: Str, name: Str, timestamp: I64) returns Str {
+    if !nostril_secret_valid(secret) || !nostril_petname_valid(name) { return "" }
+    owner := nostril_pubkey(secret)
+    if !nostril_follows_valid(previous, owner) { return "" }
+    mut fields := NostrEventFields()
+    nostril_parse_complete_event(previous, fields)
+    entries := follow_names(fields.tags)
+    mut found := false
+    for entry : FollowName in entries {
+        if entry.pubkey == target { found = true }
+        else if name.len() > 0 && entry.petname == name { return "" }
+    }
+    if !found { return "" }
+    return update_follow_event(secret, previous, target, false, timestamp, true, name)
 }

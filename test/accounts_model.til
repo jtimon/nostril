@@ -21,6 +21,13 @@ write_init := proc(root: Str, first: Str, second: Str, selected: Str) {
         "File.writefile(\"", root, "/guest-pid\", process_id().to_str())\n}\n"))
 }
 
+follow_fixture := proc(secret: Str, owner: Str, tags: Str, timestamp: I64) returns Str {
+    digest := crypto.sha256_str(format("[0,\"", owner, "\",", timestamp.to_str(), ",3,", tags, ",\"\"]"))
+    signature := crypto.schnorr_sign(U256.from_hex(secret), digest, U256())!
+    return format("{\"id\":\"", digest.to_hex(), "\",\"pubkey\":\"", owner,
+        "\",\"created_at\":", timestamp.to_str(), ",\"kind\":3,\"tags\":", tags, ",\"content\":\"\",\"sig\":\"", signature.to_hex(), "\"}")
+}
+
 wait_feed := proc(mut session: AccountFeed, events: nng_socket, requests: nng_socket, mut relay: LiveRelay) {
     deadline := nng_clock() + 5000
     while nng_clock() < deadline {
@@ -66,6 +73,8 @@ main := proc(home: Str) {
     assert(nostril_load_init(root) == "")
     assert(nostril_account_public_key() == second && nostril_account_follows() == "")
     second_note := nostril_account_sign("followed author", 1700000401)
+    assert(nostril_relay_event_pubkey(nostril_live_envelope(second_note)) == second)
+    assert(nostril_relay_event_pubkey(nostril_live_envelope(second_note).replace("followed author", "tampered")) == "")
     assert(!nostril_subscription_matches_relay(own_request, nostril_subscription_envelope("local", second_note)))
     assert(nostril_subscription_matches_relay(first_request, nostril_subscription_envelope("local", second_note)))
     assert(nostril_account_follow(first, false) == "")
@@ -119,7 +128,7 @@ main := proc(home: Str) {
     assert(File.readfile(follows_path) == valid_follows)
     // A follow edit preserves existing hints/petnames and unrelated tags.
     secret := original.trim().clone()
-    tags := format("[[\"alt\",\"local list\"],[\"p\",\"", second, "\",\"wss://hint\",\"friend\"]]")
+    tags := format("[[\"alt\",\"local list\"],[\"p\",\"", second, "\",\"wss://hint\",\"friend\",\"extra\"]]")
     digest := crypto.sha256_str(format("[0,\"", first, "\",1700000402,3,", tags, ",\"\"]"))
     signature := crypto.schnorr_sign(U256.from_hex(secret), digest, U256())!
     fixture := format("{\"id\":\"", digest.to_hex(), "\",\"pubkey\":\"", first,
@@ -130,7 +139,70 @@ main := proc(home: Str) {
     extended := File.readfile(follows_path)
     assert(nostril_follows_valid(extended, first))
     assert(extended.contains("[\"alt\",\"local list\"]") && extended.contains("\"wss://hint\",\"friend\""))
+    assert(nostril_account_petname(second) == "friend")
+    assert(nostril_account_author_label(second) == "friend")
+    assert(nostril_account_set_petname(second, "alice") == "")
+    named := File.readfile(follows_path)
+    assert(nostril_follows_valid(named, first))
+    assert(named.contains("\"wss://hint\",\"alice\",\"extra\"") && named.contains("[\"alt\",\"local list\"]"))
+    assert(nostril_follows_petname(named, first, second) == "alice")
+    assert(nostril_follows_petname(named, second, second) == "")
+    assert(nostril_follows_petname(named.replace("alice", "mallory"), first, second) == "")
+    for invalid : Str in array(Str, "two words", "../alice", "alice\n", "álîce", "a/b") {
+        assert(nostril_account_set_petname(second, invalid).len() > 0)
+    }
+    assert(nostril_account_set_petname(third, "alice").contains("unique"))
+    assert(nostril_account_set_petname(second, format(second, "x")).len() > 0)
+    assert(nostril_account_set_petname(first, "not_followed").len() > 0)
+    assert(File.readfile(follows_path) == named && nostril_account_petname(second) == "alice")
+    assert(chmod(directory.c_str, 0x140) == 0)
+    assert(nostril_account_set_petname(second, "blocked").contains("write follow list"))
+    assert(chmod(directory.c_str, 0x1c0) == 0)
+    assert(File.readfile(follows_path) == named && nostril_account_petname(second) == "alice")
+    assert(nostril_account_set_petname(third, "Alice") == "")
+    assert(nostril_load_init(root) == "")
+    assert(nostril_account_petname(second) == "alice" && nostril_account_petname(third) == "Alice")
+    assert(nostril_account_switch(root, "second") == "")
+    assert(nostril_account_petname(third) == "")
+    assert(nostril_account_follow(third, false) == "")
+    assert(nostril_account_set_petname(third, "colleague") == "")
+    assert(nostril_account_set_petname(first, "alice") == "")
+    second_path := format(root, "/accounts/", second, "/follows.json")
+    second_named := File.readfile(second_path)
+    assert(nostril_account_switch(root, "first") == "")
+    assert(nostril_account_petname(third) == "Alice" && nostril_account_author_label(second) == "alice")
+    assert(nostril_account_set_petname(third, "") == "")
+    assert(nostril_account_petname(third) == "" && nostril_account_author_label(third).contains("..."))
+    assert(File.readfile(second_path) == second_named)
+    assert(nostril_account_switch(root, "second") == "")
+    assert(nostril_account_petname(third) == "colleague")
+    assert(nostril_account_follow(third, true) == "")
+    assert(nostril_account_petname(third) == "")
+    assert(nostril_account_switch(root, "first") == "")
+    // Imported ambiguity never chooses an arbitrary identity. Editing one name
+    // repairs the collision while preserving the other person's assignment.
+    collision_tags := format("[[\"p\",\"", second, "\",\"\",\"shared\"],[\"p\",\"", third, "\",\"\",\"shared\"]]")
+    File.writefile(follows_path, follow_fixture(secret, first, collision_tags, 1700000410))
+    // Collision checks reread the locked file, not the stale in-memory names.
+    assert(nostril_account_set_petname(second, "shared").contains("unique"))
+    assert(nostril_load_init(root) == "")
+    assert(nostril_account_petname(second) == "" && nostril_account_petname(third) == "")
+    assert(nostril_account_set_petname(second, "alice") == "")
+    assert(nostril_account_petname(second) == "alice" && nostril_account_petname(third) == "shared")
+    conflicting_tags := format("[[\"p\",\"", second, "\",\"wss://one\",\"one\"],[\"p\",\"", second, "\",\"wss://two\",\"two\"]]")
+    File.writefile(follows_path, follow_fixture(secret, first, conflicting_tags, 1700000411))
+    assert(nostril_load_init(root) == "" && nostril_account_petname(second) == "")
+    assert(nostril_account_set_petname(second, "resolved") == "")
+    repaired := File.readfile(follows_path)
+    assert(repaired.contains("\"wss://one\",\"resolved\"") && repaired.contains("\"wss://two\",\"resolved\""))
+    assert(nostril_account_petname(second) == "resolved")
+    invalid_name_tags := format("[[\"p\",\"", second, "\",\"\",\"not a petname\"]]")
+    File.writefile(follows_path, follow_fixture(secret, first, invalid_name_tags, 1700000412))
+    assert(nostril_load_init(root) == "" && nostril_account_petname(second) == "")
+    // Restore the metadata fixture for the existing follow-removal checks.
+    File.writefile(follows_path, extended)
     assert(nostril_account_follow(second, true) == "")
+    assert(nostril_account_petname(second) == "")
     shortened := File.readfile(follows_path)
     assert(shortened.contains(third) && !shortened.contains(second) && shortened.contains("[\"alt\",\"local list\"]"))
     File.writefile(follows_path, valid_follows)
@@ -193,5 +265,6 @@ main := proc(home: Str) {
     File.writefile(format(home, "/account-public-key"), first)
     File.writefile(format(home, "/follow-public-key"), second)
     nostril_config_reset()
+    assert(nostril_account_petname(second) == "")
     println("PASS: shared TilVm startup, persistent identities, follows, rollback and owner-only storage")
 }
