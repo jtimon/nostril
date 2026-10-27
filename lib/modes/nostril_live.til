@@ -69,7 +69,11 @@ nostril_feed_poll := proc(socket: nng_socket, mut client: FeedClient, mut timeli
         client.history.clear()
     }
     now := nng_clock()
-    if !client.ready && now >= client.retry_at {
+    // Send a new subscription immediately, but drain queued responses before
+    // deciding whether an existing request has timed out. Otherwise history
+    // computation that crosses the retry deadline triggers a needless REQ
+    // replacement even when its events/EOSE are already waiting for us.
+    if !client.ready && client.retry_at == 0 {
         nostril_live_send(socket, client.request)
         client.retry_at = now + 1000
     }
@@ -94,6 +98,10 @@ nostril_feed_poll := proc(socket: nng_socket, mut client: FeedClient, mut timeli
             }
         }
         budget--
+    }
+    if !client.ready && now >= client.retry_at {
+        nostril_live_send(socket, client.request)
+        client.retry_at = now + 1000
     }
 }
 

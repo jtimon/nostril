@@ -507,15 +507,31 @@ test_bounded_history := test() {
     assert(history_exchange(server, relay, client, overlap).len() == 2)
     assert(history_exchange(server, relay, client, NOSTRIL_LIVE_REQUEST).len() == 0)
 
+    // A response already queued at the retry deadline is progress, not a reason
+    // to send another REQ that replaces the just-completed relay subscription.
+    mut waiting := FeedClient(request = request.clone(), retry_at = nng_clock())
+    mut pending_timeline := Vec(Str).new()
+    assert(nostril_feed_write(server, relay.subscriptions[0].peer, nostril_live_envelope(events[59])))
+    sleep_ms(30)
+    nostril_feed_poll(client, waiting, pending_timeline)
+    assert(waiting.history.len() == 1 && pending_timeline.len() == 0)
+    sleep_ms(30)
+    assert(!nostril_subscription_step(server, relay))
+    assert(nostril_feed_write(server, relay.subscriptions[0].peer, NOSTRIL_LOCAL_EOSE))
+    progress_deadline := nng_clock() + 5000
+    while !waiting.ready && nng_clock() < progress_deadline { nostril_feed_poll(client, waiting, pending_timeline); sleep_ms(5) }
+    assert(waiting.ready && pending_timeline.len() == 1)
+
     mut feed := FeedClient(request = request.clone())
     mut timeline := Vec(Str).new()
     deadline := nng_clock() + 10000
-    while !feed.ready && nng_clock() < deadline {
+    while nng_clock() < deadline {
         nostril_feed_poll(client, feed, timeline)
         nostril_subscription_step(server, relay)
+        if feed.ready && relay.subscriptions.len() == 1 && relay.control_reply.len() == 0 { break }
         sleep_ms(5)
     }
-    assert(feed.ready && timeline.len() == 50)
+    assert(feed.ready && timeline.len() == 50 && relay.subscriptions.len() == 1)
     assert(nostril_relay_event_id(timeline[0]) == nostril_event_id(events[10]))
     // A late live event is not subject to the initial history limit.
     late := nostril_sign_text_note(TEST_SECRET_KEY, "late live note", 1700001998)

@@ -1,0 +1,80 @@
+# priority: medium
+# category: cleanups
+** FIXED #7 Reassess and verify Nostril with the newly installed Til
+
+Resolution: rebuilt against the installed compiler/SDK and regenerated the
+single [[file:../../doc/til-dependency.org][Til dependency record]]. Kept the current shared-owner/prelude design and
+curated native bindings. Verification exposed and fixed a local history retry
+race: an expired retry was sent before draining already-queued history/EOSE,
+needlessly replacing the relay subscription. New requests still send immediately;
+existing requests process responses before deciding whether to retry. The focused
+regression failed before the fix and passes afterward. The history integration
+test also waits for both the client and relay to complete subscription setup.
+
+*** Verification
+
+- =./make.til=: library, native dependencies, startup library and all hosts built.
+- =./make.til test=: 21/21 interpreted and 21/21 compiled tests, including
+  empty-PATH configuration, per-account follows, history/reconnect and TLS.
+- ASan compiled test host: 21/21 passed with leak detection enabled; native
+  dependencies were the normal build, not separately instrumented vendors.
+- =xvfb-run -a til run --usize=64 -o tmp/til-reassessment-gui -c tmp/til-reassessment-gui.c test/gui_send.til=:
+  Send/Enter, feed scrolling, account switching, draft reset and Follow/Unfollow
+  passed with real controls and signed per-account file checks.
+- Generated protocol binding smoke: compiled and interpreted consumers imported
+  =gen/til/nostril.til=, signed/validated a note, and read its content successfully.
+  LIBRARY_PATH/LD_LIBRARY_PATH pointed to =gen/lib/= for this scratch probe.
+- Raw generated startup binding and combined-binding probes stopped at parse
+  time with =variadic param cannot be 'own'= on
+  =til_nostril_x5fstartup__File_fwrite := ext_proc(self: File, own parts: ..Str)=.
+  Thus the raw host/guest probe could not run; the canonical suite verifies the
+  existing curated bridge instead. Generated outputs were not hand-edited.
+- Builds used existing =tmp/openssl-dev/= staging through CMAKE_PREFIX_PATH and
+  CPATH. =git diff --check= and issue-summary generation passed.
+
+*** Reassessment findings
+
+- Installed =std/tilvm= retains the same =mode lib=, host-prelude, checked lookup
+  and shared-library lifetime contract. Nostril's implicit API and XDG patterns
+  still match Tiled's configuration loader.
+- Til's completed embedding work adds native by-value enum payload/niche
+  marshalling and canonical generated dependency-binding imports. Native closure
+  values are still not C callbacks. Nostril's compiled exported callback remains
+  the appropriate libwebsockets boundary.
+- Generated dependency composition applies when a library consumes another
+  generated API. Nostril's account/WebSocket libraries currently import protocol
+  implementation source, so their raw bindings still export overlapping crypto
+  and protocol definitions. A switch to generated APIs needs explicit dependency
+  boundaries and narrower exports, plus resolution of the startup variadic
+  declaration above; replacing the curated files wholesale is not justified.
+- Installed =Mode= now has =targets= and =build_hint=, and =link= accepts target
+  restrictions. These can make Nostril's build capabilities explicit when doing
+  packaging/cross-target work. They do not cross-build its C dependencies, port
+  the POSIX account store, or replace the project-owned NNG extension.
+- The experimental MLIR backend is a limited numerical/value backend. It is not
+  a replacement for Nostril's current C backend and runtime/native dependencies.
+- Tiled commit =94d6724= migrated Unicode to Til core/std. Its recorded compiler
+  comes from a divergent Til line (Unicode commit =85cce10bd= is not an ancestor
+  of the installed revision; their common ancestor is =d2e52f609=). The actual
+  installed SDK lacks =std/unicode= and =Str.from_codepoint/read_utf8/is_valid_utf8=.
+  Do not copy Tiled's new Unicode calls into Nostril until that SDK support is
+  installed. Tiled's relocatable-runtime packaging pattern remains relevant.
+- The compiler checkout still tracks temporary string-view lifetimes (#447),
+  discarded owned results on return edges (#446), and nested propagating
+  reference calls (#443). A source audit found no chained temporary
+  trim/substr/strip_prefix calls in Nostril's application, library or tests.
+  This is not a claim that those general compiler defects are resolved.
+
+*** Follow-up direction
+
+Keep the shared-library/prelude ownership model. For infrastructure work, pursue
+Tiled-style runtime packaging and a deliberately composed generated API surface;
+track the concrete variadic-generator failure upstream before removing curated
+bindings. Unicode/grapheme reuse depends on reconciling the installed SDK with
+Tiled's Unicode line. The application roadmap (for example NIP-02 relay follow
+sync) is otherwise unaffected by this compiler update.
+
+Compare the installed compiler/SDK with the previous successful build, inspect
+relevant embedding, generated-binding and mode changes, and compare Tiled's
+current patterns. Build the library and clients, run the canonical suite and GUI
+check, and record compatibility findings and actionable follow-ups.

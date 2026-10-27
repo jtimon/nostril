@@ -54,6 +54,8 @@ library and generates =gen/nostril_startup_api.til=, =gen/nostril_runtime.til=
 through a prelude; the GUI and interpreted init use the same shared state. Runtime
 configuration uses TilVm, not a compiler subprocess. The account model test is
 built as =bin/nostril-account-tests= and exercised with an empty PATH.
+The [[file:../issues/fixed/7.org][installed-Til reassessment]] records native-binding probes, current Tiled/SDK
+differences and verification of this integration.
 
 The build driver is executable Til code, =make.til=, rather than a GNU
 Makefile. It uses =--cpu=baseline --usize=64 --opt=0= by default.

@@ -163,7 +163,9 @@ GUI feed I/O is nonblocking with bounded work per frame. Before EOSE, the receiv
 buffers at most the newest requested number of matching notes. EOSE merges the
 batch into the timestamp-ordered, ID-deduplicated timeline. Before any response,
 the GUI retries its REQ once per second; historical progress extends that retry
-deadline to five seconds. A dead connection clears readiness and triggers
+deadline to five seconds. Queued responses are drained before retrying an
+existing request, so delayed history/EOSE does not cause needless replacement.
+A dead connection clears readiness and triggers
 resubscription; queued publications start once the subscription is ready.
 Closing the window attempts CLOSE and then closes the connection, which also
 removes its relay state. Once CLOSE is processed, later publications are not
