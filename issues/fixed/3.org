@@ -1,0 +1,20 @@
+# priority: medium
+# category: cleanups
+** FIXED #3 Verify the newly installed Til compiler
+
+No application source changes were required. The full build regenerated the
+single Til dependency record linked below.
+
+Verification:
+- ./make.til: library, native dependencies, startup library and all hosts built.
+- ./make.til test: 20/20 tests passed interpreted and compiled, including
+  empty-PATH TilVm configuration, account persistence and follow filtering.
+- xvfb-run --auto-servernum til run --usize=64 test/gui_send.til: persistent
+  test-account initialization, Send, Enter and clean GUI exit passed.
+
+Builds used the existing OpenSSL development files staged under tmp/ via
+CMAKE_PREFIX_PATH and CPATH; system libssl-dev is still absent.
+
+Rebuild Nostril against the installed compiler and update the generated
+[[file:../../doc/til-dependency.org][Til dependency record]]. Verify the full interpreted/compiled suite, including
+TilVm account initialization, and the persistent-account GUI Send regression.
