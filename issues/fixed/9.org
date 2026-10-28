@@ -1,0 +1,44 @@
+# priority: medium
+# category: features
+** FIXED #9 Copy and paste public keys with NIP-19 npub
+
+Resolution: pure Til NIP-19 codec accepts npub and nprofile, including NIP-21
+nostr: wrappers, alongside case-normalized hex. It validates Bech32 (not m),
+uniform case, checksum, conversion padding, exact 32-byte identity and bounded
+TLV framing. Unknown nprofile TLVs are ignored; relay hints do not change routing.
+The shared account owner normalizes both GUI and CLI follow/unfollow input to
+hex before storage, preserving one identity/petname across presentation forms.
+
+GUI Key/Copy key/author-line controls now copy canonical lowercase npub. Added
+a header Copy npub button for the active account, and enlarged public-identity
+input for profile/URI forms. An empty/unavailable text clipboard now reports a
+message rather than dereferencing the null GLFW result, discovered during the
+real copy/paste check. The codec's owned-string APIs and presentation-only
+boundary are documented in [[file:../../doc/accounts.org][accounts]]. No DNS/NIP-05 resolver, private-key
+import or event/address-entity decoder was introduced.
+
+Verification using the installed compiler in [[file:../../doc/til-dependency.org][the generated dependency record]]:
+- =./make.til=: full library/CLI/relay/GUI build passed, using the existing
+  OpenSSL staging via CMAKE_PREFIX_PATH and CPATH.
+- =./make.til test=: 22/22 interpreted and 22/22 compiled tests. Published
+  NIP-19 npub/nprofile vectors pass. Independent reference-style encoder fixtures
+  cover Bech32m, nonzero padding, short/long keys, unknown/duplicate/missing/
+  truncated TLVs. Every single-character mutation of the published npub is
+  rejected. Case, whitespace, URI forms, private/event prefixes and input bounds
+  are checked. Headless follow/unfollow and model checks verify hex persistence,
+  deduplication/petname preservation, nprofile extraction and unchanged relay.
+- ASan compiled test host: 22/22 passed with leak detection enabled; native
+  libraries were normal builds, not separately instrumented dependencies.
+- Real X11 GUI checks passed for npub typing, copying a followed key and the
+  active identity, Ctrl+V and signed-file checks. Pasting a copied npub into the
+  petname editor verifies its exact representation, not just an accepted alias.
+  Existing send/scroll/switch/follow/petname checks also passed.
+- The final GUI check also passed with an ASan host (detect_leaks=0 for the
+  previously documented Mesa/GLX baseline leak).
+- =git diff --check= and issue summary generation passed.
+
+Accept hex, npub/nprofile and NIP-21 nostr: URI input for GUI/headless follows.
+Copy public identities as canonical lowercase npub; retain hex in events,
+filters, registration and account directories. Validate Bech32 (not Bech32m),
+case, checksum, exact public-key length, padding and TLV bounds; ignore unknown
+nprofile TLVs and keep relay hints informational. Reject other entity types.

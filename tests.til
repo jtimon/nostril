@@ -10,6 +10,53 @@ import("src/account_feed")
 
 realpath_str := ext_proc(path: Str) returns Str {}
 
+test_nip19_public_keys := test() {
+    // Published NIP-19 vectors, including nprofile's two relay hints.
+    hex := "3bf0c63fcb93463407af97a5e5ee64fa883d107ef9e558472c4eb9aaaefa459d"
+    npub := "npub180cvv07tjdrrgpa0j7j7tmnyl2yr6yr7l8j4s3evf6u64th6gkwsyjh6w6"
+    profile := "nprofile1qqsrhuxx8l9ex335q7he0f09aej04zpazpl0ne2cgukyawd24mayt8gpp4mhxue69uhhytnc9e3k7mgpz4mhxue69uhkg6nzv9ejuumpv34kytnrdaksjlyr9p"
+    assert(nostril_public_key_npub(hex) == npub)
+    for input : Str in array(Str, hex, npub, profile, format("nostr:", npub), format("nostr:", profile),
+            format(" \t", npub, "\r\n"), "NPUB180CVV07TJDRRGPA0J7J7TMNYL2YR6YR7L8J4S3EVF6U64TH6GKWSYJH6W6",
+            "NOSTR:NPUB180CVV07TJDRRGPA0J7J7TMNYL2YR6YR7L8J4S3EVF6U64TH6GKWSYJH6W6",
+            "3BF0C63FCB93463407AF97A5E5EE64FA883D107EF9E558472C4EB9AAAEFA459D",
+            // Independently generated nprofile with an unknown TLV (ignored).
+            "nprofile1vvp07qqqyqalp33lewf5vdq847t6te0wvnags0gs0mu72kz8938tn24wlfze6he4r4x") {
+        assert(nostril_public_key_hex(input) == hex)
+    }
+    other_hex := "7e7e9c42a91bfef19fa929e5fda1b72e0ebc1a4c1141673e2794234d86addf4e"
+    other_npub := "npub10elfcs4fr0l0r8af98jlmgdh9c8tcxjvz9qkw038js35mp4dma8qzvjptg"
+    assert(nostril_public_key_npub(other_hex) == other_npub && nostril_public_key_hex(other_npub) == other_hex)
+    assert(nostril_public_key_npub(repeat_text("0", 64)) == "npub1qqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqqzqujme")
+    assert(nostril_public_key_hex("npub1lllllllllllllllllllllllllllllllllllllllllllllllllllsq7lrjw") == repeat_text("f", 64))
+    for invalid : Str in array(Str, "", "alice@example.com", "npub1", format(npub, "x"),
+            format("nostr:", hex), format("nostr://", npub), format("https://example.com/", npub),
+            npub.replace("npub", "Npub"), npub.replace("w6", "w7"), npub.replace("yjh", "ybh"),
+            format(npub, "?relay=x"), format(npub, Str.from_byte(0)), repeat_text("a", 5007),
+            "nsec1vl029mgpspedva04g90vltkh6fvh240zqtv9k0t9af8935ke9laqsnlfe5",
+            "note180cvv07tjdrrgpa0j7j7tmnyl2yr6yr7l8j4s3evf6u64th6gkwsyjh6w6",
+            // Independent encoder fixtures with valid checksums but invalid
+            // variant/payload/padding/TLV semantics must still be rejected.
+            "npub180cvv07tjdrrgpa0j7j7tmnyl2yr6yr7l8j4s3evf6u64th6gkws3w8ktc",
+            "npub180cvv07tjdrrgpa0j7j7tmnyl2yr6yr7l8j4s3evf6u64th6gkw3eyr0ng",
+            "npub180cvv07tjdrrgpa0j7j7tmnyl2yr6yr7l8j4s3evf6u64th6g5f6fxy8",
+            "npub180cvv07tjdrrgpa0j7j7tmnyl2yr6yr7l8j4s3evf6u64th6gkwsqaacg5m",
+            "nprofile1qqsrhuxx8l9ex335q7he0f09aej04zpazpl0ne2cgukyawd24mayt8gqyqalp33lewf5vdq847t6te0wvnags0gs0mu72kz8938tn24wlfze68e3ux3",
+            "nprofile1qqsrhuxx8l9ex335q7he0f09aej04zpazpl0ne2cgukyawd24may2mjqfv8",
+            "nprofile1qyqhstdd3n3", "nprofile1qq0nhuxx8l9ex335q7he0f09aej04zpazpl0ne2cgukyawd24may2nlp78g",
+            "nprofile1qqsrhuxx8l9ex335q7he0f09aej04zpazpl0ne2cgukyawd24mayt8gp0l4q3r") {
+        assert(nostril_public_key_hex(invalid) == "")
+    }
+    assert(nostril_public_key_npub("not hex") == "")
+    // Every single-character substitution is detected by the Bech32 checksum.
+    for index in 0..npub.len() {
+        mut changed := "q"
+        if npub[index] == 'q' { changed = "p" }
+        damaged := format(npub.substr(0, index), changed, npub.substr(index + 1, npub.len() - index - 1))
+        assert(nostril_public_key_hex(damaged) == "")
+    }
+}
+
 test_account_process := test() {
     home := format("tmp/account-test-", process_id().to_str())
     if File.exists(home) { File.remove_tree(home) }
@@ -35,7 +82,7 @@ test_account_process := test() {
     File.writefile(init_path, init_source)
     target := File.readfile(format(home, "/follow-public-key"))
     account := File.readfile(format(home, "/account-public-key"))
-    follow := Cmd.new("bin/nostril-gui", "--follow", target)
+    follow := Cmd.new("bin/nostril-gui", "--follow", format("nostr:", nostril_public_key_npub(target)))
     follow.env("HOME", home).env("XDG_CONFIG_HOME", "").env("PATH", "")
     follow.capture()
     if follow.run() != 0 { panic("headless follow failed: ", follow.out(), follow.err()) }
@@ -51,7 +98,7 @@ test_account_process := test() {
     assert(first_writer.wait() == 0 && second_writer.wait() == 0)
     merged := File.readfile(format(home, "/.config/nostril/accounts/", account, "/follows.json"))
     assert(nostril_follows_valid(merged, account) && merged.contains(target) && merged.contains(third))
-    unfollow := Cmd.new("bin/nostril-gui", "--unfollow", target)
+    unfollow := Cmd.new("bin/nostril-gui", "--unfollow", nostril_public_key_npub(target))
     unfollow.env("HOME", home).env("XDG_CONFIG_HOME", "").env("PATH", "")
     unfollow.capture()
     assert(unfollow.run() == 0)

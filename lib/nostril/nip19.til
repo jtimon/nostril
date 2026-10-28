@@ -1,0 +1,160 @@
+mode lib
+import("event")
+
+// NIP-19 public identity presentation. No secret-key or event-entity decoding.
+priv BECH32_ALPHABET := "qpzry9x8gf2tvdw0s3jn54khce6mua7l"
+priv HEX_ALPHABET := "0123456789abcdef"
+
+priv npub_polymod := func(check: I64, value: I64) returns I64 {
+    top := check / 33554432
+    mut next := ((check.mod(33554432)) * 32).bxor(value)
+    generators := array(I64, 0x3b6a57b2, 0x26508e6d, 0x1ea119fa, 0x3d4233dd, 0x2a1462b3)
+    mut bits := top
+    for generator : I64 in generators {
+        if bits.mod(2) == 1 { next = next.bxor(generator) }
+        bits = bits / 2
+    }
+    return next
+}
+
+priv identity_hrp := func(hrp: Str) returns I64 {
+    mut check : I64 = 1
+    for byte : I8 in hrp { check = npub_polymod(check, byte.cast(I64) / 32) }
+    check = npub_polymod(check, 0)
+    for byte : I8 in hrp { check = npub_polymod(check, byte.cast(I64).mod(32)) }
+    return check
+}
+
+priv ascii_lower := func(text: Str) returns Str {
+    mut out := Str.with_capacity(text.len())
+    for byte : I8 in text {
+        mut code := byte.cast(U8).to_i64()
+        if byte >= 'A' && byte <= 'Z' { code = code + 32 }
+        out.push_str(Str.from_byte(code.to_u8()))
+    }
+    return out
+}
+
+priv power_two := func(bits: I64) returns I64 {
+    mut out : I64 = 1
+    for _unused in 0..bits { out = out * 2 }
+    return out
+}
+
+/// Canonical lowercase npub from a protocol hex key. Empty on invalid input.
+nostril_public_key_npub := func(pubkey: Str) returns Str {
+    if !nostril_key_encoding(pubkey) { return "" }
+    mut out := Str.with_capacity(63)
+    out.push_str("npub1")
+    mut check := identity_hrp("npub")
+    mut accumulator : I64 = 0
+    mut bits : I64 = 0
+    for byte : I8 in pubkey {
+        digit := HEX_ALPHABET.find(Str.from_byte(byte.cast(U8)))
+        accumulator = accumulator * 16 + digit
+        bits = bits + 4
+        if bits >= 5 {
+            bits = bits - 5
+            divisor := power_two(bits)
+            value := accumulator / divisor
+            accumulator = accumulator.mod(divisor)
+            out.push_str(BECH32_ALPHABET.substr(value.to_usize(), 1))
+            check = npub_polymod(check, value)
+        }
+    }
+    if bits > 0 {
+        value := accumulator * power_two(5 - bits)
+        out.push_str(BECH32_ALPHABET.substr(value.to_usize(), 1))
+        check = npub_polymod(check, value)
+    }
+    for _unused in 0..6 { check = npub_polymod(check, 0) }
+    checksum := check.bxor(1)
+    mut divisor : I64 = 33554432
+    for _unused in 0..6 {
+        value := (checksum / divisor).mod(32)
+        out.push_str(BECH32_ALPHABET.substr(value.to_usize(), 1))
+        divisor = divisor / 32
+    }
+    return out
+}
+
+priv bytes_hex := func(bytes: Str) returns Str {
+    mut hex := Str.with_capacity(bytes.len() * 2)
+    for raw : I8 in bytes {
+        byte := raw.cast(U8).to_i64()
+        hex.push_str(HEX_ALPHABET.substr((byte / 16).to_usize(), 1))
+        hex.push_str(HEX_ALPHABET.substr(byte.mod(16).to_usize(), 1))
+    }
+    return hex
+}
+
+/// User-input boundary: hex, npub/nprofile or nostr: URI -> protocol hex.
+/// Bech32 permits all-upper or all-lower strings, never mixed case. Padding is
+/// checked separately from the checksum. Empty means unsupported/invalid input.
+nostril_public_key_hex := func(input: Str) returns Str {
+    trimmed := input.trim()
+    // NIP-19 recommends a 5000-character entity bound; URI adds six.
+    if trimmed.len() > 5006 { return "" }
+    mut encoded := trimmed.clone()
+    normalized := ascii_lower(encoded)
+    if normalized.starts_with("nostr:") { encoded = trimmed.substr(6, trimmed.len() - 6).clone() }
+    else if normalized.len() == 64 && nostril_key_encoding(normalized) { return normalized }
+    if encoded.len() > 5000 { return "" }
+    mut lower := false
+    mut upper := false
+    for byte : I8 in encoded {
+        if byte >= 'a' && byte <= 'z' { lower = true }
+        if byte >= 'A' && byte <= 'Z' { upper = true }
+    }
+    if lower && upper { return "" }
+    key := ascii_lower(encoded)
+    mut hrp := ""
+    if key.starts_with("npub1") { hrp = "npub" }
+    else if key.starts_with("nprofile1") { hrp = "nprofile" }
+    else { return "" }
+    if key.len() < hrp.len() + 7 { return "" }
+    if hrp == "npub" && key.len() != 63 { return "" }
+    mut check := identity_hrp(hrp)
+    mut accumulator : I64 = 0
+    mut bits : I64 = 0
+    mut payload := Str.with_capacity(key.len())
+    // Index is required to distinguish payload from the final six checksum digits.
+    for index in (hrp.len() + 1)..key.len() {
+        value := BECH32_ALPHABET.find(key.substr(index, 1))
+        if value < 0 { return "" }
+        check = npub_polymod(check, value)
+        if index < key.len() - 6 {
+            accumulator = accumulator * 32 + value
+            bits = bits + 5
+            if bits >= 8 {
+                bits = bits - 8
+                divisor := power_two(bits)
+                byte := accumulator / divisor
+                accumulator = accumulator.mod(divisor)
+                payload.push_str(Str.from_byte(byte.to_u8()))
+            }
+        }
+    }
+    if check != 1 || bits >= 5 || accumulator != 0 { return "" }
+    if hrp == "npub" {
+        if payload.len() != 32 { return "" }
+        return bytes_hex(payload)
+    }
+    // NIP-19 nprofile TLV: type and length are one byte. Only the identity
+    // (type 0) is adopted. Relay hints and unknown TLVs never alter routing.
+    mut at : USize = 0
+    mut pubkey := ""
+    while at < payload.len() {
+        if payload.len() - at < 2 { return "" }
+        kind := payload[at].cast(U8)
+        size := payload[at + 1].cast(U8).to_usize()
+        at = at + 2
+        if size > payload.len() - at { return "" }
+        if kind == 0 {
+            if size != 32 || pubkey.len() > 0 { return "" }
+            pubkey = bytes_hex(payload.substr(at, size))
+        }
+        at = at + size
+    }
+    return pubkey
+}

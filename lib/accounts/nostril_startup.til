@@ -1,5 +1,6 @@
 mode lib
 import("../nostril/event")
+import("../nostril/nip19")
 import("std/sys")
 link_c("store.c")
 
@@ -200,7 +201,9 @@ priv edit_follow := proc(pubkey: Str, remove: Bool, rename: Bool, name: Str) ret
 }
 
 nostril_account_follow := proc(pubkey: Str, remove: Bool) returns Str {
-    return edit_follow(pubkey, remove, false, "")
+    key := nostril_public_key_hex(pubkey)
+    if key.len() == 0 { return "Use a hex public key, npub, nprofile or nostr: URI with a valid checksum." }
+    return edit_follow(key, remove, false, "")
 }
 nostril_account_set_petname := proc(pubkey: Str, name: Str) returns Str {
     return edit_follow(pubkey, false, true, name)

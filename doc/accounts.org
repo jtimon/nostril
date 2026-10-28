@@ -56,7 +56,8 @@ switching cannot recall them. The configured/CLI relay endpoint stays the same.
 ** Follow and unfollow
 
 In the GUI, open =Following= for the active account. Type or paste (Ctrl+V) a
-64-character lowercase hex public key and click =Follow= or press Enter. Each
+hex public key, NIP-19 =npub= or =nprofile= and click =Follow= or press Enter.
+NIP-21 =nostr:npub...= and =nostr:nprofile...= URIs are accepted too. Each
 listed key has an =Unfollow= button. Scroll long account/follow lists with the
 mouse wheel; =Back= returns to the feed. Ephemeral identities cannot save follows.
 
@@ -67,8 +68,8 @@ lists are not edited. The composer is inactive while either panel is open.
 The headless commands remain available, using the account selected in init:
 
 #+begin_src sh
-./bin/nostril-gui --follow <64-character-public-key>
-./bin/nostril-gui --unfollow <64-character-public-key>
+./bin/nostril-gui --follow <hex-key-or-npub-or-nprofile>
+./bin/nostril-gui --unfollow <hex-key-or-npub-or-nprofile>
 ./bin/nostril-gui
 #+end_src
 
@@ -76,8 +77,31 @@ These headless commands load the same init and account owner as the GUI, save
 the change, print the selected account identity, and exit. They do not connect
 to a relay. Changes from another process are reread on switching to the account
 or on a follow edit; there is no filesystem watcher. Follow targets need only
-public keys, not local account registrations or private keys. npub/NIP-05 input
-remains later work.
+public keys, not local account registrations or private keys. Email-style NIP-05
+identifiers and web URLs are not resolved by this input.
+
+*** Copying and pasting public identities
+
+The header's =Copy npub= button copies the active account's public identity.
+Following's =Key= button, the name editor's =Copy key= button and clicking a
+feed author line also copy canonical lowercase =npub=. These controls never
+copy secret keys. A pasted identity resolves to its hex key before a follow edit;
+hex/npub/nprofile for the same person therefore share one follow and petname.
+Account registration in init and =--create-account= output still use hex.
+
+Bech32 (not Bech32m) checksums, uniform upper/lower case, payload length and
+padding are validated. Hex accepts either case and normalizes to lowercase;
+surrounding whitespace is ignored. Mixed-case Bech32, private =nsec= keys,
+event identifiers (=note/nevent/naddr=), malformed profiles and unknown identity
+prefixes are rejected without modifying follows. Checksums detect transcription
+errors; they do not establish that a key belongs to the person you intended.
+
+For =nprofile=, the required type-0 public key is extracted from bounded TLV
+data; missing/duplicate identities and truncated TLVs are rejected. Unknown TLVs
+are ignored as NIP-19 specifies. Relay hints do not change the configured relay
+or become trusted routing information. Entities are limited to 5000 characters,
+plus an optional =nostr:= wrapper. Events, filters, petname bindings and account
+directories continue using lowercase hex; encoded forms are presentation only.
 
 *** Petnames: names assigned by you
 
@@ -96,7 +120,7 @@ A locally assigned petname is the primary identity label in the feed and follow
 list. Without one, the GUI shows a shortened key (=You= for the active key).
 Shortened public keys remain visible alongside names. The follow-list =Key=
 button, the petname editor's =Copy key= button, and clicking an author line in
-the feed copy the full public key. Remote profile metadata cannot rename anyone.
+the feed copy the full public key as =npub=. Remote profile metadata cannot rename anyone.
 Changing a petname updates existing note labels immediately without resubscribing.
 
 Petnames are the fourth field of the account's signed NIP-02 =p= tags:
@@ -202,6 +226,12 @@ return an owned =nostril_follows_petnames= map or a single validated petname;
 =nostril_relay_event_pubkey= exposes only a verified author's key. The curated
 host bindings use string results, not shared mutable maps. These remain prototype
 APIs with the same shared-library ownership boundary.
+
+=lib/nostril/nip19.til= owns the pure public-identity codec. The generated protocol
+binding exposes =nostril_public_key_hex(input)= and =nostril_public_key_npub(hex)=,
+each returning an owned string or empty on invalid input. The shared account
+owner normalizes follow/unfollow input at its boundary; protocol validators stay
+hex-only. No new network resolver or native dependency is introduced.
 
 =src/nostril_init.til= uses the matching installed SDK recorded by the build,
 loads =mode lib= init in-process with a host prelude importing the generated API,

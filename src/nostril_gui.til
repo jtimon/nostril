@@ -180,6 +180,10 @@ main := proc(args: ..Str) {
         button_x := field_x + field_w + margin
 
         clicked := IsMouseButtonPressed(0)
+        if clicked && gui_hit(width - 108, 44, 96, 24) {
+            npub := nostril_public_key_npub(nostril_account_public_key())
+            SetClipboardText(npub.c_str)
+        }
         if clicked && gui_hit(margin, 8, 210, 30) {
             if panel == 1 { panel = 0 } else { panel = 1 }
             scroll = 0; notice = ""
@@ -215,14 +219,17 @@ main := proc(args: ..Str) {
         }
         if (panel == 2 || panel == 3) && (IsKeyDown(341) || IsKeyDown(345)) && IsKeyPressed(86) {
             ref clipboard : I8 = GetClipboardText()
-            pasted := Str.from_c_str(clipboard)
-            if panel == 2 {
-                candidate := pasted.trim().clone()
-                if candidate.len() <= 64 { follow_input = candidate.clone() }
-                else { notice = "Use a 64-character hex public key." }
-            } else {
-                if pasted.len() <= 64 { petname_input = pasted.clone() }
-                else { notice = "Petnames have at most 64 characters." }
+            if clipboard.is_null() { notice = "Clipboard has no text." }
+            else {
+                pasted := Str.from_c_str(clipboard)
+                if panel == 2 {
+                    candidate := pasted.trim().clone()
+                    if candidate.len() <= 5006 { follow_input = candidate.clone() }
+                    else { notice = "Public identity is too long (maximum 5000 characters plus nostr:)." }
+                } else {
+                    if pasted.len() <= 64 { petname_input = pasted.clone() }
+                    else { notice = "Petnames have at most 64 characters." }
+                }
             }
         }
         mut code := GetCharPressed()
@@ -230,7 +237,7 @@ main := proc(args: ..Str) {
             if code >= 32 && code != 127 {
                 if panel == 0 && composer_scalars < 280 {
                     composer = format(composer, gui_utf8(code.cast(I64))); composer_scalars++
-                } else if panel == 2 && follow_input.len() < 64 && code < 128 {
+                } else if panel == 2 && follow_input.len() < 5006 && code < 128 {
                     follow_input = format(follow_input, gui_utf8(code.cast(I64)))
                 } else if panel == 3 && petname_input.len() < 64 && code < 128 {
                     petname_input = format(petname_input, gui_utf8(code.cast(I64)))
@@ -282,7 +289,8 @@ main := proc(args: ..Str) {
                 row++
                 if row_y < 156 || row_y + 42 > height - 44 { continue }
                 if clicked && gui_hit(width - 216, row_y, 48, 28) {
-                    SetClipboardText(pubkey.c_str); notice = "Public key copied."
+                    npub := nostril_public_key_npub(pubkey)
+                    SetClipboardText(npub.c_str); notice = "Public key copied as npub."
                 }
                 if clicked && gui_hit(width - 156, row_y, 60, 28) {
                     editing_key = pubkey.clone()
@@ -298,7 +306,8 @@ main := proc(args: ..Str) {
         }
         if panel == 3 {
             if clicked && gui_hit(width - 88, 88, 76, 28) {
-                SetClipboardText(editing_key.c_str); notice = "Public key copied."
+                npub := nostril_public_key_npub(editing_key)
+                SetClipboardText(npub.c_str); notice = "Public key copied as npub."
             }
             clear := clicked && gui_hit(margin, 212, 96, 30)
             if clear { petname_input = "" }
@@ -329,8 +338,10 @@ main := proc(args: ..Str) {
         if panel > 0 { DrawText("Back".c_str, width - 174, 16, 14, text) }
         public_key := nostril_account_public_key()
         status := gui_fitting_tail(format(public_key.substr(0, 16), "... | ",
-            gui_status_text(session.status())), content_w, 13)
+            gui_status_text(session.status())), content_w - 108, 13)
         DrawText(status.c_str, margin, 50, 13, muted)
+        DrawRectangle(width - 108, 44, 96, 24, field)
+        DrawText("Copy npub".c_str, width - 100, 50, 13, text)
 
         if panel == 0 {
             timeline_top := header_h + 8
@@ -356,7 +367,10 @@ main := proc(args: ..Str) {
                     DrawText(author_label.c_str, content_x, row_y + 7, 13, text)
                     DrawText(key_hint.c_str, width - margin - MeasureText(key_hint.c_str, 12), row_y + 7, 12, muted)
                     if row_y + 3 >= timeline_top && row_y + 23 <= timeline_bottom &&
-                            clicked && gui_hit(content_x, row_y + 3, content_w, 20) { SetClipboardText(author.c_str) }
+                            clicked && gui_hit(content_x, row_y + 3, content_w, 20) {
+                        npub := nostril_public_key_npub(author)
+                        SetClipboardText(npub.c_str)
+                    }
                     gui_draw_wrapped(message, message_x, row_y + 27, message_w, 16, 21, text)
                     publication_status := gui_status_text(session.publication_status(event))
                     visible_status := gui_fitting_tail(publication_status, message_w, 11)
@@ -417,7 +431,7 @@ main := proc(args: ..Str) {
                 }
             } else if panel == 2 {
                 DrawRectangle(margin, 88, width - 112, 36, field)
-                mut input_label := "Hex public key (Ctrl+V to paste)"
+                mut input_label := "npub, nprofile or hex (Ctrl+V to paste)"
                 if follow_input.len() > 0 { input_label = gui_fitting_tail(follow_input, width - 132, 14) }
                 DrawText(input_label.c_str, margin + 8, 99, 14, text)
                 mut color := border

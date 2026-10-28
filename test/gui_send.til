@@ -83,12 +83,19 @@ click := proc(display: Dynamic, window: UPtr, x: I32, y: I32) {
     XTestFakeButtonEvent(display, 1, 0, 0); XFlush(display); sleep_ms(150)
 }
 
+paste := proc(display: Dynamic) {
+    control := XKeysymToKeycode(display, 0xffe3).cast(U32)
+    XTestFakeKeyEvent(display, control, 1, 0); XFlush(display)
+    key(display, 'v')
+    XTestFakeKeyEvent(display, control, 0, 0); XFlush(display); sleep_ms(150)
+}
+
 main := proc(args: ..Str) {
     if args.len() > 1 { panic("usage: gui_send [gui-binary]") }
     mut executable := "bin/nostril-gui"
     if args.len() == 1 { executable = args[0].clone() }
     // Local-only: this test never publishes to a public relay.
-    app := Cmd.new("timeout", "45", executable)
+    app := Cmd.new("timeout", "60", executable)
     home := format("tmp/gui-send-", process_id().to_str())
     mkdir_p(home)
     create := Cmd.new(executable, "--create-account")
@@ -171,14 +178,23 @@ main := proc(args: ..Str) {
     // Manage follows through real controls, then switch identities and verify
     // the signed lists stay with their owners. Enter in this panel is Follow.
     click(display, window, width.cast(I32) - 60, 24)
-    for character : I8 in second { key(display, character.cast(U8).cast(UPtr)) }
+    // Xvfb starts without a text selection. Paste must not dereference null.
+    paste(display)
+    second_identity := nostril_public_key_npub(second)
+    for character : I8 in second_identity { key(display, character.cast(U8).cast(UPtr)) }
     key(display, 0xff0d); sleep_ms(200)
+    // The follow-row copy control must yield a checksummed npub usable in the
+    // same input without changing the protocol/storage key or duplicating it.
+    click(display, window, width.cast(I32) - 190, 168)
+    paste(display)
+    key(display, 0xff0d); sleep_ms(150)
     click(display, window, width.cast(I32) - 126, 168)
     for character : I8 in "alice" { key(display, character.cast(U8).cast(UPtr)) }
     key(display, 0xff0d); sleep_ms(150)
     first_path := format(home, "/.config/nostril/accounts/", pubkey, "/follows.json")
     first_follows := File.readfile(first_path)
     assert(nostril_follows_valid(first_follows, pubkey) && first_follows.contains(second))
+    assert(!first_follows.contains("npub") && !first_follows.contains("nostr:"))
     assert(nostril_follows_petname(first_follows, pubkey, second) == "alice")
     click(display, window, width.cast(I32) - 150, 24)
     for character : I8 in "discard this draft" { key(display, character.cast(U8).cast(UPtr)) }
@@ -187,7 +203,7 @@ main := proc(args: ..Str) {
     click(display, window, 90, 150)
     assert(composer_is_empty(display, window, height, empty))
     click(display, window, width.cast(I32) - 60, 24)
-    for character : I8 in pubkey { key(display, character.cast(U8).cast(UPtr)) }
+    for character : I8 in nostril_public_key_npub(pubkey) { key(display, character.cast(U8).cast(UPtr)) }
     click(display, window, width.cast(I32) - 50, 105)
     click(display, window, width.cast(I32) - 126, 168)
     for character : I8 in "bob" { key(display, character.cast(U8).cast(UPtr)) }
@@ -221,11 +237,19 @@ main := proc(args: ..Str) {
     ref unnamed : Dynamic = XGetImage(display, window, 22, height.cast(I32) - 134, 180, 24, 0xffffff, 2)
     if unnamed.is_null() { panic("could not capture author label") }
     click(display, window, width.cast(I32) - 60, 24)
-    for character : I8 in pubkey { key(display, character.cast(U8).cast(UPtr)) }
+    click(display, window, width.cast(I32) - 60, 56)
+    paste(display)
     key(display, 0xff0d); sleep_ms(150)
+    self_follow := File.readfile(first_path)
+    assert(nostril_follows_valid(self_follow, pubkey) && self_follow.contains(format("[\"p\",\"", pubkey, "\"")))
+    assert(!self_follow.contains("npub"))
     click(display, window, width.cast(I32) - 126, 168)
-    for character : I8 in "local_me" { key(display, character.cast(U8).cast(UPtr)) }
+    // Paste into a petname field too, to check the exact copied representation
+    // is canonical npub rather than another accepted input such as hex.
+    paste(display)
     click(display, window, width.cast(I32) - 50, 174)
+    copied_name := File.readfile(first_path)
+    assert(nostril_follows_petname(copied_name, pubkey, pubkey) == nostril_public_key_npub(pubkey))
     click(display, window, width.cast(I32) - 150, 24)
     assert(!region_matches(display, window, 22, height.cast(I32) - 134, unnamed))
     click(display, window, width.cast(I32) - 60, 24)
@@ -241,5 +265,5 @@ main := proc(args: ..Str) {
     status := app.wait()
     if status != 0 { panic("GUI exit failed: ", app.out(), app.err()) }
     File.remove_tree(home)
-    println("GUI Send/Enter, scrolling, account switching, Follow/Unfollow and petname editing/labels passed")
+    println("GUI Send/Enter, scrolling, account switching, npub copy/paste, follows and petnames passed")
 }
