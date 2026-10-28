@@ -48,6 +48,11 @@ namespace:
         self.open(endpoint)
         return ""
     }
+    create_account := proc(mut self: AccountFeed, root: Str, name: Str) returns Str {
+        result := nostril_account_create_named(root, name)
+        if !nostril_key_encoding(result) { return result }
+        return self.switch_account(root, name)
+    }
     refresh := proc(mut self: AccountFeed) {
         self.feed = FeedClient(request = nostril_account_subscription())
         if self.remote { nostril_ws_subscribe(self.websocket, self.feed.request) }

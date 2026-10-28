@@ -40,7 +40,18 @@ wait_feed := proc(mut session: AccountFeed, events: nng_socket, requests: nng_so
     panic("account feed did not establish its updated subscription")
 }
 
-main := proc(home: Str) {
+main := proc(home: Str, args: ..Str) {
+    if args.len() > 0 {
+        if args.len() != 1 { panic("usage: accounts_model home [new-account-name]") }
+        root := format(home, "/.config/nostril")
+        error := nostril_load_init(root)
+        if error.len() > 0 { panic(error) }
+        result := nostril_account_create_named(root, args[0])
+        if !nostril_key_encoding(result) { panic(result) }
+        println(result)
+        nostril_config_reset()
+        return
+    }
     mkdir_p(home)
     root := format(home, "/.config/nostril")
     init_path := format(root, "/init.til")
@@ -282,5 +293,80 @@ main := proc(home: Str) {
     File.writefile(format(home, "/follow-public-key"), second)
     nostril_config_reset()
     assert(nostril_account_petname(second) == "")
+    // Fresh, config-free GUI session: create/select and rediscover after restart.
+    created_root := format(home, "/gui-created")
+    assert(nostril_load_init(created_root) == "")
+    assert(!nostril_account_persistent())
+    mut created_session := AccountFeed()
+    created_session.open("")
+    created_session.send("ephemeral draft feed")
+    assert(created_session.create_account(created_root, "Personal") == "")
+    personal := nostril_account_public_key()
+    assert(nostril_account_persistent() && nostril_account_name() == "Personal")
+    assert(created_session.messages.len() == 0 && nostril_account_follows() == "")
+    assert(!File.exists(format(created_root, "/init.til")))
+    key_file := format(created_root, "/accounts/", personal, "/secret.key")
+    key_bytes := File.readfile(key_file)
+    catalog_file := format(created_root, "/accounts/catalog.tsv")
+    catalog := File.readfile(catalog_file)
+    assert(catalog == format("nostril-accounts-v1\n", personal, "\tPersonal\n"))
+    for invalid : Str in array(Str, "", " Personal", "Personal ", "bad\tname", "bad\nname", format("bad", Str.from_byte(0)),
+            format("bad", Str.from_byte(255)), format(personal, "x")) {
+        assert(created_session.create_account(created_root, invalid).len() > 0)
+    }
+    assert(created_session.create_account(created_root, "Personal").contains("already exists"))
+    assert(File.readfile(catalog_file) == catalog && File.readfile(key_file) == key_bytes)
+    assert(nostril_account_public_key() == personal && nostril_account_count() == 1)
+    assert(created_session.create_account(created_root, "Work") == "")
+    work := nostril_account_public_key()
+    assert(work != personal && nostril_account_name() == "Work" && nostril_account_count() == 2)
+    assert(created_session.follow(personal, false) == "")
+    assert(nostril_account_set_petname(personal, "friend") == "")
+    created_session.close()
+    assert(nostril_load_init(created_root) == "")
+    assert(nostril_account_public_key() == personal && nostril_account_follows() == "")
+    assert(nostril_account_switch(created_root, "Work") == "")
+    assert(nostril_account_follows() == format(personal, "\n") && nostril_account_petname(personal) == "friend")
+    // Init can choose a catalog account without redeclaring it. Exact duplicate
+    // declarations coalesce; conflicts fail without changing the catalog/key.
+    init_file := format(created_root, "/init.til")
+    init_source := format("mode lib\ninit := proc() { nostril_config_account(\"Personal\", \"", personal,
+        "\"); nostril_config_select(\"Work\") }\n")
+    File.writefile(init_file, init_source)
+    assert(nostril_load_init(created_root) == "" && nostril_account_public_key() == work && nostril_account_count() == 2)
+    assert(nostril_key_encoding(nostril_account_create_named(created_root, "Other")))
+    assert(File.readfile(init_file) == init_source)
+    all_catalog := File.readfile(catalog_file)
+    File.writefile(init_file, format("mode lib\ninit := proc() { nostril_config_account(\"Personal\", \"", work, "\") }\n"))
+    assert(nostril_load_init(created_root).contains("conflicts with init"))
+    assert(nostril_account_public_key() == "" && File.readfile(catalog_file) == all_catalog)
+    File.writefile(init_file, init_source)
+    assert(nostril_load_init(created_root) == "")
+    catalog_directory := format(created_root, "/accounts")
+    assert(chmod(catalog_directory.c_str, 0x140) == 0)
+    assert(!nostril_key_encoding(nostril_account_create_named(created_root, "No write")))
+    assert(chmod(catalog_directory.c_str, 0x1c0) == 0)
+    assert(File.readfile(catalog_file) == all_catalog && nostril_account_public_key() == work)
+    assert(chmod(catalog_file.c_str, 0x1a4) == 0)
+    assert(nostril_account_create_named(created_root, "Blocked").contains("read account catalog"))
+    assert(nostril_account_public_key() == work)
+    assert(chmod(catalog_file.c_str, 0x180) == 0)
+    for invalid : Str in array(Str, "broken catalog", format("nostril-accounts-v1\n", personal, "\tPersonal"),
+            format("nostril-accounts-v1\n", personal, "\tduplicate\n", work, "\tduplicate\n"),
+            format("nostril-accounts-v1\n", personal, "\tFirst\n", personal, "\tSecond\n")) {
+        File.writefile(catalog_file, invalid)
+        assert(!nostril_key_encoding(nostril_account_create_named(created_root, "Blocked")))
+        assert(File.readfile(key_file) == key_bytes && File.readfile(catalog_file) == invalid)
+        assert(nostril_load_init(created_root).len() > 0)
+        assert(nostril_account_public_key() == "")
+    }
+    File.writefile(catalog_file, all_catalog)
+    catalog_saved := format(catalog_file, ".saved")
+    File.rename(catalog_file, catalog_saved)
+    assert(symlink(catalog_saved.c_str, catalog_file.c_str) == 0)
+    assert(nostril_load_init(created_root).contains("read account catalog"))
+    File.remove(catalog_file); File.rename(catalog_saved, catalog_file)
+    assert(nostril_load_init(created_root) == "" && nostril_account_public_key() == work)
+    nostril_config_reset()
     println("PASS: shared TilVm startup, persistent identities, follows, rollback and owner-only storage")
 }

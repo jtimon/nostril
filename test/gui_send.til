@@ -259,11 +259,60 @@ main := proc(args: ..Str) {
     assert(region_matches(display, window, 22, height.cast(I32) - 134, unnamed))
     assert(File.readfile(second_path) == second_follows)
     XDestroyImage(unnamed)
+    // Create directly in the GUI. Duplicate names preserve the current account
+    // and do not publish a catalog; a successful creation selects a fresh owner.
+    click(display, window, 90, 24)
+    click(display, window, width.cast(I32) - 80, 90)
+    for character : I8 in "gui-test" { key(display, character.cast(U8).cast(UPtr)) }
+    key(display, 0xff0d); sleep_ms(150)
+    catalog_path := format(home, "/.config/nostril/accounts/catalog.tsv")
+    assert(!File.exists(catalog_path))
+    for _index in 0..8 { key(display, 0xff08) }
+    for character : I8 in "fresh" { key(display, character.cast(U8).cast(UPtr)) }
+    click(display, window, width.cast(I32) - 60, 174)
+    assert(composer_is_empty(display, window, height, empty))
+    catalog := File.readfile(catalog_path)
+    lines := catalog.split("\n")
+    assert(lines.len() == 3 && lines[0] == "nostril-accounts-v1")
+    fields := lines[1].split("\t")
+    assert(fields.len() == 2)
+    fresh := fields[0].clone()
+    assert(fields[1] == "fresh" && nostril_key_encoding(fresh))
+    assert(fresh != pubkey && fresh != second)
+    assert(File.readfile(format(home, "/.config/nostril/init.til")) == configured)
+    click(display, window, width.cast(I32) - 60, 24)
+    for character : I8 in nostril_public_key_npub(pubkey) { key(display, character.cast(U8).cast(UPtr)) }
+    key(display, 0xff0d); sleep_ms(150)
+    fresh_path := format(home, "/.config/nostril/accounts/", fresh, "/follows.json")
+    fresh_follows := File.readfile(fresh_path)
+    assert(nostril_follows_valid(fresh_follows, fresh) && fresh_follows.contains(pubkey))
+    assert(File.readfile(second_path) == second_follows)
+    assert(File.is_file(format(home, "/.config/nostril/accounts/", fresh, "/secret.key")))
     XDestroyImage(empty)
     key(display, 0xff1b)
-    XCloseDisplay(display)
     status := app.wait()
     if status != 0 { panic("GUI exit failed: ", app.out(), app.err()) }
+    // A catalog account is usable on a fresh launch with no init at all.
+    File.remove(format(home, "/.config/nostril/init.til"))
+    restarted := Cmd.new("timeout", "30", executable)
+    restarted.env("HOME", home).env("XDG_CONFIG_HOME", "").capture()
+    restarted.start()
+    mut restarted_window : UPtr = 0
+    attempts = 0
+    while restarted_window == 0 && !restarted.poll() && attempts < 100 {
+        restarted_window = find_window(); sleep_ms(50); attempts++
+    }
+    if restarted_window == 0 { panic("created account did not restart: ", restarted.out(), restarted.err()) }
+    XSetInputFocus(display, restarted_window, 1, 0); XFlush(display); sleep_ms(150)
+    click(display, restarted_window, width.cast(I32) - 60, 24)
+    for character : I8 in nostril_public_key_npub(second) { key(display, character.cast(U8).cast(UPtr)) }
+    key(display, 0xff0d); sleep_ms(150)
+    reloaded_follows := File.readfile(fresh_path)
+    assert(nostril_follows_valid(reloaded_follows, fresh) && reloaded_follows.contains(second) && reloaded_follows.contains(pubkey))
+    assert(File.readfile(catalog_path) == catalog && File.readfile(second_path) == second_follows)
+    key(display, 0xff1b)
+    if restarted.wait() != 0 { panic("restarted GUI failed: ", restarted.out(), restarted.err()) }
+    XCloseDisplay(display)
     File.remove_tree(home)
-    println("GUI Send/Enter, scrolling, account switching, npub copy/paste, follows and petnames passed")
+    println("GUI sending, switching, follows/petnames, npub copy/paste and account creation/restart passed")
 }

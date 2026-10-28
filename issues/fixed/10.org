@@ -1,0 +1,41 @@
+# priority: medium
+# category: features
+** FIXED #10 Create persistent named accounts from the GUI
+
+Resolution: Account -> New account opens a local-name input; Create/Enter saves
+a fresh keypair, registers it and switches through the existing feed reset path.
+Back cancels. Duplicate/invalid names report an error without replacing the
+current identity or session. The picker includes init and GUI registrations.
+
+GUI names persist in accounts/catalog.tsv under the accounts/.lock. The shared
+owner validates a versioned, bounded catalog, rereads it while locked, creates
+keys exclusively and atomically writes/syncs the new catalog. Init is never
+rewritten. Exact init/catalog pairs coalesce; conflicting name/key pairs fail.
+Explicit init selection wins; with no init declarations/selection the first
+catalog account is the startup default. Key directories alone are not discovered.
+Creation/switch APIs, metadata ownership, 256-entry bound, retained-key behavior
+on catalog failure and post-rename sync semantics are documented in [[file:../../doc/accounts.org][accounts]].
+
+Verification with the installed compiler in [[file:../../doc/til-dependency.org][the generated dependency record]]:
+- =./make.til=: library and all clients built using existing OpenSSL staging
+  through CMAKE_PREFIX_PATH and CPATH.
+- =./make.til test=: 23/23 interpreted and 23/23 compiled tests passed. Expanded
+  model coverage verifies fresh ephemeral creation, selection/reset, restart,
+  follow/petname isolation, duplicate/invalid names, unchanged init, init merge
+  conflicts, read/write permission failures, malformed/duplicate/symlink catalogs
+  and preservation of existing secret keys. Process tests race distinct names
+  and the same name, checking both no lost registrations and unique naming.
+- ASan account-model host passed with empty PATH and leak detection enabled.
+- =xvfb-run -a til run --usize=64 -o tmp/gui-create-check -c tmp/gui-create-check.c test/gui_send.til=:
+  real GUI duplicate rejection, account creation/selection, signed follows for
+  the new owner and restart with no init passed; existing send/scroll/switch/
+  npub/petname checks also passed.
+- The same GUI check passed with an ASan host (detect_leaks=0 for the documented
+  Mesa/GLX baseline leak). Native dependencies used normal builds.
+- =git diff --check= and issue summary generation passed.
+
+Add New account to the account picker, usable from an unconfigured ephemeral
+session. Generate/store a fresh keypair, persist the local registration without
+rewriting user init, and select the new account with normal session reset rules.
+Define catalog ownership, init merge/default selection and failure behavior.
+Verify restart discovery, account/follow isolation, concurrent creation and GUI.

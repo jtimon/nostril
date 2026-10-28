@@ -74,11 +74,13 @@ startup_library := proc(opt: Str) {
         binding = format(binding, "til_nostril_x5fstartup__", name, " := ext_proc() returns shallow Str {}\n",
             name, " := proc() returns Str { return til_nostril_x5fstartup__", name, "() }\n")
     }
-    for name : Str in array(Str, "nostril_config_apply", "nostril_account_create") {
+    for name : Str in array(Str, "nostril_config_apply", "nostril_account_create", "nostril_accounts_load") {
         binding = format(binding, "til_nostril_x5fstartup__", name, " := ext_proc(root: Str) returns shallow Str {}\n",
             name, " := proc(root: Str) returns Str { return til_nostril_x5fstartup__", name, "(root) }\n")
     }
     binding = format(binding,
+        "til_nostril_x5fstartup__nostril_account_create_named := ext_proc(root: Str, name: Str) returns shallow Str {}\n",
+        "nostril_account_create_named := proc(root: Str, name: Str) returns Str { return til_nostril_x5fstartup__nostril_account_create_named(root, name) }\n",
         "til_nostril_x5fstartup__nostril_account_petname := ext_proc(pubkey: Str) returns shallow Str {}\n",
         "nostril_account_petname := proc(pubkey: Str) returns Str { return til_nostril_x5fstartup__nostril_account_petname(pubkey) }\n",
         "til_nostril_x5fstartup__nostril_account_author_label := ext_proc(pubkey: Str) returns shallow Str {}\n",

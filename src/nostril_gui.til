@@ -155,6 +155,7 @@ main := proc(args: ..Str) {
     mut follow_input := ""
     mut editing_key := ""
     mut petname_input := ""
+    mut account_input := ""
     mut notice := ""
 
     SetConfigFlags(FLAG_WINDOW_RESIZABLE.cast(U32))
@@ -193,7 +194,9 @@ main := proc(args: ..Str) {
             scroll = 0; notice = ""
         }
         if panel > 0 && clicked && gui_hit(width - 180, 8, 60, 30) {
-            if panel == 3 { panel = 2 } else { panel = 0 }
+            if panel == 3 { panel = 2 }
+            else if panel == 4 { panel = 1 }
+            else { panel = 0 }
             notice = ""
         }
         if panel > 0 {
@@ -216,8 +219,9 @@ main := proc(args: ..Str) {
                 composer = gui_without_last_scalar(composer); composer_scalars--
             } else if panel == 2 { follow_input = gui_without_last_scalar(follow_input) }
             else if panel == 3 { petname_input = gui_without_last_scalar(petname_input) }
+            else if panel == 4 { account_input = gui_without_last_scalar(account_input) }
         }
-        if (panel == 2 || panel == 3) && (IsKeyDown(341) || IsKeyDown(345)) && IsKeyPressed(86) {
+        if (panel == 2 || panel == 3 || panel == 4) && (IsKeyDown(341) || IsKeyDown(345)) && IsKeyPressed(86) {
             ref clipboard : I8 = GetClipboardText()
             if clipboard.is_null() { notice = "Clipboard has no text." }
             else {
@@ -226,9 +230,12 @@ main := proc(args: ..Str) {
                     candidate := pasted.trim().clone()
                     if candidate.len() <= 5006 { follow_input = candidate.clone() }
                     else { notice = "Public identity is too long (maximum 5000 characters plus nostr:)." }
-                } else {
+                } else if panel == 3 {
                     if pasted.len() <= 64 { petname_input = pasted.clone() }
                     else { notice = "Petnames have at most 64 characters." }
+                } else {
+                    if pasted.len() <= 64 { account_input = pasted.clone() }
+                    else { notice = "Local account names have at most 64 UTF-8 bytes." }
                 }
             }
         }
@@ -242,10 +249,17 @@ main := proc(args: ..Str) {
                 } else if panel == 3 && petname_input.len() < 64 && code < 128 {
                     petname_input = format(petname_input, gui_utf8(code.cast(I64)))
                 } else if panel == 3 && code >= 128 { notice = "Use ASCII letters, digits or underscore." }
+                else if panel == 4 {
+                    character := gui_utf8(code.cast(I64))
+                    if account_input.len() + character.len() <= 64 { account_input = format(account_input, character) }
+                }
             }
             code = GetCharPressed()
         }
         if panel == 1 {
+            if clicked && gui_hit(width - 152, 80, 140, 22) {
+                account_input = ""; notice = ""; panel = 4
+            }
             count := nostril_account_count().to_i32()
             visible := (height - 148) / 34
             mut maximum := count - visible
@@ -315,6 +329,15 @@ main := proc(args: ..Str) {
                 error := nostril_account_set_petname(editing_key, petname_input)
                 if error.len() > 0 { notice = error.clone() }
                 else { panel = 2; notice = "Petname saved locally." }
+            }
+        }
+        if panel == 4 && (IsKeyPressed(257) || (clicked && gui_hit(width - 108, 156, 96, 36))) {
+            error := session.create_account(root, account_input)
+            if error.len() > 0 { notice = error.clone() }
+            else {
+                composer = ""; composer_scalars = 0; follow_input = ""
+                editing_key = ""; petname_input = ""; account_input = ""
+                notice = ""; panel = 0; scroll = 0; timeline_scroll = 0
             }
         }
         button_hover := gui_hit(button_x, field_y, button_w, field_h)
@@ -415,9 +438,12 @@ main := proc(args: ..Str) {
         } else {
             BeginScissorMode(margin, header_h + 1, content_w, height - header_h - 2)
             if panel == 1 {
-                DrawText("Switching clears the draft/feed and stops pending retries.".c_str, margin, 84, 12, muted)
+                hint := gui_fitting_head("Switching clears draft/feed and pending retries.", content_w - 152, 12)
+                DrawText(hint.c_str, margin, 84, 12, muted)
+                DrawRectangle(width - 152, 80, 140, 22, action)
+                DrawText("New account".c_str, width - 142, 84, 14, text)
                 if nostril_account_count() == 0 {
-                    DrawText("Register accounts in init.til to switch here.".c_str, margin, 110, 14, muted)
+                    DrawText("No saved accounts. Create one to get started.".c_str, margin, 110, 14, muted)
                 }
                 for index in 0..nostril_account_count() {
                     row_y : I32 = 104 + (index.to_i32() - scroll) * 34
@@ -460,7 +486,7 @@ main := proc(args: ..Str) {
                     DrawRectangle(width - 88, row_y, 76, 28, field)
                     DrawText("Unfollow".c_str, width - 82, row_y + 7, 13, text)
                 }
-            } else {
+            } else if panel == 3 {
                 DrawText("Petname for this public key".c_str, margin, 92, 14, text)
                 DrawRectangle(width - 88, 88, 76, 28, field)
                 DrawText("Copy key".c_str, width - 82, 95, 13, text)
@@ -474,6 +500,18 @@ main := proc(args: ..Str) {
                 DrawRectangle(margin, 212, 96, 30, field)
                 DrawText("Clear name".c_str, margin + 8, 220, 13, text)
                 DrawText("Letters, digits, underscore; names are per account.".c_str, margin, 254, 12, muted)
+            } else {
+                DrawText("Create a new account".c_str, margin, 92, 18, text)
+                DrawText("Local name (up to 64 UTF-8 bytes)".c_str, margin, 132, 13, muted)
+                DrawRectangle(margin, 156, width - 132, 36, field)
+                DrawRectangleLines(margin, 156, width - 132, 36, action)
+                label := gui_fitting_tail(account_input, width - 152, 14)
+                DrawText(label.c_str, margin + 8, 167, 14, text)
+                DrawRectangle(width - 108, 156, 96, 36, action)
+                DrawText("Create".c_str, width - 94, 167, 14, text)
+                hint := gui_fitting_head("Creates a fresh keypair, saves it locally and switches to it.", content_w, 12)
+                DrawText(hint.c_str, margin, 212, 12, muted)
+                DrawText("This name stays on this device; it is not a public profile name.".c_str, margin, 238, 12, muted)
             }
             visible_notice := gui_fitting_head(notice, content_w, 12)
             DrawText(visible_notice.c_str, margin, height - 28, 12, muted)

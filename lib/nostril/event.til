@@ -110,7 +110,8 @@ priv nostril_utf8_width := func(text: Str, at: USize, mut width: USize) returns 
     return true
 }
 
-priv nostril_valid_utf8 := func(text: Str) returns Bool {
+// Shared text validation for event content and application-owned account names.
+nostril_valid_utf8 := func(text: Str) returns Bool {
     mut at : USize = 0
     while at < text.len() {
         mut width : USize = 0

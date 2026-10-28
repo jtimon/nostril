@@ -20,6 +20,8 @@ nostril_load_init := proc(root: Str) returns Str {
         eval_init(vm, path)?
         catch (error: TilVmError) { nostril_config_reset(); return error.to_str() }
     }
+    catalog_error := nostril_accounts_load(root)
+    if catalog_error.len() > 0 { nostril_config_reset(); return catalog_error }
     failure := nostril_config_apply(root)
     if failure.len() > 0 { nostril_config_reset() }
     return failure

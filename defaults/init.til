@@ -5,11 +5,14 @@ mode lib
 // to this file. Nostril interprets init() in-process before opening its window.
 init := proc() {
     nostril_config_relay("")
-    // Create an account with bin/nostril-gui --create-account, then use its
-    // printed public key here. Secret keys never belong in this init file.
+    // The GUI's Account -> New account saves named accounts automatically.
+    // Or use bin/nostril-gui --create-account and register its printed key here.
+    // Secret keys never belong in this init file.
     // nostril_config_account("main", "<64 lowercase hex public key>")
     // nostril_config_select("main")
-    // Register additional accounts here; the GUI's Account picker can switch
-    // between them. Selection above is the initial account on each launch.
+    // The picker combines these registrations with GUI-created accounts.
+    // Selection above is the initial account on each launch, including a
+    // GUI-created name. Without init declarations/selection, the first saved
+    // GUI account is selected automatically.
     // nostril_config_relay("wss://relay.damus.io")
 }

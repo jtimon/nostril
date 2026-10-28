@@ -22,9 +22,11 @@ From the repository root:
 ./bin/nostril-gui
 #+end_src
 
-Without configuration the GUI creates an ephemeral keypair from OS entropy and
-stays local-only. Type into the composer and press Enter or =Send= to create a
-signed NIP-01 kind-1 event. For a stable identity and a following feed, see
+Without saved accounts or configuration the GUI creates an ephemeral keypair from
+OS entropy and stays local-only. Use =Account: → New account= to create a named,
+persistent identity directly in the GUI. Type into the composer and press Enter
+or =Send= to create a signed NIP-01 kind-1 event. For a stable identity and a
+following feed, see
 [[file:doc/accounts.org][accounts and configuration]].
 
 To attach GUI sessions to the local live relay, start it, then run
@@ -99,6 +101,8 @@ key and prints its public key; the init file names/selects accounts and relays.
 =--follow= and =--unfollow= persist the selected account's signed follow list.
 The GUI's =Account:= picker switches between registered accounts; =Following=
 adds/removes follows for the active account and updates its feed immediately.
+=New account= creates and selects a fresh keypair and saves its local name for
+future launches, without editing =init.til=.
 Use =Name= beside a follow to assign a per-account NIP-02 petname. Your names
 are the primary feed labels; public keys remain visible and can be copied.
 The =Copy npub= button copies your public identity. Follow input accepts hex,

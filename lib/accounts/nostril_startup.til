@@ -2,6 +2,7 @@ mode lib
 import("../nostril/event")
 import("../nostril/nip19")
 import("std/sys")
+import("std/file")
 link_c("store.c")
 
 nostril_store_directory := ext_proc(path: I8, shallow create: Bool) returns shallow I32 {}
@@ -115,6 +116,106 @@ nostril_account_create := proc(root: Str) returns Str {
     code = nostril_store_write(handle, "secret.key".c_str, bytes, true)
     nostril_store_unlock(handle)
     if code != 0 { return storage_error("create secret key", code) }
+    return pubkey
+}
+
+priv catalog_name_valid := func(name: Str) returns Bool {
+    if name.len() == 0 || name.len() > 64 || name != name.trim() || !nostril_valid_utf8(name) { return false }
+    for byte : I8 in name { if byte.cast(U8) < 32 || byte.cast(U8) == 127 { return false } }
+    return true
+}
+
+// Private versioned metadata, not executable Til. All catalog operations hold
+// accounts/.lock, including read-modify-write for concurrent creators.
+priv read_catalog := proc(handle: Dynamic, mut entries: Vec(AccountSpec)) returns Str {
+    mut code : I32 = 0
+    bytes := nostril_store_read(handle, "catalog.tsv".c_str, code)
+    if code == -1 { return "" }
+    if code != 0 { return storage_error("read account catalog", code) }
+    if !bytes.starts_with("nostril-accounts-v1\n") || !bytes.ends_with("\n") { return "invalid account catalog" }
+    lines := bytes.split("\n")
+    // Skip the format header and terminal empty line; row order is the default.
+    for index in 1..(lines.len() - 1) {
+        fields := lines[index].split("\t")
+        if fields.len() != 2 || !nostril_key_encoding(fields[0]) || !catalog_name_valid(fields[1]) {
+            return "invalid account catalog entry"
+        }
+        for entry : AccountSpec in entries {
+            if entry.name == fields[1] || entry.pubkey == fields[0] { return "duplicate account catalog entry" }
+        }
+        if entries.len() >= 256 { return "account catalog limit is 256" }
+        entries.push(own AccountSpec(name = fields[1].clone(), pubkey = fields[0].clone()))
+    }
+    return ""
+}
+
+/// Merge durable GUI registrations with init declarations. Identical pairs
+/// coalesce; a name bound to different keys is an error, never an override.
+nostril_accounts_load := proc(root: Str) returns Str {
+    if root.len() == 0 || !File.exists(format(root, "/accounts")) { return "" }
+    for path : Str in array(Str, root, format(root, "/accounts")) {
+        error := nostril_store_directory(path.c_str, false)
+        if error != 0 { return storage_error("account catalog directory (must be owner-only)", error) }
+    }
+    mut code : I32 = 0
+    directory := format(root, "/accounts")
+    ref handle : Dynamic = nostril_store_lock(directory.c_str, code)
+    if handle.is_null() { return storage_error("account catalog lock", code) }
+    mut entries := Vec(AccountSpec).new()
+    error := read_catalog(handle, entries)
+    nostril_store_unlock(handle)
+    if error.len() > 0 { return error }
+    for entry : AccountSpec in entries {
+        for account : AccountSpec in accounts {
+            if account.name == entry.name && account.pubkey != entry.pubkey { return "account catalog name conflicts with init: choose a different local name" }
+        }
+    }
+    initial := accounts.len() == 0 && selected.len() == 0
+    for entry : AccountSpec in entries {
+        mut exists := false
+        for account : AccountSpec in accounts { if account.name == entry.name { exists = true } }
+        if !exists { accounts.push(own entry.clone()) }
+    }
+    if initial && entries.len() > 0 { selected = entries[0].name.clone() }
+    return ""
+}
+
+/// Returns a public hex key on success, otherwise an owned diagnostic. Complete
+/// registration is published only after the secret and catalog are durable.
+nostril_account_create_named := proc(root: Str, name: Str) returns Str {
+    if !catalog_name_valid(name) { return "Use a local name of 1..64 UTF-8 bytes, without surrounding whitespace or ASCII control characters." }
+    for account : AccountSpec in accounts { if account.name == name { return "An account with this local name already exists." } }
+    // Create/check only the shared private directory before taking its lock.
+    if root.len() == 0 { return "persistent accounts need an absolute XDG_CONFIG_HOME or HOME" }
+    slash := root.rfind("/")
+    if slash > 0 {
+        code := mkdir_p(root.substr(0, slash.to_usize()))
+        if code != 0 { return storage_error("configuration parent directory", code) }
+    }
+    directory := format(root, "/accounts")
+    for path : Str in array(Str, root, directory) {
+        error := nostril_store_directory(path.c_str, true)
+        if error != 0 { return storage_error("account catalog directory (must be owner-only)", error) }
+    }
+    mut code : I32 = 0
+    ref handle : Dynamic = nostril_store_lock(directory.c_str, code)
+    if handle.is_null() { return storage_error("account catalog lock", code) }
+    mut entries := Vec(AccountSpec).new()
+    error := read_catalog(handle, entries)
+    if error.len() > 0 { nostril_store_unlock(handle); return error }
+    for entry : AccountSpec in entries {
+        if entry.name == name { nostril_store_unlock(handle); return "An account with this local name already exists." }
+    }
+    if entries.len() >= 256 { nostril_store_unlock(handle); return "account catalog limit is 256" }
+    pubkey := nostril_account_create(root)
+    if !nostril_key_encoding(pubkey) { nostril_store_unlock(handle); return pubkey }
+    entries.push(own AccountSpec(name = name.clone(), pubkey = pubkey.clone()))
+    mut bytes := "nostril-accounts-v1\n"
+    for entry : AccountSpec in entries { bytes = format(bytes, entry.pubkey, "\t", entry.name, "\n") }
+    code = nostril_store_write(handle, "catalog.tsv".c_str, bytes, false)
+    nostril_store_unlock(handle)
+    if code != 0 { return format(storage_error("save account catalog", code), "; generated key retained at accounts/", pubkey, "/secret.key") }
+    accounts.push(own AccountSpec(name = name.clone(), pubkey = pubkey.clone()))
     return pubkey
 }
 

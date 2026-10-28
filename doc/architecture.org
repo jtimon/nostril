@@ -80,8 +80,11 @@ User configuration follows Tiled's TilVm/shared-library pattern. The GUI and
 interpreted XDG init (default =~/.config/nostril/init.til=) share
 =libnostril_startup.so= through the host API prelude; init stages
 account declarations, selection and relay preference, then the host validates
-and adopts the selected account. Secret keys remain in the compiled account
-owner. Signed follow files are locked and atomically replaced. Both transports
+and merges the application-owned account catalog before adopting the selected
+account. GUI creation persists a local name/key registration under the catalog
+lock and selects the new identity through the same session-reset path. Secret
+keys remain in the compiled account owner. Signed follow files are locked and
+atomically replaced. Both transports
 receive the same self-plus-follows request and recheck that filter locally.
 See [[file:accounts.org][accounts and configuration]] for the API and storage contracts.
 

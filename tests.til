@@ -57,6 +57,37 @@ test_nip19_public_keys := test() {
     }
 }
 
+test_account_catalog_processes := test() {
+    home := format("tmp/account-catalog-", process_id().to_str())
+    if File.exists(home) { File.remove_tree(home) }
+    first := Cmd.new("bin/nostril-account-tests", home, "First")
+    second := Cmd.new("bin/nostril-account-tests", home, "Second")
+    first.env("PATH", "").capture(); second.env("PATH", "").capture()
+    first.start(); second.start()
+    assert(first.wait() == 0 && second.wait() == 0)
+    first_output := first.out(); second_output := second.out()
+    first_key := first_output.trim().clone(); second_key := second_output.trim().clone()
+    assert(nostril_key_encoding(first_key) && nostril_key_encoding(second_key) && first_key != second_key)
+    catalog_path := format(home, "/.config/nostril/accounts/catalog.tsv")
+    catalog := File.readfile(catalog_path)
+    assert(catalog.contains(format(first_key, "\tFirst\n")) && catalog.contains(format(second_key, "\tSecond\n")))
+    assert(catalog.split("\n").len() == 4)
+    assert(!File.exists(format(home, "/.config/nostril/init.til")))
+    racing_first := Cmd.new("bin/nostril-account-tests", home, "Shared")
+    racing_second := Cmd.new("bin/nostril-account-tests", home, "Shared")
+    racing_first.env("PATH", "").capture(); racing_second.env("PATH", "").capture()
+    racing_first.start(); racing_second.start()
+    a := racing_first.wait(); b := racing_second.wait()
+    assert((a == 0 && b != 0) || (a != 0 && b == 0))
+    updated := File.readfile(catalog_path)
+    assert(updated.split("\n").len() == 5)
+    assert(updated.contains(format(first_key, "\tFirst\n")) && updated.contains(format(second_key, "\tSecond\n")))
+    for key : Str in array(Str, first_key, second_key) {
+        assert(File.is_file(format(home, "/.config/nostril/accounts/", key, "/secret.key")))
+    }
+    File.remove_tree(home)
+}
+
 test_account_process := test() {
     home := format("tmp/account-test-", process_id().to_str())
     if File.exists(home) { File.remove_tree(home) }
@@ -105,7 +136,7 @@ test_account_process := test() {
     remaining := File.readfile(format(home, "/.config/nostril/accounts/", account, "/follows.json"))
     assert(!remaining.contains(target) && remaining.contains(third))
     permission_check := Cmd.new("python3", "-c",
-        "import os,stat,sys\nroot=sys.argv[1]+'/.config/nostril'\nassert stat.S_IMODE(os.stat(root).st_mode)==0o700\na=root+'/accounts'\nassert stat.S_IMODE(os.stat(a).st_mode)==0o700\nfor name in os.listdir(a):\n    p=a+'/'+name\n    assert stat.S_IMODE(os.stat(p).st_mode)==0o700\n    for f in os.listdir(p):\n        assert stat.S_IMODE(os.stat(p+'/'+f).st_mode)==0o600\n",
+        "import os,stat,sys\nroot=sys.argv[1]+'/.config/nostril'\nassert stat.S_IMODE(os.stat(root).st_mode)==0o700\nfor p,dirs,files in os.walk(root+'/accounts'):\n    assert stat.S_IMODE(os.stat(p).st_mode)==0o700\n    for f in files:\n        assert stat.S_IMODE(os.stat(p+'/'+f).st_mode)==0o600\n",
         home)
     permission_check.run_checked()
 

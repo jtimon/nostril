@@ -4,7 +4,27 @@
 
 ** Create and select an account
 
-From the repository root, after building:
+After building, launch =./bin/nostril-gui=, open =Account:=, then =New account=.
+Enter a local name and click =Create= or press Enter. Nostril generates a fresh
+keypair, saves it in the selected configuration directory, registers the name
+and switches to it. This works from the initial ephemeral session with no init
+file. =Back= cancels without creating anything. Duplicate names show an error
+and preserve the current account/session.
+
+GUI names are case-sensitive, 1..64 UTF-8 bytes, without surrounding whitespace
+or ASCII control characters. The name is a device-local alias, not published Nostr
+profile metadata. Follows and petnames start empty and remain account-specific.
+
+GUI registrations persist in =accounts/catalog.tsv=; user-authored =init.til=
+is never rewritten. On launch, init declarations and catalog entries are merged:
+identical name/key pairs coalesce; one name mapped to different keys stops
+startup. An explicit =nostril_config_select= wins, including selection of a
+catalog account without redeclaring it. With no init registrations or selection,
+the first catalog entry is the default. A manual switch lasts for that process;
+the next launch returns to the startup selection. Other processes' newly created
+registrations appear after restarting.
+
+The command-line key-generation/configuration route remains available:
 
 #+begin_src sh
 ./bin/nostril-gui --create-account
@@ -25,12 +45,11 @@ init := proc() {
 }
 #+end_src
 
-Register additional local accounts with distinct names and public keys. Select
-the initial account in init. Click the =Account:= button in the GUI and choose
-another registered account to switch immediately. The selection lasts for that
-process; the next launch uses init again. Creating/registering accounts still
-uses =--create-account= and init.
-Names here are local aliases, not published Nostr profile metadata.
+The bare =--create-account= command generates only a keypair and prints its hex
+public key; it does not create a named catalog registration. Register that key
+in init as shown, or create a named account directly in the GUI. Click =Account:=
+to switch between accounts from either source. Explicit init registrations
+without a startup selection still require =nostril_config_select=.
 The CLI =--relay [endpoint]= overrides the configured relay for that launch.
 An empty configured relay keeps the GUI local-only. =--version= bypasses init.
 
@@ -41,8 +60,9 @@ loaded. A missing file does not trigger a fallback search; an invalid file stops
 startup. There is no current-directory or legacy =~/.nostril/init.til= search.
 The shell example above assumes XDG_CONFIG_HOME is unset or absolute.
 
-Without registrations the GUI retains an explicitly labelled,
-session-only ephemeral identity; it never silently selects a key from disk.
+Without init or catalog registrations the GUI retains an explicitly labelled,
+session-only ephemeral identity; it never discovers identities by scanning key
+directories. The catalog is an explicit durable registration, not key discovery.
 Missing, corrupt, mismatched or permissive key files for a selected account
 stop startup instead of generating a replacement identity.
 
@@ -65,7 +85,7 @@ Each account owns its own =follows.json=. GUI edits persist immediately, refresh
 the live subscription, and remove notes that no longer match. Other accounts'
 lists are not edited. The composer is inactive while either panel is open.
 
-The headless commands remain available, using the account selected in init:
+The headless commands remain available, using the same startup selection:
 
 #+begin_src sh
 ./bin/nostril-gui --follow <hex-key-or-npub-or-nprofile>
@@ -161,6 +181,8 @@ supports up to 512 follow tags.
 
 #+begin_example
 ~/.config/nostril/init.til
+~/.config/nostril/accounts/catalog.tsv
+~/.config/nostril/accounts/.lock
 ~/.config/nostril/accounts/<public-key>/secret.key
 ~/.config/nostril/accounts/<public-key>/follows.json
 ~/.config/nostril/accounts/<public-key>/.lock
@@ -179,6 +201,20 @@ was created with broader permissions, explicitly correct its mode to 0700.
 The shared parent (normally =~/.config=) need not be owner-only.
 The store rejects symlinks at account directory/file boundaries and nonregular
 files. This implementation targets the project's existing Linux/POSIX build.
+
+The versioned catalog starts with =nostril-accounts-v1= and contains one
+=<hex-key><TAB><local-name>= row per named GUI account, with a final newline.
+It holds public metadata only, with at most 256 entries, and is owner-only like
+the keys. The native account owner validates the complete catalog before merging
+registrations. Malformed, duplicate, symlink or permissive catalogs stop loading
+rather than being overwritten. New registrations lock =accounts/.lock=, reread
+the catalog, create a key exclusively, then atomically replace and sync the
+catalog. Concurrent creators cannot overwrite each other's registrations.
+If key creation succeeds but catalog saving fails, the error identifies the
+retained key directory; it is never silently deleted/replaced. A post-rename sync
+error can leave the complete catalog visible even when the operation reports
+failure, as with follow-list writes. Existing active state is retained on a
+creation failure; a successful GUI creation uses the ordinary switch/reset path.
 
 Keys are plaintext by explicit choice for this first slice; permissions do not
 encrypt them. Encryption/keyring support and migration are tracked in
@@ -215,6 +251,13 @@ failure). The native owner retains registrations and validates before replacing
 active state; GUI code receives no secret keys. These are prototype APIs, not a
 new NIP or a stable external ABI. =src/account_feed.til= owns the active GUI
 transport handles, timeline and retry queue, with explicit open/close lifetime.
+
+The generated bridge exposes =nostril_accounts_load(root)= (merge catalog after
+init, owned error or empty) and =nostril_account_create_named(root, name)=
+(owned public hex key or diagnostic). The shared native owner handles metadata,
+locks and secret storage. =AccountFeed.create_account= invokes creation, then
+the existing validated switch. GUI code receives no secret and never writes
+the catalog or init. Text validation reuses the protocol layer's UTF-8 validator.
 
 Petname edits use =nostril_account_set_petname(pubkey, name)=, returning an owned
 diagnostic or empty on success. It locks and rereads the latest signed list,
