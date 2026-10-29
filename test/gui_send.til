@@ -90,6 +90,11 @@ paste := proc(display: Dynamic) {
     XTestFakeKeyEvent(display, control, 0, 0); XFlush(display); sleep_ms(150)
 }
 
+scalar_key := proc(display: Dynamic, keycode: U32) {
+    XTestFakeKeyEvent(display, keycode, 1, 0); XFlush(display); sleep_ms(25)
+    XTestFakeKeyEvent(display, keycode, 0, 0); XFlush(display); sleep_ms(25)
+}
+
 main := proc(args: ..Str) {
     if args.len() > 1 { panic("usage: gui_send [gui-binary]") }
     mut executable := "bin/nostril-gui"
@@ -143,6 +148,18 @@ main := proc(args: ..Str) {
     if XGetGeometry(display, window, root, x, y, width, height, border, depth) == 0 { panic("missing GUI geometry") }
     ref empty : Dynamic = XGetImage(display, window, 22, height.cast(I32) - 38, 180, 24, 0xffffff, 2)
     if empty.is_null() { panic("could not capture empty composer") }
+    // Remap only this driver's private Xvfb, with a live display connection so
+    // the mapping survives. Actual GLFW character callbacks deliver the input.
+    Cmd.new("xmodmap", "-e", "keycode 200 = U00E9", "-e", "keycode 201 = U754C", "-e", "keycode 202 = U0301",
+        "-e", "keycode 203 = U1F469", "-e", "keycode 204 = U200D", "-e", "keycode 205 = U1F4BB").run_checked()
+    key(display, 'e'); scalar_key(display, 202)
+    assert(!composer_is_empty(display, window, height, empty))
+    key(display, 0xff08)
+    assert(composer_is_empty(display, window, height, empty))
+    scalar_key(display, 203); scalar_key(display, 204); scalar_key(display, 205)
+    assert(!composer_is_empty(display, window, height, empty))
+    key(display, 0xff08)
+    assert(composer_is_empty(display, window, height, empty))
     for character : I8 in "first message" { key(display, character.cast(U8).cast(UPtr)) }
     if composer_is_empty(display, window, height, empty) { panic("typing did not reach the composer") }
     mut root_x : I32 = 0
@@ -268,7 +285,10 @@ main := proc(args: ..Str) {
     catalog_path := format(home, "/.config/nostril/accounts/catalog.tsv")
     assert(!File.exists(catalog_path))
     for _index in 0..8 { key(display, 0xff08) }
-    for character : I8 in "fresh" { key(display, character.cast(U8).cast(UPtr)) }
+    for character : I8 in "caf" { key(display, character.cast(U8).cast(UPtr)) }
+    scalar_key(display, 200); scalar_key(display, 202)
+    key(display, 0xff08) // Remove the whole accented cluster, not just its mark.
+    scalar_key(display, 201)
     click(display, window, width.cast(I32) - 60, 174)
     assert(composer_is_empty(display, window, height, empty))
     catalog := File.readfile(catalog_path)
@@ -277,7 +297,7 @@ main := proc(args: ..Str) {
     fields := lines[1].split("\t")
     assert(fields.len() == 2)
     fresh := fields[0].clone()
-    assert(fields[1] == "fresh" && nostril_key_encoding(fresh))
+    assert(fields[1] == "caf界" && nostril_key_encoding(fresh))
     assert(fresh != pubkey && fresh != second)
     assert(File.readfile(format(home, "/.config/nostril/init.til")) == configured)
     click(display, window, width.cast(I32) - 60, 24)
@@ -314,5 +334,5 @@ main := proc(args: ..Str) {
     if restarted.wait() != 0 { panic("restarted GUI failed: ", restarted.out(), restarted.err()) }
     XCloseDisplay(display)
     File.remove_tree(home)
-    println("GUI sending, switching, follows/petnames, npub copy/paste and account creation/restart passed")
+    println("GUI Unicode/grapheme editing, sending, identity controls and account creation/restart passed")
 }

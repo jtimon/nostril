@@ -1,0 +1,49 @@
+# priority: medium
+# category: cleanups
+** FIXED #11 Adopt installed Til UTF-8 and grapheme APIs
+
+Resolution: core Str.from_codepoint/read_utf8/is_valid_utf8 now own Unicode
+encoding, strict JSON decoding and validation. Removed Nostril's duplicate
+UTF-8 encoder/decoder implementations. The existing public validation wrapper
+delegates to core, including account-name checks. No text normalization occurs;
+malformed reads are rejected rather than repaired with U+FFFD.
+
+GUI Backspace and width/status clipping now use std/unicode's extended grapheme
+boundaries, following Tiled. The composer retains its 280-scalar budget and
+recounts after deleting a multi-scalar cluster. Protocol subscription IDs retain
+64-scalar limits; account names retain byte limits. ASCII petname/Bech32 contracts
+remain unchanged. [[file:../../doc/unicode.org][Unicode documentation]] covers boundaries, exact-byte signing,
+font/IME limitations and SDK ownership of Unicode data/notices.
+
+The new compiler's ownership checker also rejected direct WsOwner construction
+followed by transfer into its registry: it traced the owned child allocation as
+used after its constructor consumed it. Explicitly naming the child did not
+resolve that diagnostic. A dedicated WsOwner.new constructor scopes the child
+transfer and returns one complete owner, retaining heap-stable callback state
+without cloning native handles. A reduced constructor/registry probe passed
+under ASan; this is an explicit construction boundary, not a compiler fix.
+
+Verification with the installed compiler recorded in [[file:../../doc/til-dependency.org][the generated dependency record]]:
+- =./make.til=: full library/CLI/relay/GUI build passed using existing OpenSSL
+  staging through CMAKE_PREFIX_PATH and CPATH.
+- =./make.til test=: 24/24 interpreted and 24/24 compiled tests. New Unicode
+  integration checks include combining/Indic/emoji/flag deletion and clipping,
+  scalar recounting, unchanged subscription limits, surrogate-pair JSON, embedded
+  NUL, normalization-distinct event IDs, and malformed UTF-8 events with otherwise
+  matching hashes/signatures. WebSocket callback/registry coverage also passes.
+- ASan compiled test host: 24/24 passed with leak detection enabled. Native
+  dependencies were normal builds, not separately instrumented vendors.
+- =xvfb-run -a til run --usize=64 -o tmp/unicode-gui-check -c tmp/unicode-gui-check.c test/gui_send.til=:
+  real GLFW combining/ZWJ input is deleted with one Backspace; Unicode local-name
+  editing persists exact catalog bytes and survives restart. Existing send,
+  scrolling, npub, petname, follow and account checks also passed.
+- The same GUI check passed with an ASan host (detect_leaks=0 for the documented
+  Mesa/GLX baseline leak). X11 remapping follows Tiled's private-Xvfb test pattern.
+- =git diff --check= and issue summary generation passed. Tiled's concurrent
+  checkout work was inspected read-only and preserved.
+
+Follow Tiled's use of core Str encoding/decoding/validation and std/unicode
+grapheme boundaries. Remove duplicate UTF-8 implementations; preserve strict
+JSON rejection, signed bytes and scalar-based protocol/composer limits. Make
+GUI Backspace and clipping respect graphemes, including local account names.
+Verify Unicode input, combining/emoji deletion and malformed protocol text.

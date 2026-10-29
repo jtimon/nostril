@@ -29,6 +29,9 @@ or =Send= to create a signed NIP-01 kind-1 event. For a stable identity and a
 following feed, see
 [[file:doc/accounts.org][accounts and configuration]].
 
+Text input uses Til's Unicode/grapheme APIs: Backspace removes whole combining
+and emoji sequences. See [[file:doc/unicode.org][Unicode handling]] for editing, limits and font coverage.
+
 To attach GUI sessions to the local live relay, start it, then run
 two GUI instances from separate terminals in this repository:
 

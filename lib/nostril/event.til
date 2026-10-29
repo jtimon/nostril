@@ -29,26 +29,6 @@ priv NostrEventFields := struct {
     has_sig := false
 }
 
-priv nostril_utf8 := func(code: I64) returns Str {
-    if code < 0 || code > 0x10ffff || (code >= 0xd800 && code <= 0xdfff) {
-        return ""
-    }
-    if code < 128 { return Str.from_byte(code.to_u8()) }
-    if code < 2048 {
-        return format(Str.from_byte((192 + code / 64).to_u8()),
-            Str.from_byte((128 + code.mod(64)).to_u8()))
-    }
-    if code < 65536 {
-        return format(Str.from_byte((224 + code / 4096).to_u8()),
-            Str.from_byte((128 + (code / 64).mod(64)).to_u8()),
-            Str.from_byte((128 + code.mod(64)).to_u8()))
-    }
-    return format(Str.from_byte((240 + code / 262144).to_u8()),
-        Str.from_byte((128 + (code / 4096).mod(64)).to_u8()),
-        Str.from_byte((128 + (code / 64).mod(64)).to_u8()),
-        Str.from_byte((128 + code.mod(64)).to_u8()))
-}
-
 priv json_skip_ws := func(mut cursor: JsonCursor) {
     while cursor.at < cursor.text.len() {
         ref byte : I8 = cursor.text[cursor.at]
@@ -84,50 +64,18 @@ priv json_hex_quad := func(mut cursor: JsonCursor, mut value: I64) returns Bool 
     return true
 }
 
-priv nostril_utf8_width := func(text: Str, at: USize, mut width: USize) returns Bool {
-    if at >= text.len() { return false }
-    first := text[at].cast(U8).to_i64()
-    if first < 0x80 { width = 1; return true }
-    mut wanted : USize = 0
-    if first >= 0xc2 && first <= 0xdf { wanted = 2 }
-    else if first >= 0xe0 && first <= 0xef { wanted = 3 }
-    else if first >= 0xf0 && first <= 0xf4 { wanted = 4 }
-    else { return false }
-    if at + wanted > text.len() { return false }
-    second := text[at + 1].cast(U8).to_i64()
-    if second < 0x80 || second > 0xbf { return false }
-    if first == 0xe0 && second < 0xa0 { return false }
-    if first == 0xed && second > 0x9f { return false }
-    if first == 0xf0 && second < 0x90 { return false }
-    if first == 0xf4 && second > 0x8f { return false }
-    mut i : USize = 2
-    while i < wanted {
-        continuation := text[at + i].cast(U8).to_i64()
-        if continuation < 0x80 || continuation > 0xbf { return false }
-        i++
-    }
-    width = wanted
-    return true
-}
-
 // Shared text validation for event content and application-owned account names.
 nostril_valid_utf8 := func(text: Str) returns Bool {
-    mut at : USize = 0
-    while at < text.len() {
-        mut width : USize = 0
-        if !nostril_utf8_width(text, at, width) { return false }
-        at = at + width
-    }
-    return true
+    return text.is_valid_utf8()
 }
 
 priv nostril_utf8_scalars := func(text: Str) returns USize {
     mut at : USize = 0
     mut count : USize = 0
     while at < text.len() {
-        mut width : USize = 0
-        if !nostril_utf8_width(text, at, width) { return 0 }
-        at = at + width
+        scalar := text.read_utf8(at)
+        if !scalar.valid { return 0 }
+        at = scalar.end
         count++
     }
     return count
@@ -157,10 +105,10 @@ priv json_parse_string := func(mut cursor: JsonCursor, mut out: Str) returns Boo
         if byte.cast(U8).to_i64() < 0x20 { return false }
         if byte != '\\' {
             start := cursor.at - 1
-            mut width : USize = 0
-            if !nostril_utf8_width(cursor.text, start, width) { return false }
-            decoded.push_str(cursor.text.substr(start, width))
-            cursor.at = start + width
+            scalar := cursor.text.read_utf8(start)
+            if !scalar.valid { return false }
+            decoded.push_str(cursor.text.substr(start, scalar.end - start))
+            cursor.at = scalar.end
             continue
         }
         if cursor.at >= cursor.text.len() { return false }
@@ -186,7 +134,7 @@ priv json_parse_string := func(mut cursor: JsonCursor, mut out: Str) returns Boo
                 if !json_hex_quad(cursor, low) || low < 0xdc00 || low > 0xdfff { return false }
                 code = 0x10000 + (code - 0xd800) * 1024 + low - 0xdc00
             } else if code >= 0xdc00 && code <= 0xdfff { return false }
-            decoded.push_str(nostril_utf8(code))
+            decoded.push_str(Str.from_codepoint(code))
         } else { return false }
     }
     return false

@@ -1,0 +1,62 @@
+* Unicode text handling
+
+[[file:../README.org][Nostril]] | [[file:accounts.org][Accounts]] | [[file:til-dependency.org][Installed compiler]]
+
+Nostril follows Tiled's use of the installed Til SDK's Unicode primitives.
+Core =Str.from_codepoint= encodes scalar input; =Str.read_utf8= decodes without
+rewriting bytes; =Str.is_valid_utf8= checks validity. =std/unicode= supplies
+Unicode 17.0 extended grapheme boundaries (UAX #29). Nostril does not maintain
+its own UTF-8 decoder, encoder or Unicode property tables.
+
+** Editing and display boundaries
+
+Backspace removes one extended grapheme cluster from the end of the composer
+or local account name, so a base plus combining marks, regional-indicator flag,
+skin-tone sequence or ZWJ emoji is deleted together. The ASCII follow/petname
+fields use the same helper. Width fitting and status truncation also preserve
+grapheme boundaries instead of leaving a detached mark or half an emoji sequence.
+
+The composer's existing =280= budget counts Unicode scalars, not bytes or
+graphemes. A grapheme can contain multiple scalars; after Backspace the scalar
+count is recomputed. This remains a prototype UI limit, not a Nostr protocol
+limit. Account names retain their 64-byte UTF-8 storage limit. Petnames retain
+NIP-02's ASCII resolution spelling and NIP-19 inputs retain Bech32's ASCII rules.
+
+=src/text_input.til= provides pure owned-string helpers for grapheme deletion
+and status clipping plus scalar counting. The GUI uses =grapheme_next= on the
+original text when dropping a leading cluster, retaining context-sensitive
+boundaries such as regional-indicator pairing.
+
+These are text/input improvements. The GUI still uses raylib's default font;
+glyph coverage, font selection, complex shaping, bidi layout and IME composition
+are separate rendering/input work. Accepting and preserving Unicode does not
+guarantee every character is rendered by that font.
+
+** Protocol and storage
+
+JSON strings are decoded with core =read_utf8= and invalid reads are rejected.
+The decoder's U+FFFD recovery value is not substituted for malformed input.
+Escaped surrogate pairs are checked before =from_codepoint= is called; isolated
+surrogates remain invalid. Embedded NUL is valid text and is JSON-escaped, even
+though NUL-terminated native display APIs cannot display its following bytes.
+
+Content is never normalized. Precomposed and decomposed text can look alike but
+have different signed bytes and event IDs. NIP-01 subscription IDs retain the
+64-scalar bound, not a 64-grapheme bound. Public library
+=nostril_valid_utf8= retains its existing name and delegates to the core method,
+including for catalog account-name validation.
+
+** Verification
+
+=test_unicode_text= covers grapheme deletion/clipping, scalar recounting and
+limits, combining/Indic/flag/emoji sequences, raw Unicode versus escaped JSON,
+embedded NUL, normalization-distinct event IDs and malformed UTF-8 events with
+otherwise matching signatures/IDs. Existing protocol tests retain surrogate and
+subscription-length rejection coverage.
+
+The X11 GUI check remaps keys only on its private Xvfb display, following Tiled's
+test pattern. Real GLFW character callbacks deliver accents, combining marks,
+CJK and ZWJ emoji. Pixel checks verify whole-cluster deletion; the account
+creation/restart check verifies exact Unicode bytes persisted to the catalog.
+The SDK owns Unicode data, its license and conformance tests; a future runtime
+bundle must carry the matching SDK and its notices as Tiled's installer does.

@@ -1,0 +1,26 @@
+mode lib
+import("std/unicode")
+
+// GUI input uses grapheme boundaries for editing, but retains the prototype's
+// 280-scalar composer budget. All offsets and account-name limits stay bytes.
+text_scalar_count := func(text: Str) returns USize {
+    mut at : USize = 0
+    mut count : USize = 0
+    while at < text.len() {
+        scalar := text.read_utf8(at)
+        if !scalar.valid { return 0 }
+        at = scalar.end
+        count++
+    }
+    return count
+}
+
+text_without_last_grapheme := func(text: Str) returns Str {
+    if text.len() == 0 { return "" }
+    return text.substr(0, grapheme_previous(text, text.len())).clone()
+}
+
+text_status_prefix := func(text: Str, budget: USize) returns Str {
+    if text.len() <= budget { return text.clone() }
+    return format(text.substr(0, grapheme_floor(text, budget)), "...")
+}

@@ -7,8 +7,54 @@ _nostril_test_nng := import("lib/modes/nostril_nng")
 import("lib/modes/nostril_live")
 import("gen/websocket_api")
 import("src/account_feed")
+import("src/text_input")
 
 realpath_str := ext_proc(path: Str) returns Str {}
+
+test_unicode_text := test() {
+    // Application behavior using Til's Unicode 17 grapheme implementation.
+    for cluster : Str in array(Str, "é", "👩‍💻", "🇺🇸", "👍🏽", "क्ष") {
+        text := format("prefix", cluster)
+        assert(text_without_last_grapheme(text) == "prefix")
+        assert(text_status_prefix(text, text.len() - 1) == "prefix...")
+    }
+    assert(text_without_last_grapheme("") == "")
+    assert(text_scalar_count("é界é👩‍💻") == 7)
+    assert(text_scalar_count(text_without_last_grapheme("é界é👩‍💻")) == 4)
+    assert(text_status_prefix("é界", 1) == "...")
+    assert(text_status_prefix("é界", 2) == "é...")
+    assert(text_status_prefix("é界", 5) == "é界")
+    assert(text_status_prefix("é", 1) == "...")
+    budget := repeat_text("é", 140)
+    assert(text_scalar_count(budget) == 280)
+    assert(text_scalar_count(text_without_last_grapheme(budget)) == 278)
+    content := format("é界é👩‍💻🇺🇸", Str.from_byte(0))
+    unicode_event := nostril_sign_text_note(TEST_SECRET_KEY, content, 1700006000)
+    assert(nostril_event_is_valid(unicode_event) && nostril_event_content(unicode_event) == content)
+    escaped := unicode_event.replace("👩‍💻", "\\uD83D\\uDC69\\u200D\\uD83D\\uDCBB")
+    assert(nostril_event_is_valid(escaped) && nostril_event_content(escaped) == content)
+    composed := nostril_sign_text_note(TEST_SECRET_KEY, "é", 1700006001)
+    decomposed := nostril_sign_text_note(TEST_SECRET_KEY, "é", 1700006001)
+    assert(nostril_event_id(composed) != nostril_event_id(decomposed))
+    assert(nostril_relay_event_is_valid(relay_event_for(unicode_event, repeat_text("é", 32))))
+    assert(!nostril_relay_event_is_valid(relay_event_for(unicode_event, repeat_text("é", 33))))
+    // Even with a matching hash/signature, malformed UTF-8 must be rejected,
+    // never replaced by the decoder's U+FFFD recovery value.
+    author := nostril_pubkey(TEST_SECRET_KEY)
+    for malformed : Str in array(Str, Str.from_byte(0x80), Str.from_byte(0xff),
+            format(Str.from_byte(0xc0), Str.from_byte(0xaf)),
+            format(Str.from_byte(0xed), Str.from_byte(0xa0), Str.from_byte(0x80)),
+            format(Str.from_byte(0xe2), Str.from_byte(0x82)),
+            format(Str.from_byte(0xf4), Str.from_byte(0x90), Str.from_byte(0x80), Str.from_byte(0x80))) {
+        assert(!malformed.is_valid_utf8())
+        digest := crypto.sha256_str(format("[0,\"", author, "\",1700006002,1,[],\"", malformed, "\"]"))
+        signature := crypto.schnorr_sign(U256.from_hex(TEST_SECRET_KEY), digest, U256())!
+        event := format("{\"id\":\"", digest.to_hex(), "\",\"pubkey\":\"", author,
+            "\",\"created_at\":1700006002,\"kind\":1,\"tags\":[],\"content\":\"", malformed, "\",\"sig\":\"", signature.to_hex(), "\"}")
+        assert(!nostril_event_is_valid(event))
+        assert(!nostril_relay_event_is_valid(nostril_live_envelope(event)))
+    }
+}
 
 test_nip19_public_keys := test() {
     // Published NIP-19 vectors, including nprofile's two relay hints.

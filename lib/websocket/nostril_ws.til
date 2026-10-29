@@ -51,7 +51,13 @@ priv WsSession := struct {
 }
 
 // A heap-owned field keeps callback userdata stable when the map grows.
-priv WsOwner := struct { own state := WsSession() }
+priv WsOwner := struct {
+    own state : WsSession
+namespace:
+    // Keep construction/transfer of the owned subtree in its own scope. The
+    // caller receives one owner; neither the state nor native handles are copied.
+    new := func() returns WsOwner { return WsOwner(state = WsSession()) }
+}
 priv mut sessions := Map(I64, WsOwner).new()
 priv mut next_handle : I64 = 1
 
@@ -192,7 +198,7 @@ ws_callback := proc(wsi: Dynamic, reason: I32, _user: Dynamic,
 // Calls stay on one thread; callbacks run only during poll/connect/teardown.
 nostril_ws_open := proc(url: Str, ca_file: Str) returns I64 {
     if url.len() > 2048 || (!url.starts_with("ws://") && !url.starts_with("wss://")) { return 0 }
-    mut owner := WsOwner()
+    mut owner := WsOwner.new()
     {
         ref mut session : WsSession = owner.state
         session.pre = ws_native_pre().to_usize()

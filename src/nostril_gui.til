@@ -4,48 +4,18 @@ import("../gen/nostril_api")
 import("account_feed")
 import("nostril_init")
 import("config_paths")
-
-gui_utf8 := func(code: I64) returns Str {
-    if code < 0 || code > 0x10ffff || (code >= 0xd800 && code <= 0xdfff) {
-        panic("invalid Unicode scalar")
-    }
-    if code < 128 { return Str.from_byte(code.to_u8()) }
-    if code < 2048 {
-        return format(Str.from_byte((192 + code / 64).to_u8()),
-            Str.from_byte((128 + code.mod(64)).to_u8()))
-    }
-    if code < 65536 {
-        return format(Str.from_byte((224 + code / 4096).to_u8()),
-            Str.from_byte((128 + (code / 64).mod(64)).to_u8()),
-            Str.from_byte((128 + code.mod(64)).to_u8()))
-    }
-    return format(Str.from_byte((240 + code / 262144).to_u8()),
-        Str.from_byte((128 + (code / 4096).mod(64)).to_u8()),
-        Str.from_byte((128 + (code / 64).mod(64)).to_u8()),
-        Str.from_byte((128 + code.mod(64)).to_u8()))
-}
-
-gui_without_last_scalar := func(text: Str) returns Str {
-    if text.len() == 0 { return "" }
-    mut start := text.len() - 1
-    while start > 0 && text[start].cast(U8).to_i64().band(0xc0) == 0x80 { start-- }
-    return text.substr(0, start).clone()
-}
+import("text_input")
 
 gui_status_text := func(text: Str) returns Str {
-    if text.len() <= 160 { return text.clone() }
-    mut end : USize = 160
-    while end > 0 && text[end].cast(U8).to_i64().band(0xc0) == 0x80 { end-- }
-    return format(text.substr(0, end), "...")
+    return text_status_prefix(text, 160)
 }
 
 gui_fitting_tail := proc(text: Str, width: I32, font_size: I32) returns Str {
     mut visible := text.clone()
+    mut start : USize = 0
     while visible.len() > 0 && MeasureText(visible.c_str, font_size) > width {
-        mut start : USize = 1
-        while start < visible.len() &&
-              visible[start].cast(U8).to_i64().band(0xc0) == 0x80 { start++ }
-        visible = visible.substr(start, visible.len() - start).clone()
+        start = grapheme_next(text, start)
+        visible = text.substr(start, text.len() - start).clone()
     }
     return visible
 }
@@ -54,7 +24,7 @@ gui_fitting_head := proc(text: Str, width: I32, font_size: I32) returns Str {
     if MeasureText(text.c_str, font_size) <= width { return text.clone() }
     mut visible := text.clone()
     while visible.len() > 0 {
-        visible = gui_without_last_scalar(visible)
+        visible = text_without_last_grapheme(visible)
         candidate := format(visible, "...")
         if MeasureText(candidate.c_str, font_size) <= width { return candidate }
     }
@@ -216,10 +186,11 @@ main := proc(args: ..Str) {
         else if timeline_scroll >= session.messages.len() { timeline_scroll = session.messages.len() - 1 }
         if IsKeyPressed(259) || IsKeyPressedRepeat(259) {
             if panel == 0 && composer_scalars > 0 {
-                composer = gui_without_last_scalar(composer); composer_scalars--
-            } else if panel == 2 { follow_input = gui_without_last_scalar(follow_input) }
-            else if panel == 3 { petname_input = gui_without_last_scalar(petname_input) }
-            else if panel == 4 { account_input = gui_without_last_scalar(account_input) }
+                composer = text_without_last_grapheme(composer)
+                composer_scalars = text_scalar_count(composer).to_i64().to_i32()
+            } else if panel == 2 { follow_input = text_without_last_grapheme(follow_input) }
+            else if panel == 3 { petname_input = text_without_last_grapheme(petname_input) }
+            else if panel == 4 { account_input = text_without_last_grapheme(account_input) }
         }
         if (panel == 2 || panel == 3 || panel == 4) && (IsKeyDown(341) || IsKeyDown(345)) && IsKeyPressed(86) {
             ref clipboard : I8 = GetClipboardText()
@@ -243,14 +214,14 @@ main := proc(args: ..Str) {
         while code > 0 {
             if code >= 32 && code != 127 {
                 if panel == 0 && composer_scalars < 280 {
-                    composer = format(composer, gui_utf8(code.cast(I64))); composer_scalars++
+                    composer = format(composer, Str.from_codepoint(code.cast(I64))); composer_scalars++
                 } else if panel == 2 && follow_input.len() < 5006 && code < 128 {
-                    follow_input = format(follow_input, gui_utf8(code.cast(I64)))
+                    follow_input = format(follow_input, Str.from_codepoint(code.cast(I64)))
                 } else if panel == 3 && petname_input.len() < 64 && code < 128 {
-                    petname_input = format(petname_input, gui_utf8(code.cast(I64)))
+                    petname_input = format(petname_input, Str.from_codepoint(code.cast(I64)))
                 } else if panel == 3 && code >= 128 { notice = "Use ASCII letters, digits or underscore." }
                 else if panel == 4 {
-                    character := gui_utf8(code.cast(I64))
+                    character := Str.from_codepoint(code.cast(I64))
                     if account_input.len() + character.len() <= 64 { account_input = format(account_input, character) }
                 }
             }

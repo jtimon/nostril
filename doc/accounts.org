@@ -14,6 +14,8 @@ and preserve the current account/session.
 GUI names are case-sensitive, 1..64 UTF-8 bytes, without surrounding whitespace
 or ASCII control characters. The name is a device-local alias, not published Nostr
 profile metadata. Follows and petnames start empty and remain account-specific.
+Backspace removes a whole Unicode grapheme from the local name; the storage
+limit remains bytes. See [[file:unicode.org][Unicode text handling]] for input and font details.
 
 GUI registrations persist in =accounts/catalog.tsv=; user-authored =init.til=
 is never rewritten. On launch, init declarations and catalog entries are merged:
